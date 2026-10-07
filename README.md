@@ -67,8 +67,9 @@ re-checks every instance's `location` after every `up`.
    `ValidUntil` can never be later than the real expiry. etcd leader changes only extend leases.
    `TestValidityBoundNeverExceedsServerExpiry` measures this against a real etcd: the bound came
    12–22 ms before the attached key vanished. The **guardian** goroutine starts the self-fence at
-   `ValidUntil − margin − (stop_budget + kill_budget)`. It does this itself, so a main loop stuck
+   `ValidUntil − margin − (self-fence chain budget)`. It does this itself, so a main loop stuck
    in a slow call cannot delay it. The steps are:
+   - it runs the member's **self-fence chain** (§ Fences). The default chain is:
    - `incus stop --force` on the local project, within `stop_budget`;
    - then **`cgroup.kill`** on `lxc.payload.<project>_*`, within `kill_budget`. This needs no
      Incus daemon and no cluster quorum, which matters because a partitioned member's Incus has
@@ -137,7 +138,7 @@ copy, and the new leader's API fence and audit stop it within seconds.
 ## Timing
 
 ```
-renew_interval ×3 + stop_budget + kill_budget + margin  ≤  ttl      (config.Validate refuses otherwise)
+renew_interval ×3 + self chain budget + margin  ≤  ttl              (config.Validate refuses otherwise)
 self-fence starts at  ValidUntil − margin − (stop+kill)              ≈ last good renewal + 9 s  (prod defaults)
 rival can acquire at  real lease expiry ≥ ValidUntil                ≈ last good renewal + 20 s
 watchdog-fenced peer: new leader waits watchdog_timeout + reboot_margin after acquiring
@@ -156,6 +157,60 @@ With the prototype config (TTL 20 s, renew 2 s, margin 2 s, stop 6 s, kill 3 s):
 | preferred member blips back within `grace` | no failover |
 
 Failback is never automatic. Use `pagurus move`.
+
+## Fences
+
+How a member's copy is stopped is configured, not hard-wired. `fences.self` is an ordered
+chain the member runs on itself before its lease can expire. It stops at the first fence whose
+**confirm** says nothing runs (`internal/fence`):
+
+```jsonc
+"fences": {
+  "self": [
+    {"kind": "incus-stop",  "budget": "6s"},                    // incus stop --force; confirmed from cgroupfs
+    {"kind": "cgroup-kill", "budget": "3s"},                    // cgroup.kill on lxc.payload.<project>_*; no incusd, no quorum
+    {"kind": "exec", "budget": "5s",                            // anything else: a power fence, a site script
+     "command": ["/etc/pagurus/plug-off", "{member}"],          // {member} and {project} are expanded per argv element, no shell
+     "confirm": ["/etc/pagurus/plug-is-off", "{member}"],       // optional; without it, the command's exit 0 confirms
+     "for": ["container"]}                                      // optional: target types it applies to
+  ]
+}
+```
+
+- **Absent:** `incus-stop` (`self_fence.stop_budget`) then `cgroup-kill`
+  (`self_fence.kill_budget`), exactly the prototype's behaviour. Set either `self_fence` or
+  `fences.self`, not both.
+- **Empty (`"self": []`), or no fence applies** (the container fences skip VMs: a VM's qemu
+  has no `lxc.payload` cgroup):
+  - the member has **no verified self-fence**, and advertises it (`Caps.NoVerifiedSelfFence`);
+  - peers then refuse to trust it under `fence.unverified=proceed` and block as under `block`,
+    until it returns or an operator runs `fence-ack`;
+  - when it must fence itself, it cannot confirm, so it goes unfit and the watchdog is the
+    backstop.
+- **Timing:** the chain's total budget replaces `stop_budget + kill_budget` in every timing
+  rule.
+
+`pagurus fence-check -c cfg --member <m>` runs only the *confirm* of each fence and prints
+the chain. It is read-only, so safe on production. Run it **on** that member, because the
+container fences read the local cgroupfs.
+
+### Writing a fence
+
+1. Implement `fence.Fence`: `Kind`, `Budget`, `Applies(target)`, `Run`, `Confirm`.
+   - `Run` must be idempotent.
+   - `Confirm` must not change anything.
+   - Both must honour the context, because the chain gives the pair no more than `Budget`.
+2. Add it to `fence.BuildSelf`.
+3. Test it with `internal/fence/fencetest` (no real Incus, cgroupfs or host):
+   - `FakeBin`: scripted binaries that record their argv;
+   - `FakeCgroupFS`: a cgroup2 tree whose `cgroup.kill` empties the cgroup, or doesn't;
+   - `FakeProc`: a real process with a pidfile;
+   - then pass `fencetest.Contract`, which checks: it confirms after a run; confirm is
+     read-only; it is idempotent; it honours its budget; errors name the kind.
+
+The **peer** chain (what a new leader does to a member that may still run: the Incus API stop,
+an `exec` power fence, the watchdog wait) is still hard-wired in `termState.fenceMember`.
+Making it configurable is a follow-up (`singleton-fence-chain`, configs repo).
 
 ## Watchdog
 
@@ -177,6 +232,7 @@ internal/config/        schema, defaults, the timing validation
 internal/lease/         lease keeper with the local validity bound
 internal/coord/         etcd schema: leader/epoch, member states, registrations, pin
 internal/incus/         incus / incus-compose / cgroupfs driver
+internal/fence/         fence kinds, the chain runner, fencetest (fakes + contract)
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
 internal/agent/         the state machine (agent.go: lifecycle; lead.go: a term)
 examples/whoami/        the prototype's compose.yaml + pagurus.json

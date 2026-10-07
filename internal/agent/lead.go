@@ -333,6 +333,10 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 		}
 		return false, fmt.Sprintf("waiting %s for %s's watchdog (%s)", (wait - since).Round(time.Second), m, reach), min(retry, wait-since)
 	}
+	if a.cfg.Fence.Unverified == config.UnverifiedProceed && st.Caps.NoVerifiedSelfFence {
+		return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is %s, and advertises no verified self-fence, so policy=proceed cannot trust it; "+
+			"run `pagurus fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
+	}
 	if a.cfg.Fence.Unverified == config.UnverifiedProceed {
 		wait := a.cfg.Fence.UnverifiedWait.D()
 		if since >= wait {

@@ -518,6 +518,25 @@ func TestPartitionedLeaderSelfFences_ProceedPolicy(t *testing.T) {
 	h.holdOne("dell", 2*time.Second)
 }
 
+// A member whose self chain is empty (e.g. a VM with no Incus-free kill)
+// advertises no verified self-fence. Partitioned as leader, it cannot stop its
+// copy, and under policy=proceed its peers must still refuse to trust it:
+// the copy keeps running alone, and nobody starts a second one even well past
+// unverified_wait.
+func TestNoVerifiedSelfFence_ProceedPolicyStillBlocks(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.Fence.Unverified = config.UnverifiedProceed
+		c.Fences.Self = &[]config.FenceStep{}
+	})
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.partition("asus", true)
+	h.holdOne("asus", h.cfg.Fence.UnverifiedWait.D()+h.cfg.Lease.TTL.D()+2*time.Second)
+	if !h.memberStates()["asus"].Caps.NoVerifiedSelfFence {
+		t.Fatal("asus did not advertise NoVerifiedSelfFence")
+	}
+}
+
 // Same partition under the default policy=block: nobody may start until the
 // isolated member is back (or acknowledged), even though it did self-fence.
 func TestPartitionedLeader_BlockPolicyWaitsForTheMember(t *testing.T) {

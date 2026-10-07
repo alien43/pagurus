@@ -24,6 +24,7 @@ import (
 
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/lease"
 	"github.com/alien43/pagurus/internal/watchdog"
@@ -166,7 +167,7 @@ func (a *Agent) Fit() (bool, string) {
 }
 
 func (a *Agent) caps() coord.Caps {
-	c := coord.Caps{SelfFenceLead: a.cfg.SelfFenceLead()}
+	c := coord.Caps{SelfFenceLead: a.cfg.SelfFenceLead(), NoVerifiedSelfFence: !a.selfChain().Verified(a.selfTarget())}
 	if a.wd != nil {
 		c.WatchdogMode = a.wd.Mode()
 		c.WatchdogTimeout = a.wd.Timeout()
@@ -347,34 +348,36 @@ func (a *Agent) reportStopped(ctx context.Context) {
 	a.log.Info("recorded member state stopped (self-verified)", "epoch", ms.Epoch)
 }
 
-// stopLocal stops this member's instances: Incus first, then cgroup.kill, each
-// within its budget. It returns whether cgroupfs confirms nothing runs.
+// selfChain is this member's configured self-fence chain over the runtime.
+func (a *Agent) selfChain() fence.Chain {
+	c, err := fence.BuildSelf(a.rt, a.cfg.SelfFences())
+	if err != nil {
+		panic(err) // config.Validate builds the same chain
+	}
+	return c
+}
+
+func (a *Agent) selfTarget() fence.Target {
+	return fence.Target{Member: a.member, Project: a.cfg.Project(a.member)}
+}
+
+// stopLocal runs this member's self-fence chain (by default incus-stop, then
+// cgroup.kill), each fence within its budget. It returns whether a fence
+// confirmed that nothing runs.
 func (a *Agent) stopLocal(ctx context.Context, reason string) bool {
 	a.fenceMu.Lock()
 	defer a.fenceMu.Unlock()
 	log := a.log.With("member", a.member, "reason", reason)
 	start := a.now()
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.cfg.SelfFence.StopBudget.D())
-	err := a.rt.Stop(sctx, a.member, 0)
-	cancel()
-	running, lerr := a.rt.LocalRunning(a.member)
-	if err != nil || lerr != nil || len(running) > 0 {
-		log.Warn("incus stop did not confirm; escalating to cgroup.kill", "stop_err", err, "still_running", running)
-		kctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), a.cfg.SelfFence.KillBudget.D())
-		kerr := a.rt.Kill(kctx, a.member)
-		cancel()
-		running, lerr = a.rt.LocalRunning(a.member)
-		if kerr != nil {
-			log.Error("cgroup.kill failed", "err", kerr)
-		}
-	}
-	ok := lerr == nil && len(running) == 0
+	res := a.selfChain().Run(context.WithoutCancel(ctx), a.selfTarget(), log)
+	ok := res.Stopped
 	a.setLocalStopped(ok)
 	if ok {
-		log.Info("local instances stopped", "took", a.now().Sub(start).Round(time.Millisecond))
+		log.Info("local instances stopped", "by", res.By, "took", a.now().Sub(start).Round(time.Millisecond))
 	} else {
-		a.alerter.Alert("self-fence-failed", "CANNOT stop local instances — watchdog is the backstop",
-			"member", a.member, "running", running, "err", lerr, "watchdog", a.caps().WatchdogMode)
+		running, lerr := a.rt.LocalRunning(a.member)
+		a.alerter.Alert("self-fence-failed", "CANNOT confirm local instances stopped — watchdog is the backstop",
+			"member", a.member, "chain", res.String(), "running", running, "err", lerr, "watchdog", a.caps().WatchdogMode)
 	}
 	return ok
 }

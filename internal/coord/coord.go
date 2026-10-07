@@ -51,6 +51,11 @@ type Caps struct {
 	// systemd watchdog whose unit has a reboot FailureAction.
 	FencesByReboot bool          `json:"fences_by_reboot"`
 	SelfFenceLead  time.Duration `json:"self_fence_lead"`
+	// NoVerifiedSelfFence: no fence in this member's self chain applies to its
+	// workload, so its self-fence can never be confirmed. Peers must not
+	// trust it under fence.unverified=proceed. (Zero value: the prototype's
+	// chain, which is verified.)
+	NoVerifiedSelfFence bool `json:"no_verified_self_fence,omitempty"`
 }
 
 type MemberState struct {

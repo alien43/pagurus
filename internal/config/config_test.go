@@ -68,3 +68,45 @@ func TestSelfFenceLead(t *testing.T) {
 		t.Fatal(c.SelfFenceLead())
 	}
 }
+
+func TestDefaultSelfChainIsThePrototypes(t *testing.T) {
+	c, err := parse(`"self_fence": {"stop_budget": "4s", "kill_budget": "1s"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.SelfFences()
+	if len(got) != 2 || got[0].Kind != "incus-stop" || got[0].Budget != 4*time.Second || got[1].Kind != "cgroup-kill" || got[1].Budget != time.Second {
+		t.Fatalf("default chain %+v, want incus-stop 4s then cgroup-kill 1s", got)
+	}
+}
+
+func TestExplicitSelfChain(t *testing.T) {
+	c, err := parse(`"fences": {"self": [{"kind": "exec", "budget": "2s", "command": ["/bin/plug", "{member}"]}, {"kind": "cgroup-kill", "budget": "3s"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SelfFenceLead() != 5*time.Second {
+		t.Fatalf("lead %v, want the chain's total 5s", c.SelfFenceLead())
+	}
+	c, err = parse(`"fences": {"self": []}`)
+	if err != nil {
+		t.Fatalf("an empty self chain must be allowed: %v", err)
+	}
+	if len(c.SelfFences()) != 0 || c.SelfFenceLead() != 0 {
+		t.Fatalf("empty chain became %+v", c.SelfFences())
+	}
+}
+
+func TestSelfChainRejections(t *testing.T) {
+	for name, extra := range map[string]string{
+		"both forms":      `"self_fence": {"stop_budget": "4s"}, "fences": {"self": []}`,
+		"unknown kind":    `"fences": {"self": [{"kind": "stonith", "budget": "1s"}]}`,
+		"no budget":       `"fences": {"self": [{"kind": "cgroup-kill"}]}`,
+		"exec no command": `"fences": {"self": [{"kind": "exec", "budget": "1s"}]}`,
+		"chain too long":  `"fences": {"self": [{"kind": "incus-stop", "budget": "30s"}]}`,
+	} {
+		if _, err := parse(extra); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

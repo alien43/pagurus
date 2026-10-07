@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/alien43/pagurus/internal/fence"
 	"os"
 	"regexp"
 	"slices"
@@ -78,6 +79,36 @@ type SelfFence struct {
 	// KillBudget bounds the cgroup.kill fallback, used when Incus cannot stop
 	// the instances (e.g. this member lost the Incus cluster quorum).
 	KillBudget Duration `json:"kill_budget"`
+}
+
+// Fences configures the fence chains. Self is the ordered chain a member runs
+// on itself before its lease can expire; it stops at the first fence that
+// confirms. Absent, it is incus-stop (self_fence.stop_budget) then
+// cgroup-kill (self_fence.kill_budget). An explicitly empty list means "no
+// verified self-fence": allowed, and advertised to peers.
+type Fences struct {
+	Self *[]FenceStep `json:"self"`
+}
+
+// FenceStep is one fence in a chain (see internal/fence for the kinds).
+type FenceStep struct {
+	Kind    string   `json:"kind"`
+	Budget  Duration `json:"budget"`
+	Command []string `json:"command,omitempty"`
+	Confirm []string `json:"confirm,omitempty"`
+	For     []string `json:"for,omitempty"`
+}
+
+// SelfFences returns the self chain's specs.
+func (c *Config) SelfFences() []fence.Spec {
+	if c.Fences.Self == nil {
+		return nil
+	}
+	out := make([]fence.Spec, 0, len(*c.Fences.Self))
+	for _, s := range *c.Fences.Self {
+		out = append(out, fence.Spec{Kind: s.Kind, Budget: s.Budget.D(), Command: s.Command, Confirm: s.Confirm, For: s.For})
+	}
+	return out
 }
 
 type Fence struct {
@@ -152,6 +183,7 @@ type Config struct {
 	Etcd       Etcd      `json:"etcd"`
 	Lease      Lease     `json:"lease"`
 	SelfFence  SelfFence `json:"self_fence"`
+	Fences     Fences    `json:"fences"`
 	Fence      Fence     `json:"fence"`
 	Health     Health    `json:"health"`
 	Watchdog   Watchdog  `json:"watchdog"`
@@ -180,6 +212,9 @@ func Parse(b []byte) (*Config, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(c); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
+	}
+	if c.Fences.Self != nil && (c.SelfFence.StopBudget != 0 || c.SelfFence.KillBudget != 0) {
+		return nil, fmt.Errorf("config: set either self_fence budgets or fences.self, not both")
 	}
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {
@@ -216,6 +251,12 @@ func (c *Config) applyDefaults() {
 	def(&c.Lease.Margin, 2*time.Second)
 	def(&c.SelfFence.StopBudget, 6*time.Second)
 	def(&c.SelfFence.KillBudget, 3*time.Second)
+	if c.Fences.Self == nil {
+		c.Fences.Self = &[]FenceStep{
+			{Kind: fence.KindIncusStop, Budget: c.SelfFence.StopBudget},
+			{Kind: fence.KindCgroupKill, Budget: c.SelfFence.KillBudget},
+		}
+	}
 	def(&c.Fence.APITimeout, 20*time.Second)
 	def(&c.Fence.RetryInterval, 10*time.Second)
 	def(&c.Fence.RebootMargin, 10*time.Second)
@@ -247,7 +288,11 @@ func (c *Config) applyDefaults() {
 // SelfFenceLead is how long before the lease's safe deadline the leader starts
 // fencing itself, so that the stop has finished by the deadline.
 func (c *Config) SelfFenceLead() time.Duration {
-	return c.SelfFence.StopBudget.D() + c.SelfFence.KillBudget.D()
+	var d time.Duration
+	for _, s := range c.SelfFences() {
+		d += s.Budget
+	}
+	return d
 }
 
 // Project returns the Incus project member m runs the stack in.
@@ -298,6 +343,9 @@ func (c *Config) Validate() error {
 	if len(c.Etcd.Endpoints) == 0 {
 		bad("etcd.endpoints: required")
 	}
+	if _, err := fence.BuildSelf(nil, c.SelfFences()); err != nil {
+		bad("%v", err)
+	}
 	if c.Fence.Unverified != UnverifiedBlock && c.Fence.Unverified != UnverifiedProceed {
 		bad("fence.unverified %q: must be %q or %q", c.Fence.Unverified, UnverifiedBlock, UnverifiedProceed)
 	}
@@ -327,7 +375,7 @@ func (c *Config) Validate() error {
 	// At least two renewals must be allowed to fail before self-fencing
 	// starts, or ordinary jitter fences a healthy leader.
 	if need := 3*renew + c.SelfFenceLead() + margin; need > ttl {
-		bad("lease.ttl %s too short: 3*renew_interval + stop_budget + kill_budget + margin = %s", ttl, need)
+		bad("lease.ttl %s too short: 3*renew_interval + self-fence chain budget + margin = %s", ttl, need)
 	}
 	if c.Fence.Unverified == UnverifiedProceed && c.Fence.UnverifiedWait.D() < c.SelfFenceLead()+margin {
 		bad("fence.unverified_wait %s must cover the old leader's self-fence (>= %s)", c.Fence.UnverifiedWait.D(), c.SelfFenceLead()+margin)

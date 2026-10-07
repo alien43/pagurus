@@ -23,6 +23,7 @@ import (
 	"github.com/alien43/pagurus/internal/agent"
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
@@ -38,6 +39,11 @@ commands:
   move        planned move: pagurus move -c cfg --to <member>
   fence-ack   operator override: record that a member is verified down
               pagurus fence-ack -c cfg --member <member>
+  fence-check read-only: run Confirm of every fence in this member's self
+              chain and print what each would do (safe on production)
+              pagurus fence-check -c cfg --member <member>
+              Run it ON that member: incus-stop and cgroup-kill confirm
+              from the local cgroupfs.
   audit       watch every member's project and report any moment with more
               than one member running the workload (drill tool)
 `
@@ -51,7 +57,7 @@ func main() {
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	cfgPath := fs.String("c", "", "config file")
 	to := fs.String("to", "", "move: target member")
-	member := fs.String("member", "", "fence-ack: member to acknowledge")
+	member := fs.String("member", "", "fence-ack: member to acknowledge; fence-check: member whose chain to check")
 	every := fs.Duration("every", time.Second, "audit: poll interval")
 	dur := fs.Duration("for", 0, "audit: stop after this long (0 = until interrupted)")
 	jsonLog := fs.Bool("json", false, "run: log as JSON")
@@ -97,6 +103,8 @@ func main() {
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdFenceAck(ctx, cfg, cli, *member) })
 	case "audit":
 		err = cmdAudit(ctx, cfg, rt, *every, *dur)
+	case "fence-check":
+		err = cmdFenceCheck(ctx, cfg, rt, *member)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(64)
@@ -346,6 +354,40 @@ func cmdAudit(ctx context.Context, cfg *config.Config, rt *incus.Driver, every, 
 	fmt.Printf("audit: %d polls, %d violations\n", polls, violations)
 	if violations > 0 {
 		return fmt.Errorf("%d at-most-one violations observed", violations)
+	}
+	return nil
+}
+
+// cmdFenceCheck prints, for each fence of member's self chain, whether it
+// applies and what its Confirm reports now. It runs no fence: Confirm is
+// read-only by contract (internal/fence/fencetest.Contract).
+func cmdFenceCheck(ctx context.Context, cfg *config.Config, rt *incus.Driver, member string) error {
+	if member == "" {
+		return fmt.Errorf("fence-check: --member required")
+	}
+	chain, err := fence.BuildSelf(rt, cfg.SelfFences())
+	if err != nil {
+		return err
+	}
+	tg := fence.Target{Member: member, Project: cfg.Project(member)}
+	fmt.Printf("self chain of %s (project %s): %d fence(s), total budget %s, verified=%v\n",
+		member, tg.Project, len(chain), chain.Budget(), chain.Verified(tg))
+	for i, f := range chain {
+		if !f.Applies(tg) {
+			fmt.Printf("  %d. %-12s budget %-5s skipped (does not apply)\n", i+1, f.Kind(), f.Budget())
+			continue
+		}
+		cctx, cancel := context.WithTimeout(ctx, f.Budget())
+		stopped, err := f.Confirm(cctx, tg)
+		cancel()
+		state := "running (a fence would act)"
+		if stopped {
+			state = "stopped"
+		}
+		if err != nil {
+			state = "confirm error: " + err.Error()
+		}
+		fmt.Printf("  %d. %-12s budget %-5s confirm: %s\n", i+1, f.Kind(), f.Budget(), state)
 	}
 	return nil
 }
