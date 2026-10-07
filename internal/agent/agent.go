@@ -22,11 +22,11 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"singleton/internal/config"
-	"singleton/internal/coord"
-	"singleton/internal/incus"
-	"singleton/internal/lease"
-	"singleton/internal/watchdog"
+	"github.com/alien43/pagurus/internal/config"
+	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/lease"
+	"github.com/alien43/pagurus/internal/watchdog"
 )
 
 // Runtime is everything the agent needs from Incus. *incus.Driver implements

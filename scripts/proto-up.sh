@@ -21,7 +21,7 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 svc=whoami
 unit=singleton-$svc
 remote_dir=/run/singleton-proto
-cfg="$here/examples/whoami/singleton.json"
+cfg="$here/examples/whoami/pagurus.json"
 compose="$here/examples/whoami/compose.yaml"
 drill=0
 only="asus dell rpi5"
@@ -60,7 +60,7 @@ ver="proto-$(git -C "$here" rev-parse --short HEAD 2>/dev/null || echo dev)$(git
 build=$(mktemp -d)
 trap 'rm -rf "$build"' EXIT
 for a in amd64 arm64; do
-  (cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=$ver" -o "$build/singleton-$a" ./cmd/singleton)
+  (cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=$ver" -o "$build/singleton-$a" ./cmd/pagurus)
   (cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w" -o "$build/blackhole-proxy-$a" ./cmd/blackhole-proxy)
 done
 

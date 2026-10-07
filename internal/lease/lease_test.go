@@ -9,7 +9,7 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"singleton/internal/testutil"
+	"github.com/alien43/pagurus/internal/testutil"
 )
 
 func quiet() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

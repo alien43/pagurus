@@ -24,7 +24,7 @@ for m in "$@"; do
       -c features.images=true -c features.profiles=true \
       -c features.storage.volumes=true -c features.storage.buckets=true \
       -c restricted.cluster.groups="$group"
-    incus project set "$p" user.singleton.managed=true
+    incus project set "$p" user.pagurus.managed=true
     echo "[new] project $p -> $group"
   fi
   got=$(incus project get "$p" restricted.cluster.groups)

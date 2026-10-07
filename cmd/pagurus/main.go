@@ -1,4 +1,4 @@
-// Command singleton runs one incus-compose stack on at most one member of an
+// Command pagurus runs one incus-compose stack on at most one member of an
 // Incus cluster, failing it over between members. See README.md.
 package main
 
@@ -20,24 +20,24 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
 
-	"singleton/internal/agent"
-	"singleton/internal/config"
-	"singleton/internal/coord"
-	"singleton/internal/incus"
-	"singleton/internal/watchdog"
+	"github.com/alien43/pagurus/internal/agent"
+	"github.com/alien43/pagurus/internal/config"
+	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/watchdog"
 )
 
 var version = "dev"
 
-const usage = `usage: singleton <command> -c <config.json> [flags]
+const usage = `usage: pagurus <command> -c <config.json> [flags]
 
 commands:
   run         run the agent on this member (as root, under systemd)
   validate    check the config, this member's Incus project and the compose file
   status      show the office, member states and every member's instances
-  move        planned move: singleton move -c cfg --to <member>
+  move        planned move: pagurus move -c cfg --to <member>
   fence-ack   operator override: record that a member is verified down
-              singleton fence-ack -c cfg --member <member>
+              pagurus fence-ack -c cfg --member <member>
   audit       watch every member's project and report any moment with more
               than one member running the workload (drill tool)
 `
@@ -107,7 +107,7 @@ func main() {
 }
 
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "singleton:", err)
+	fmt.Fprintln(os.Stderr, "pagurus:", err)
 	os.Exit(1)
 }
 

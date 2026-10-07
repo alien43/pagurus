@@ -1,4 +1,4 @@
-// Package config loads and validates a singleton service definition.
+// Package config loads and validates a pagurus service definition.
 //
 // Validation is deliberately strict: every timing relation the at-most-one
 // argument depends on (README.md "Timing") is checked here, so a config that
@@ -42,7 +42,7 @@ func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(time.Durat
 const (
 	// UnverifiedBlock never starts on an unconfirmed fence. Fail closed: the
 	// service stays down until the member is reachable again or an operator
-	// runs `singleton fence-ack`.
+	// runs `pagurus fence-ack`.
 	UnverifiedBlock = "block"
 	// UnverifiedProceed trusts the old leader's software self-fence: it waits
 	// fence.unverified_wait after acquiring, then starts.
@@ -195,7 +195,7 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	if c.EtcdPrefix == "" {
-		c.EtcdPrefix = "/singleton/v1/" + c.Service
+		c.EtcdPrefix = "/pagurus/v1/" + c.Service
 	}
 	if len(c.Prefer) == 0 {
 		c.Prefer = slices.Clone(c.Members)
@@ -204,7 +204,7 @@ func (c *Config) applyDefaults() {
 		c.UpArgs = []string{"--detach", "--no-healthd"}
 	}
 	if c.StateDir == "" {
-		c.StateDir = "/run/singleton"
+		c.StateDir = "/run/pagurus"
 	}
 	def(&c.Grace, 10*time.Second)
 	def(&c.EligibleInterval, 5*time.Second)

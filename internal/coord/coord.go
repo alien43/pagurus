@@ -1,4 +1,4 @@
-// Package coord holds the etcd schema of one singleton service.
+// Package coord holds the etcd schema of one pagurus service.
 //
 //	<prefix>/leader         LeaderRecord, attached to the leader's lease. Its
 //	                        create revision is the epoch (fencing token).
@@ -238,7 +238,7 @@ func (c *Coord) ReportSelfStopped(ctx context.Context, member string, prevModRev
 	return nil
 }
 
-// AckFenced is the operator override (`singleton fence-ack`): it records that a
+// AckFenced is the operator override (`pagurus fence-ack`): it records that a
 // human has verified member is not running the workload. Refused while member
 // holds the office.
 func (c *Coord) AckFenced(ctx context.Context, member, by string) error {

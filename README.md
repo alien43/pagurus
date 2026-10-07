@@ -1,4 +1,13 @@
-# `singleton` — at-most-one incus-compose stack, failing over across the cluster
+# `pagurus` — at-most-one incus-compose stack, failing over across the cluster
+
+A hermit crab lives in one shell at a time and moves when it has to. `pagurus` keeps a workload
+running on exactly one member of an Incus cluster, and moves it when that member fails.
+
+> **Naming.** The project was prototyped as `singleton`. The prototype that still runs live keeps
+> its old names: transient units `singleton-<svc>`, binaries in `/run/singleton-proto` and
+> `/var/lib/singleton-proto`, and etcd keys under `/singleton/v1/` (pinned in
+> `examples/whoami/pagurus.json`). `scripts/` drive that prototype, so they use those names too.
+> New code and defaults use `pagurus` (`/pagurus/v1/<svc>`, `/run/pagurus`).
 
 > **Status: EXPERIMENTAL PROTOTYPE (2026-10-06).** Not wired into any NixOS module, timer or
 > `fleet/` stack. When it runs on the live cluster it does so only as *transient* systemd units
@@ -146,7 +155,7 @@ With the prototype config (TTL 20 s, renew 2 s, margin 2 s, stop 6 s, kill 3 s):
 | same, `block` | until the member returns or `fence-ack` |
 | preferred member blips back within `grace` | no failover |
 
-Failback is never automatic. Use `singleton move`.
+Failback is never automatic. Use `pagurus move`.
 
 ## Watchdog
 
@@ -162,7 +171,7 @@ Failback is never automatic. Use `singleton move`.
 ## Layout
 
 ```
-cmd/singleton/          CLI: run | validate | status | move | fence-ack | audit
+cmd/pagurus/            CLI: run | validate | status | move | fence-ack | audit
 cmd/blackhole-proxy/    drill-only TCP proxy; SIGUSR1 = partition the agent from etcd
 internal/config/        schema, defaults, the timing validation
 internal/lease/         lease keeper with the local validity bound
@@ -170,7 +179,7 @@ internal/coord/         etcd schema: leader/epoch, member states, registrations,
 internal/incus/         incus / incus-compose / cgroupfs driver
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
 internal/agent/         the state machine (agent.go: lifecycle; lead.go: a term)
-examples/whoami/        the prototype's compose.yaml + singleton.json
+examples/whoami/        the prototype's compose.yaml + pagurus.json
 scripts/                provision.sh, proto-up.sh, proto-down.sh, drill.sh
 ```
 
@@ -184,7 +193,7 @@ scripts/drill.sh                           # live drills, audited (see below)
 scripts/proto-down.sh --purge              # remove everything
 ```
 
-`singleton audit -c <cfg> --for 10m` is the independent referee during drills. It polls every
+`pagurus audit -c <cfg> --for 10m` is the independent referee during drills. It polls every
 member's project through the cluster API once a second. It reports, and exits non-zero on, any
 instant where instances run in more than one project.
 

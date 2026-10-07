@@ -34,7 +34,7 @@ func TestDefaultsAreValid(t *testing.T) {
 	if c.Project("dell") != "sgl-whoami-dell" || c.Rank("asus") != 0 || c.Rank("rpi5") != 2 {
 		t.Error("project/rank derivation wrong")
 	}
-	if c.EtcdPrefix != "/singleton/v1/whoami" {
+	if c.EtcdPrefix != "/pagurus/v1/whoami" {
 		t.Errorf("etcd prefix %q", c.EtcdPrefix)
 	}
 }
@@ -45,7 +45,7 @@ func TestTimingSandwichEnforced(t *testing.T) {
 		"fractional ttl":               `"lease": {"ttl": "20500ms"}`,
 		"op timeout > renew":           `"etcd": {"endpoints": ["x"], "op_timeout": "5s"}`,
 		"unverified wait too short":    `"fence": {"unverified": "proceed", "unverified_wait": "1s"}`,
-		"state dir not tmpfs":          `"state_dir": "/var/lib/singleton"`,
+		"state dir not tmpfs":          `"state_dir": "/var/lib/pagurus"`,
 		"bad policy":                   `"fence": {"unverified": "yolo"}`,
 		"prefer not a member":          `"prefer": ["nucbox"]`,
 		"unknown field":                `"ttl": "20s"`,

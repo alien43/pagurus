@@ -2,6 +2,7 @@
   "service": "whoami",
   "compose": "/run/singleton-proto/whoami/compose.yaml",
   "project_prefix": "sgl-whoami",
+  "etcd_prefix": "/singleton/v1/whoami",
   "members": ["asus", "dell", "rpi5"],
   "prefer": ["asus", "dell", "rpi5"],
   "grace": "10s",

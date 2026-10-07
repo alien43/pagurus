@@ -1,4 +1,4 @@
-module singleton
+module github.com/alien43/pagurus
 
 go 1.25.0
 

@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
-	"singleton/internal/config"
-	"singleton/internal/coord"
-	"singleton/internal/incus"
-	"singleton/internal/testutil"
-	"singleton/internal/watchdog"
+	"github.com/alien43/pagurus/internal/config"
+	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/testutil"
+	"github.com/alien43/pagurus/internal/watchdog"
 )
 
 // ------------------------------------------------------- simulated cluster -

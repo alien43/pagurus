@@ -48,7 +48,7 @@ func (al *Alerter) Alert(event, msg string, kv ...any) {
 		if err != nil {
 			return
 		}
-		req.Header.Set("Title", fmt.Sprintf("singleton/%s: %s", al.service, event))
+		req.Header.Set("Title", fmt.Sprintf("pagurus/%s: %s", al.service, event))
 		if resp, err := al.client.Do(req); err == nil {
 			resp.Body.Close()
 		} else {

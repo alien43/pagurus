@@ -13,10 +13,10 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
-	"singleton/internal/config"
-	"singleton/internal/coord"
-	"singleton/internal/incus"
-	"singleton/internal/lease"
+	"github.com/alien43/pagurus/internal/config"
+	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/lease"
 )
 
 var (
@@ -343,7 +343,7 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 		return false, fmt.Sprintf("waiting %s before trusting %s's self-fence (%s)", (wait - since).Round(time.Second), m, reach), min(retry, wait-since)
 	}
 	return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is %s, and has no reboot watchdog; "+
-		"waiting for it to come back, or run `singleton fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
+		"waiting for it to come back, or run `pagurus fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
 }
 
 // ---------------------------------------------------------------- supervise -
