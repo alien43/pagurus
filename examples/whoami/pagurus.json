@@ -1,6 +1,6 @@
 {
   "service": "whoami",
-  "compose": "/run/singleton-proto/whoami/compose.yaml",
+  "start": {"kind": "compose", "file": "/run/singleton-proto/whoami/compose.yaml"},
   "project_prefix": "sgl-whoami",
   "etcd_prefix": "/singleton/v1/whoami",
   "members": ["asus", "dell", "rpi5"],

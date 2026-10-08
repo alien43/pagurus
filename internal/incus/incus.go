@@ -39,15 +39,11 @@ const (
 )
 
 type Options struct {
-	Compose       string
-	ComposeArgs   []string
-	UpArgs        []string
 	ProjectPrefix string
 	// CgroupRoot is the cgroup2 mount (default /sys/fs/cgroup).
 	CgroupRoot string
-	// IncusBin / ComposeBin override the binaries (tests).
-	IncusBin   string
-	ComposeBin string
+	// IncusBin overrides the binary (tests).
+	IncusBin string
 }
 
 type Driver struct {
@@ -61,9 +57,6 @@ func New(o Options) *Driver {
 	if o.IncusBin == "" {
 		o.IncusBin = "incus"
 	}
-	if o.ComposeBin == "" {
-		o.ComposeBin = "incus-compose"
-	}
 	return &Driver{o: o}
 }
 
@@ -71,7 +64,9 @@ func (d *Driver) Project(member string) string { return d.o.ProjectPrefix + "-" 
 
 // run executes a command bounded by ctx; on cancellation the whole process
 // group is killed so no grandchild outlives the budget.
-func run(ctx context.Context, name string, args ...string) ([]byte, error) {
+// Run runs a CLI in its own process group, killing the group when ctx ends,
+// and returns stdout; stderr is folded into the error.
+func Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
@@ -89,7 +84,7 @@ func run(ctx context.Context, name string, args ...string) ([]byte, error) {
 }
 
 func (d *Driver) query(ctx context.Context, path string, v any) error {
-	out, err := run(ctx, d.o.IncusBin, "query", path)
+	out, err := Run(ctx, d.o.IncusBin, "query", path)
 	if err != nil {
 		return err
 	}
@@ -178,16 +173,6 @@ func (d *Driver) List(ctx context.Context, member string) ([]Instance, error) {
 	return out, err
 }
 
-// Up runs `incus-compose up` in this member's project.
-func (d *Driver) Up(ctx context.Context, member string) error {
-	args := []string{"-p", d.Project(member), "-f", d.o.Compose}
-	args = append(args, d.o.ComposeArgs...)
-	args = append(args, "up")
-	args = append(args, d.o.UpArgs...)
-	_, err := run(ctx, d.o.ComposeBin, args...)
-	return err
-}
-
 // EnforceNoAutostart sets boot.autostart=false on every instance of member's
 // project. Unset means "restore the last state on boot", which would let a
 // rebooting host start a second copy behind the agent's back.
@@ -200,7 +185,7 @@ func (d *Driver) EnforceNoAutostart(ctx context.Context, member string) error {
 		if in.Expanded["boot.autostart"] == "false" {
 			continue
 		}
-		if _, err := run(ctx, d.o.IncusBin, "config", "set", in.Name, "--project", d.Project(member), "boot.autostart=false"); err != nil {
+		if _, err := Run(ctx, d.o.IncusBin, "config", "set", in.Name, "--project", d.Project(member), "boot.autostart=false"); err != nil {
 			return err
 		}
 	}
@@ -231,7 +216,7 @@ func (d *Driver) Stop(ctx context.Context, member string, graceful time.Duration
 	base := []string{"stop", "--project", d.Project(member)}
 	if graceful > 0 {
 		gctx, cancel := context.WithTimeout(ctx, graceful+2*time.Second)
-		_, gerr := run(gctx, d.o.IncusBin, append(append(base, fmt.Sprintf("--timeout=%d", int(graceful.Seconds()))), names...)...)
+		_, gerr := Run(gctx, d.o.IncusBin, append(append(base, fmt.Sprintf("--timeout=%d", int(graceful.Seconds()))), names...)...)
 		cancel()
 		if gerr == nil {
 			return nil
@@ -241,7 +226,7 @@ func (d *Driver) Stop(ctx context.Context, member string, graceful time.Duration
 			return err
 		}
 	}
-	_, err = run(ctx, d.o.IncusBin, append(append(base, "--force"), names...)...)
+	_, err = Run(ctx, d.o.IncusBin, append(append(base, "--force"), names...)...)
 	return err
 }
 
@@ -387,12 +372,4 @@ func (d *Driver) CheckCgroup2() error {
 		return fmt.Errorf("%s is not a cgroup2 mount", d.o.CgroupRoot)
 	}
 	return nil
-}
-
-// CheckCompose renders the compose file, proving it parses.
-func (d *Driver) CheckCompose(ctx context.Context, member string) error {
-	args := []string{"-p", d.Project(member), "-f", d.o.Compose}
-	args = append(args, d.o.ComposeArgs...)
-	_, err := run(ctx, d.o.ComposeBin, append(args, "config")...)
-	return err
 }

@@ -127,3 +127,37 @@ func TestDefaultPeerChainIsThePrototypes(t *testing.T) {
 		t.Fatalf("an empty peer chain (unverified policy only) must be allowed: %v", err)
 	}
 }
+
+func TestStartForms(t *testing.T) {
+	// The prototype's top-level compose still works, mapped onto start, with a deprecation.
+	c, err := parse("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Start.Kind != "compose" || c.Start.File != "/x/compose.yaml" || strings.Join(c.Start.UpArgs, " ") != "--detach --no-healthd" || len(c.Deprecations) != 1 {
+		t.Fatalf("legacy compose: start %+v deprecations %q", c.Start, c.Deprecations)
+	}
+	raw := func(start string) string {
+		return `{"service": "s", "project_prefix": "p", "members": ["asus"], "etcd": {"endpoints": ["x"]}, "start": ` + start + `}`
+	}
+	c, err = Parse([]byte(raw(`{"kind": "instances", "names": ["web"]}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Start.Kind != "instances" || len(c.Deprecations) != 0 {
+		t.Fatalf("instances: %+v %q", c.Start, c.Deprecations)
+	}
+	for name, start := range map[string]string{
+		"compose without file":  `{"kind": "compose"}`,
+		"instances with a file": `{"kind": "instances", "file": "x"}`,
+		"compose with names":    `{"kind": "compose", "file": "x", "names": ["a"]}`,
+		"unknown kind":          `{"kind": "vm"}`,
+	} {
+		if _, err := Parse([]byte(raw(start))); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := Parse([]byte(`{"service": "s", "project_prefix": "p", "members": ["asus"], "etcd": {"endpoints": ["x"]}}`)); err == nil {
+		t.Error("no start at all: accepted")
+	}
+}

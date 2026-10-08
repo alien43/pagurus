@@ -25,6 +25,7 @@ import (
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/start"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
 
@@ -91,9 +92,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	rt := incus.New(incus.Options{
-		Compose: cfg.Compose, ComposeArgs: cfg.ComposeArgs, UpArgs: cfg.UpArgs, ProjectPrefix: cfg.ProjectPrefix,
-	})
+	for _, d := range cfg.Deprecations {
+		log.Warn("deprecated config", "what", d)
+	}
+	drv := incus.New(incus.Options{ProjectPrefix: cfg.ProjectPrefix})
+	rt := &runtime{Driver: drv, Starter: newStarter(cfg, drv)}
 
 	switch cmd {
 	case "validate":
@@ -101,17 +104,17 @@ func main() {
 	case "run":
 		err = cmdRun(ctx, cfg, rt, log, *self)
 	case "status":
-		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdStatus(ctx, cfg, rt, cli) })
+		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdStatus(ctx, cfg, drv, cli) })
 	case "move":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdMove(ctx, cfg, cli, *to, *timeout) })
 	case "fence-ack":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdFenceAck(ctx, cfg, cli, *member) })
 	case "audit":
-		err = cmdAudit(ctx, cfg, rt, *every, *dur)
+		err = cmdAudit(ctx, cfg, drv, *every, *dur)
 	case "fence-check":
-		err = cmdFenceCheck(ctx, cfg, rt, *member)
+		err = cmdFenceCheck(ctx, cfg, drv, *member)
 	case "fence-run":
-		err = cmdFenceRun(ctx, cfg, rt, *member, *fenceIdx, *iKnow, log)
+		err = cmdFenceRun(ctx, cfg, drv, *member, *fenceIdx, *iKnow, log)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(64)
@@ -147,13 +150,13 @@ func withEtcd(cfg *config.Config, f func(*clientv3.Client) error) error {
 	return f(cli)
 }
 
-func cmdValidate(ctx context.Context, cfg *config.Config, rt *incus.Driver) error {
+func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime) error {
 	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Etcd: nil})
 	if err := a.Preflight(ctx); err != nil {
 		return err
 	}
-	fmt.Printf("ok: member %s, project %s pinned, compose renders, timing valid (TTL %s, self-fence lead %s)\n",
-		a.Member(), cfg.Project(a.Member()), cfg.Lease.TTL.D(), cfg.SelfFenceLead())
+	fmt.Printf("ok: member %s, project %s pinned, %s starter check passes, timing valid (TTL %s, self-fence lead %s)\n",
+		a.Member(), cfg.Project(a.Member()), rt.Starter.Kind(), cfg.Lease.TTL.D(), cfg.SelfFenceLead())
 	for _, m := range cfg.Members {
 		if err := rt.CheckProject(ctx, m); err != nil {
 			fmt.Printf("WARNING: %v\n", err)
@@ -162,7 +165,7 @@ func cmdValidate(ctx context.Context, cfg *config.Config, rt *incus.Driver) erro
 	return nil
 }
 
-func cmdRun(ctx context.Context, cfg *config.Config, rt *incus.Driver, log *slog.Logger, self string) error {
+func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logger, self string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("run must be root (cgroup.kill, watchdog)")
 	}
@@ -422,4 +425,20 @@ func cmdFenceRun(ctx context.Context, cfg *config.Config, rt *incus.Driver, memb
 		return fmt.Errorf("fence %s did not confirm", chain[idx-1].Kind())
 	}
 	return nil
+}
+
+// runtime is the agent's view of the world: the Incus driver (projects,
+// instances, fencing primitives) plus the configured starter.
+type runtime struct {
+	*incus.Driver
+	start.Starter
+}
+
+func newStarter(cfg *config.Config, drv *incus.Driver) start.Starter {
+	switch cfg.Start.Kind {
+	case start.KindInstances:
+		return start.Instances{Run: incus.Run, Project: cfg.Project, L: drv, Names: cfg.Start.Names}
+	default:
+		return start.Compose{Run: incus.Run, Project: cfg.Project, File: cfg.Start.File, Args: cfg.Start.Args, UpArgs: cfg.Start.UpArgs}
+	}
 }

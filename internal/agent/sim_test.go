@@ -125,7 +125,7 @@ func (r *simRT) clusterOp() error {
 
 func (r *simRT) Identity(context.Context) (string, string, error) { return r.me, "x86_64", r.gate() }
 func (r *simRT) CheckProject(context.Context, string) error       { return nil }
-func (r *simRT) CheckCompose(context.Context, string) error       { return nil }
+func (r *simRT) CheckStart(context.Context, string) error         { return nil }
 func (r *simRT) CheckCgroup2() error                              { return nil }
 
 func (r *simRT) MemberOnline(_ context.Context, m string) (bool, error) {
@@ -157,7 +157,7 @@ func (r *simRT) List(_ context.Context, m string) ([]incus.Instance, error) {
 	return []incus.Instance{{Name: "svc-1", Status: st, Location: m, Type: "container"}}, nil
 }
 
-func (r *simRT) Up(_ context.Context, m string) error {
+func (r *simRT) Start(_ context.Context, m string) error {
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	if err := r.clusterOp(); err != nil {

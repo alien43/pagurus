@@ -35,11 +35,12 @@ import (
 type Runtime interface {
 	Identity(ctx context.Context) (member, arch string, err error)
 	CheckProject(ctx context.Context, member string) error
-	CheckCompose(ctx context.Context, member string) error
+	// CheckStart / Start are the configured starter (internal/start).
+	CheckStart(ctx context.Context, member string) error
 	CheckCgroup2() error
 	MemberOnline(ctx context.Context, member string) (bool, error)
 	List(ctx context.Context, member string) ([]incus.Instance, error)
-	Up(ctx context.Context, member string) error
+	Start(ctx context.Context, member string) error
 	EnforceNoAutostart(ctx context.Context, member string) error
 	Stop(ctx context.Context, member string, graceful time.Duration) error
 	LocalRunning(member string) ([]string, error)
@@ -209,7 +210,7 @@ func (a *Agent) Preflight(ctx context.Context) error {
 			return fmt.Errorf("instance %s is a %s; only containers can be fenced via cgroup.kill", in.Name, in.Type)
 		}
 	}
-	return a.rt.CheckCompose(cctx, m)
+	return a.rt.CheckStart(cctx, m)
 }
 
 // Run is the agent's lifetime. It returns when ctx ends, after releasing the

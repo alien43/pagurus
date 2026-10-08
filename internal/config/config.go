@@ -176,12 +176,30 @@ type Watchdog struct {
 	Arm bool `json:"arm"`
 }
 
+// Start configures the starter.
+type Start struct {
+	// Kind is "compose" (incus-compose up) or "instances" (start
+	// containers that already exist in the member's project).
+	Kind string `json:"kind"`
+	// compose
+	File   string   `json:"file,omitempty"`
+	Args   []string `json:"args,omitempty"`
+	UpArgs []string `json:"up_args,omitempty"`
+	// instances: names to start; empty means every instance in the project.
+	Names []string `json:"names,omitempty"`
+}
+
 type Config struct {
 	Service string `json:"service"`
-	// Compose is the compose file; ComposeArgs are extra global flags.
-	Compose     string   `json:"compose"`
-	ComposeArgs []string `json:"compose_args"`
-	UpArgs      []string `json:"up_args"`
+	// Start says how a member brings its copy up (internal/start).
+	Start Start `json:"start"`
+	// Compose, ComposeArgs and UpArgs are the prototype's top-level form of
+	// start.kind=compose. Still read, mapped onto Start; see Deprecations.
+	Compose     string   `json:"compose,omitempty"`
+	ComposeArgs []string `json:"compose_args,omitempty"`
+	UpArgs      []string `json:"up_args,omitempty"`
+	// Deprecations lists config forms that still work but should change.
+	Deprecations []string `json:"-"`
 	// ProjectPrefix: member m runs the stack in Incus project "<prefix>-<m>",
 	// which must be restricted to a cluster group containing only m.
 	ProjectPrefix string `json:"project_prefix"`
@@ -254,8 +272,14 @@ func (c *Config) applyDefaults() {
 	if len(c.Prefer) == 0 {
 		c.Prefer = slices.Clone(c.Members)
 	}
-	if len(c.UpArgs) == 0 {
-		c.UpArgs = []string{"--detach", "--no-healthd"}
+	if c.Compose != "" || len(c.ComposeArgs) > 0 || len(c.UpArgs) > 0 {
+		if c.Start.Kind == "" {
+			c.Start = Start{Kind: "compose", File: c.Compose, Args: c.ComposeArgs, UpArgs: c.UpArgs}
+		}
+		c.Deprecations = append(c.Deprecations, `top-level "compose"/"compose_args"/"up_args": use "start": {"kind": "compose", "file": …, "args": …, "up_args": …}`)
+	}
+	if c.Start.Kind == "compose" && len(c.Start.UpArgs) == 0 {
+		c.Start.UpArgs = []string{"--detach", "--no-healthd"}
 	}
 	if c.StateDir == "" {
 		c.StateDir = "/run/pagurus"
@@ -338,8 +362,25 @@ func (c *Config) Validate() error {
 	if !nameRE.MatchString(c.Service) {
 		bad("service %q: must match %s", c.Service, nameRE)
 	}
-	if c.Compose == "" {
-		bad("compose: required")
+	switch c.Start.Kind {
+	case "compose":
+		if c.Start.File == "" {
+			bad("start.file: required for start.kind=compose")
+		}
+		if len(c.Start.Names) > 0 {
+			bad("start.names: only for start.kind=instances")
+		}
+	case "instances":
+		if c.Start.File != "" || len(c.Start.Args) > 0 || len(c.Start.UpArgs) > 0 {
+			bad("start.file/args/up_args: only for start.kind=compose")
+		}
+	case "":
+		bad("start: required (kind compose or instances)")
+	default:
+		bad("start.kind %q: must be compose or instances", c.Start.Kind)
+	}
+	if c.Compose != "" && c.Start.Kind != "" && c.Start.File != c.Compose {
+		bad("set either the top-level compose or start, not both")
 	}
 	if !nameRE.MatchString(c.ProjectPrefix) {
 		bad("project_prefix %q: must match %s", c.ProjectPrefix, nameRE)

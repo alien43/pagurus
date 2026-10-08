@@ -1,0 +1,61 @@
+{
+  "service": "whoami-instances",
+  "start": {
+    "kind": "instances",
+    "names": [
+      "whoami"
+    ]
+  },
+  "project_prefix": "pgs-whoami",
+  "etcd_prefix": "/pagurus/v1/whoami-instances",
+  "members": [
+    "asus",
+    "dell",
+    "rpi5"
+  ],
+  "prefer": [
+    "asus",
+    "dell",
+    "rpi5"
+  ],
+  "grace": "10s",
+  "etcd": {
+    "endpoints": [
+      "10.0.1.3:2379",
+      "10.0.1.6:2379",
+      "10.0.1.8:2379"
+    ],
+    "dial_timeout": "3s",
+    "op_timeout": "2s"
+  },
+  "lease": {
+    "ttl": "20s",
+    "renew_interval": "2s",
+    "margin": "2s"
+  },
+  "self_fence": {
+    "stop_budget": "6s",
+    "kill_budget": "3s"
+  },
+  "fence": {
+    "api_timeout": "15s",
+    "unverified": "proceed",
+    "unverified_wait": "40s",
+    "retry_interval": "5s",
+    "reboot_margin": "10s"
+  },
+  "health": {
+    "interval": "5s",
+    "start_period": "30s",
+    "failures": 3,
+    "max_restarts": 2,
+    "http": "http://{ip}:80/health",
+    "instance": "whoami",
+    "timeout": "3s",
+    "release_backoff": "2m"
+  },
+  "watchdog": {
+    "mode": "systemd"
+  },
+  "state_dir": "/run/pagurus/state"
+}

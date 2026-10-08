@@ -158,6 +158,26 @@ With the prototype config (TTL 20 s, renew 2 s, margin 2 s, stop 6 s, kill 3 s):
 
 Failback is never automatic. Use `pagurus move`.
 
+## Starters
+
+How a member brings its copy up is the configured **starter** (`internal/start`). The agent
+itself only fences, records `may-run`, calls `Start`, then checks location and autostart.
+
+```jsonc
+"start": {"kind": "compose", "file": "/etc/pagurus/whoami/compose.yaml", "args": [], "up_args": ["--detach", "--no-healthd"]}
+"start": {"kind": "instances", "names": ["whoami"]}   // empty names: every instance in the project
+```
+
+- **compose** runs `incus-compose -p <project> -f <file> up --detach --no-healthd`. The
+  prototype's top-level `"compose"` / `"compose_args"` / `"up_args"` still work, mapped onto
+  this, with a deprecation warning.
+- **instances** runs `incus start` on containers that already exist in each member's pinned
+  project (`examples/whoami-instances/`). The preflight checks each one exists, is a
+  container, and has `boot.autostart=false`.
+
+Both starters run containers only, because the self-fences confirm from cgroupfs. VMs are
+`singleton-vm-support` (configs repo).
+
 ## Fences
 
 How a member's copy is stopped is configured, not hard-wired. `fences.self` is an ordered
@@ -266,6 +286,7 @@ internal/lease/         lease keeper with the local validity bound
 internal/coord/         etcd schema: leader/epoch, member states, registrations, pin
 internal/incus/         incus / incus-compose / cgroupfs driver
 internal/fence/         fence kinds, the chain runner, fencetest (fakes + contract)
+internal/start/         starters: compose, instances
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
 internal/agent/         the state machine (agent.go: lifecycle; lead.go: a term)
 examples/whoami/        the prototype's compose.yaml + pagurus.json

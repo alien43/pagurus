@@ -357,8 +357,8 @@ func (t *termState) start() error {
 	a.beat(UpTimeout)
 	uctx, cancel := context.WithTimeout(t.op, UpTimeout)
 	defer cancel()
-	if err := a.rt.Up(uctx, a.member); err != nil {
-		return fmt.Errorf("up: %w", err)
+	if err := a.rt.Start(uctx, a.member); err != nil {
+		return fmt.Errorf("start: %w", err)
 	}
 	if err := a.rt.EnforceNoAutostart(uctx, a.member); err != nil {
 		return fmt.Errorf("enforce boot.autostart=false: %w", err)
@@ -368,7 +368,7 @@ func (t *termState) start() error {
 		return err
 	}
 	if len(insts) == 0 {
-		return errors.New("up created no instances")
+		return errors.New("start left no instances in the project")
 	}
 	for _, in := range insts {
 		if in.Location != a.member {
