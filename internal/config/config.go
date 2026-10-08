@@ -11,6 +11,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/alien43/pagurus/internal/fence"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"os"
 	"regexp"
 	"slices"
@@ -63,6 +65,16 @@ type Etcd struct {
 	DialTimeout Duration `json:"dial_timeout"`
 	// OpTimeout bounds every single etcd request the agent makes.
 	OpTimeout Duration `json:"op_timeout"`
+
+	// Optional TLS (use https:// endpoints): CACert verifies etcd's server
+	// certificate; Cert/Key are a client certificate for --client-cert-auth.
+	CACert string `json:"cacert,omitempty"`
+	Cert   string `json:"cert,omitempty"`
+	Key    string `json:"key,omitempty"`
+	// Optional etcd user/password auth. The password is read from
+	// PasswordFile, never stored in the config.
+	User         string `json:"user,omitempty"`
+	PasswordFile string `json:"password_file,omitempty"`
 }
 
 type Lease struct {
@@ -409,6 +421,12 @@ func (c *Config) Validate() error {
 	if len(c.Etcd.Endpoints) == 0 {
 		bad("etcd.endpoints: required")
 	}
+	if (c.Etcd.Cert == "") != (c.Etcd.Key == "") {
+		bad("etcd.cert and etcd.key go together")
+	}
+	if (c.Etcd.User == "") != (c.Etcd.PasswordFile == "") {
+		bad("etcd.user and etcd.password_file go together")
+	}
 	if _, err := fence.BuildSelf(nil, c.SelfFences()); err != nil {
 		bad("%v", err)
 	}
@@ -458,4 +476,43 @@ func (c *Config) Validate() error {
 		bad("health.failures must be >= 1 and health.max_restarts >= 0")
 	}
 	return errors.Join(errs...)
+}
+
+// EtcdClientConfig is the etcd client config every pagurus client uses:
+// endpoints, timeouts, and the optional TLS and user/password auth.
+func (c *Config) EtcdClientConfig() (clientv3.Config, error) {
+	cc := clientv3.Config{
+		Endpoints:            c.Etcd.Endpoints,
+		DialTimeout:          c.Etcd.DialTimeout.D(),
+		DialKeepAliveTime:    c.Lease.RenewInterval.D(),
+		DialKeepAliveTimeout: c.Etcd.OpTimeout.D(),
+	}
+	if c.Etcd.CACert != "" || c.Etcd.Cert != "" {
+		tlsCfg, err := (transport.TLSInfo{TrustedCAFile: c.Etcd.CACert, CertFile: c.Etcd.Cert, KeyFile: c.Etcd.Key}).ClientConfig()
+		if err != nil {
+			return cc, fmt.Errorf("etcd TLS: %w", err)
+		}
+		cc.TLS = tlsCfg
+	}
+	if c.Etcd.User != "" {
+		b, err := os.ReadFile(c.Etcd.PasswordFile)
+		if err != nil {
+			return cc, fmt.Errorf("etcd password_file: %w", err)
+		}
+		cc.Username, cc.Password = c.Etcd.User, strings.TrimRight(string(b), "\r\n")
+	}
+	return cc, nil
+}
+
+// ConchEtcdArgs renders the etcd settings as conch's global flags (conch
+// >= bea278d), for a conch that pagurus spawns. The password goes as a file,
+// never on the command line.
+func (c *Config) ConchEtcdArgs() []string {
+	args := []string{"--endpoints", strings.Join(c.Etcd.Endpoints, ","), "--dial-timeout", c.Etcd.DialTimeout.D().String()}
+	for _, kv := range [][2]string{{"--cacert", c.Etcd.CACert}, {"--cert", c.Etcd.Cert}, {"--key", c.Etcd.Key}, {"--user", c.Etcd.User}, {"--password-file", c.Etcd.PasswordFile}} {
+		if kv[1] != "" {
+			args = append(args, kv[0], kv[1])
+		}
+	}
+	return args
 }

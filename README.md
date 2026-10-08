@@ -158,6 +158,24 @@ With the prototype config (TTL 20 s, renew 2 s, margin 2 s, stop 6 s, kill 3 s):
 
 Failback is never automatic. Use `pagurus move`.
 
+## etcd security
+
+pagurus talks plain, unauthenticated etcd by default. TLS and etcd's user/password auth are
+optional fields under `etcd`:
+
+```jsonc
+"etcd": {
+  "endpoints": ["https://10.0.1.3:2379"],
+  "cacert": "/etc/pagurus/etcd-ca.pem",                                    // verify etcd's server cert
+  "cert": "/etc/pagurus/etcd-client.pem", "key": "/etc/pagurus/etcd-client-key.pem",  // client cert
+  "user": "pagurus", "password_file": "/run/secrets/pagurus-etcd"          // never the password itself
+}
+```
+
+`cert`/`key` and `user`/`password_file` go in pairs. The same settings render as conch flags
+(`Config.ConchEtcdArgs`: `--cacert --cert --key --user --password-file`, conch ≥ `bea278d`)
+for a conch that pagurus spawns. The password travels as a file path, never on a command line.
+
 ## Starters
 
 How a member brings its copy up is the configured **starter** (`internal/start`). The agent

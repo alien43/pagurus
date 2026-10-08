@@ -130,15 +130,14 @@ func fatal(err error) {
 }
 
 func newEtcd(cfg *config.Config) (*clientv3.Client, error) {
-	return clientv3.New(clientv3.Config{
-		Endpoints:            cfg.Etcd.Endpoints,
-		DialTimeout:          cfg.Etcd.DialTimeout.D(),
-		DialKeepAliveTime:    cfg.Lease.RenewInterval.D(),
-		DialKeepAliveTimeout: cfg.Etcd.OpTimeout.D(),
-		// The agent logs what matters itself; the client's own retry chatter
-		// during a partition is noise.
-		Logger: zap.NewNop(),
-	})
+	cc, err := cfg.EtcdClientConfig()
+	if err != nil {
+		return nil, err
+	}
+	// The agent logs what matters itself; the client's own retry chatter
+	// during a partition is noise.
+	cc.Logger = zap.NewNop()
+	return clientv3.New(cc)
 }
 
 func withEtcd(cfg *config.Config, f func(*clientv3.Client) error) error {
