@@ -44,6 +44,9 @@ type simMember struct {
 	stopFail  bool // `incus stop` does nothing
 	killFail  bool // cgroup.kill does not empty the cgroup
 	upFail    bool
+	// hideCgroup: cgroupfs shows no payload cgroup although Incus says it
+	// runs (a liblxc that names payload cgroups differently).
+	hideCgroup bool
 }
 
 func newSim(t *testing.T, members ...string) *simCluster {
@@ -199,7 +202,7 @@ func (r *simRT) LocalRunning(m string) ([]string, error) {
 	if err := r.gate(); err != nil {
 		return nil, err
 	}
-	if r.c.m[m].running {
+	if r.c.m[m].running && !r.c.m[m].hideCgroup {
 		return []string{"svc-1"}, nil
 	}
 	return nil, nil
@@ -627,6 +630,21 @@ func TestExecPeerFence_PowerOffUnblocksFailover(t *testing.T) {
 	t.Logf("dell running %s after the partition (power fence, policy=block)", took)
 	if st := h.memberStates()["asus"]; st.State != coord.Stopped || !strings.Contains(st.Reason, "exec") {
 		t.Fatalf("asus record %+v, want stopped via exec", st)
+	}
+}
+
+// asus's cgroupfs hides the payload cgroup of what it runs. Right after its
+// first start the agent must notice that Incus and cgroupfs disagree and give
+// the term up instead of running a copy its own checks cannot see; another
+// member takes over. (Preflight passes: nothing runs yet.)
+func TestUnrecognisedCgroupLayoutAfterStartGivesUp(t *testing.T) {
+	h := newHarness(t, nil)
+	h.sim.set("asus", func(m *simMember) { m.hideCgroup = true })
+	h.startAll()
+	took := h.waitRunning("dell", 20*time.Second)
+	t.Logf("dell running %s after start; asus refused its term", took)
+	if on := h.sim.runningOn(); len(on) != 1 || on[0] != "dell" {
+		t.Fatalf("running on %v, want only dell", on)
 	}
 }
 

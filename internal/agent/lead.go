@@ -376,6 +376,9 @@ func (t *termState) start() error {
 		}
 	}
 	a.setTypes(insts)
+	if err := a.checkCgroupLayout(insts); err != nil {
+		return fmt.Errorf("%w: %v", errMisplaced, err)
+	}
 	t.publish()
 	return nil
 }

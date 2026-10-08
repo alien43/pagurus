@@ -210,6 +210,9 @@ func (a *Agent) Preflight(ctx context.Context) error {
 		return err
 	}
 	a.setTypes(insts)
+	if err := a.checkCgroupLayout(insts); err != nil {
+		return err
+	}
 	if t := a.selfTarget(); len(t.Types) > 0 && !a.selfChain().Verified(t) {
 		a.log.Warn("no fence in the self chain applies to this project's instances: no verified self-fence (advertised; peers will not trust it under proceed)",
 			"types", t.Types, "chain", a.cfg.SelfFences())
@@ -375,6 +378,39 @@ func (a *Agent) selfTarget() fence.Target {
 	a.typesMu.Lock()
 	defer a.typesMu.Unlock()
 	return fence.Target{Member: a.member, Project: a.cfg.Project(a.member), Types: slices.Clone(a.types)}
+}
+
+// errCgroupLayout: Incus says a container runs here but cgroupfs shows no
+// payload cgroup for it. LocalRunning would then report a running member as
+// stopped, which every self-check and self-fence relies on, so the agent
+// refuses rather than fall back to "nothing running".
+var errCgroupLayout = errors.New("cgroup layout not recognised")
+
+// checkCgroupLayout requires that every container Incus reports Running in
+// this member's project has a live payload cgroup (lxc.payload.<project>_<name>)
+// that LocalRunning sees. VMs have no payload cgroup and are not checked here.
+func (a *Agent) checkCgroupLayout(insts []incus.Instance) error {
+	var running []string
+	for _, in := range insts {
+		if in.Status == incus.StatusRunning && (in.Type == "" || in.Type == "container") {
+			running = append(running, in.Name)
+		}
+	}
+	if len(running) == 0 {
+		return nil
+	}
+	local, err := a.rt.LocalRunning(a.member)
+	if err != nil {
+		return fmt.Errorf("%w: reading cgroupfs: %v", errCgroupLayout, err)
+	}
+	for _, n := range running {
+		if !slices.Contains(local, n) {
+			return fmt.Errorf("%w: Incus reports container %s of project %s Running, but cgroupfs has no live lxc.payload.%s_%s; "+
+				"is this a liblxc/Incus version with a different payload cgroup name? Refusing: the self-fence would see it as stopped",
+				errCgroupLayout, n, a.cfg.Project(a.member), a.cfg.Project(a.member), n)
+		}
+	}
+	return nil
 }
 
 // setTypes records the distinct instance types of insts (sorted).
