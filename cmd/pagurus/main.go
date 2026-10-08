@@ -44,6 +44,9 @@ commands:
               pagurus fence-check -c cfg --member <member>
               Run it ON that member: incus-stop and cgroup-kill confirm
               from the local cgroupfs.
+  fence-run   run ONE fence of this member's self chain for real (drills on
+              scratch projects): pagurus fence-run -c cfg --member <m>
+              --fence <1-based index> --i-know
   audit       watch every member's project and report any moment with more
               than one member running the workload (drill tool)
 `
@@ -63,6 +66,8 @@ func main() {
 	jsonLog := fs.Bool("json", false, "run: log as JSON")
 	timeout := fs.Duration("timeout", 3*time.Minute, "move: how long to wait for the new holder")
 	self := fs.String("self", "", "run: this host's cluster member name; lets the agent fence locally even when the local Incus is down at startup")
+	fenceIdx := fs.Int("fence", 0, "fence-run: 1-based index into the member's self chain")
+	iKnow := fs.Bool("i-know", false, "fence-run: confirm that this really stops the member's workload")
 	endpoints := fs.String("etcd", "", "override etcd.endpoints (comma-separated; drill harness)")
 	_ = fs.Parse(args)
 	if *cfgPath == "" {
@@ -105,6 +110,8 @@ func main() {
 		err = cmdAudit(ctx, cfg, rt, *every, *dur)
 	case "fence-check":
 		err = cmdFenceCheck(ctx, cfg, rt, *member)
+	case "fence-run":
+		err = cmdFenceRun(ctx, cfg, rt, *member, *fenceIdx, *iKnow, log)
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(64)
@@ -171,12 +178,13 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *incus.Driver, log *slog
 		// then exit non-zero and let systemd retry.
 		if self != "" {
 			if running, lerr := rt.LocalRunning(self); lerr == nil && len(running) > 0 {
-				log.Error("preflight failed with local instances running and no lease: killing them", "running", running)
-				kctx, cancel := context.WithTimeout(context.Background(), cfg.SelfFence.KillBudget.D())
-				if kerr := rt.Kill(kctx, self); kerr != nil {
-					log.Error("emergency cgroup.kill failed", "err", kerr)
+				log.Error("preflight failed with local instances running and no lease: running the self-fence chain", "running", running)
+				if chain, berr := fence.BuildSelf(rt, cfg.SelfFences()); berr == nil {
+					res := chain.Run(context.Background(), fence.Target{Member: self, Project: cfg.Project(self)}, log)
+					if !res.Stopped {
+						log.Error("emergency self-fence did not confirm", "chain", res.String())
+					}
 				}
-				cancel()
 			}
 		}
 		return fmt.Errorf("preflight: %w", err)
@@ -388,6 +396,30 @@ func cmdFenceCheck(ctx context.Context, cfg *config.Config, rt *incus.Driver, me
 			state = "confirm error: " + err.Error()
 		}
 		fmt.Printf("  %d. %-12s budget %-5s confirm: %s\n", i+1, f.Kind(), f.Budget(), state)
+	}
+	return nil
+}
+
+// cmdFenceRun runs one fence of member's self chain for real, then its
+// confirm. Meant for drills on scratch projects; it refuses without --i-know.
+func cmdFenceRun(ctx context.Context, cfg *config.Config, rt *incus.Driver, member string, idx int, iKnow bool, log *slog.Logger) error {
+	if member == "" || idx < 1 {
+		return fmt.Errorf("fence-run: --member and --fence <1-based index> required")
+	}
+	if !iKnow {
+		return fmt.Errorf("fence-run stops %s's workload in project %s for real; add --i-know", member, cfg.Project(member))
+	}
+	chain, err := fence.BuildSelf(rt, cfg.SelfFences())
+	if err != nil {
+		return err
+	}
+	if idx > len(chain) {
+		return fmt.Errorf("fence-run: the self chain has %d fence(s)", len(chain))
+	}
+	res := fence.Chain{chain[idx-1]}.Run(ctx, fence.Target{Member: member, Project: cfg.Project(member)}, log)
+	fmt.Println(res.String())
+	if !res.Stopped {
+		return fmt.Errorf("fence %s did not confirm", chain[idx-1].Kind())
 	}
 	return nil
 }

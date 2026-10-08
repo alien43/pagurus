@@ -86,8 +86,15 @@ type SelfFence struct {
 // confirms. Absent, it is incus-stop (self_fence.stop_budget) then
 // cgroup-kill (self_fence.kill_budget). An explicitly empty list means "no
 // verified self-fence": allowed, and advertised to peers.
+//
+// Peer is the ordered chain a new leader runs against another member that may
+// still run the workload (incus-api-stop, exec, watchdog-wait); the first
+// fence that does not skip decides. Absent, it is incus-api-stop
+// (fence.api_timeout) then watchdog-wait: the prototype's behaviour. When
+// every fence skips, fence.unverified decides.
 type Fences struct {
 	Self *[]FenceStep `json:"self"`
+	Peer *[]FenceStep `json:"peer"`
 }
 
 // FenceStep is one fence in a chain (see internal/fence for the kinds).
@@ -106,6 +113,18 @@ func (c *Config) SelfFences() []fence.Spec {
 	}
 	out := make([]fence.Spec, 0, len(*c.Fences.Self))
 	for _, s := range *c.Fences.Self {
+		out = append(out, fence.Spec{Kind: s.Kind, Budget: s.Budget.D(), Command: s.Command, Confirm: s.Confirm, For: s.For})
+	}
+	return out
+}
+
+// PeerFences returns the peer chain's specs.
+func (c *Config) PeerFences() []fence.Spec {
+	if c.Fences.Peer == nil {
+		return nil
+	}
+	out := make([]fence.Spec, 0, len(*c.Fences.Peer))
+	for _, s := range *c.Fences.Peer {
 		out = append(out, fence.Spec{Kind: s.Kind, Budget: s.Budget.D(), Command: s.Command, Confirm: s.Confirm, For: s.For})
 	}
 	return out
@@ -258,6 +277,12 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	def(&c.Fence.APITimeout, 20*time.Second)
+	if c.Fences.Peer == nil {
+		c.Fences.Peer = &[]FenceStep{
+			{Kind: fence.KindIncusAPIStop, Budget: c.Fence.APITimeout},
+			{Kind: fence.KindWatchdogWait},
+		}
+	}
 	def(&c.Fence.RetryInterval, 10*time.Second)
 	def(&c.Fence.RebootMargin, 10*time.Second)
 	if c.Fence.Unverified == "" {
@@ -344,6 +369,9 @@ func (c *Config) Validate() error {
 		bad("etcd.endpoints: required")
 	}
 	if _, err := fence.BuildSelf(nil, c.SelfFences()); err != nil {
+		bad("%v", err)
+	}
+	if _, err := fence.BuildPeer(nil, 0, c.PeerFences()); err != nil {
 		bad("%v", err)
 	}
 	if c.Fence.Unverified != UnverifiedBlock && c.Fence.Unverified != UnverifiedProceed {

@@ -208,9 +208,42 @@ container fences read the local cgroupfs.
    - then pass `fencetest.Contract`, which checks: it confirms after a run; confirm is
      read-only; it is idempotent; it honours its budget; errors name the kind.
 
-The **peer** chain (what a new leader does to a member that may still run: the Incus API stop,
-an `exec` power fence, the watchdog wait) is still hard-wired in `termState.fenceMember`.
-Making it configurable is a follow-up (`singleton-fence-chain`, configs repo).
+### Peer fences
+
+`fences.peer` is what a new leader does to every other member that may still run the
+workload. It is retried each fencing round, and the **first fence that does not skip
+decides**:
+
+```jsonc
+"fences": {
+  "peer": [
+    {"kind": "incus-api-stop", "budget": "20s"},       // stop via the cluster API, confirm from the cluster's view
+    {"kind": "exec", "budget": "20s",                  // a power fence: smart plug, IPMI, PDU
+     "command": ["/etc/pagurus/plug-off", "{member}"],
+     "confirm": ["/etc/pagurus/plug-is-off", "{member}"]},
+    {"kind": "watchdog-wait"}                          // trust an armed reboot watchdog after its timeout + fence.reboot_margin
+  ]
+}
+```
+
+| Outcome | Meaning |
+| :--- | :--- |
+| **confirmed, verified** | observed stopped (API stop, a confirmed power-off): the member's record is set to `stopped` |
+| **confirmed, assumed** | `watchdog-wait` ran out: treated as fenced, but the `may-run` record is kept, so every later leader deals with it again |
+| **wait** | stop the chain and retry later. Examples: the cluster still *sees* the instance running (no later fence may override that), a watchdog is still counting, or project pinning is broken (`BLOCKED`) |
+| **skip** | this fence can't act. The member is unreachable, the fence doesn't apply (`exec` and `watchdog-wait` only act on a member recorded `may-run`), or the power fence didn't confirm. Try the next fence |
+
+If every fence skips:
+- a member recorded `stopped` needs nothing;
+- otherwise `fence.unverified` decides, as before (`block`, or `proceed` after
+  `unverified_wait`, never for a member advertising no verified self-fence).
+
+The default chain, `incus-api-stop` (`fence.api_timeout`) then `watchdog-wait`, is the
+prototype's behaviour exactly. An `exec` peer fence runs again every fencing round until it
+confirms, so the command must be idempotent.
+
+`pagurus fence-run -c cfg --member <m> --fence <i> --i-know` runs one **self** fence for real,
+then its confirm. It is meant for drills on scratch projects.
 
 ## Watchdog
 

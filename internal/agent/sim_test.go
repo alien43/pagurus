@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -580,6 +581,52 @@ func TestSelfFenceFailure_BlockPolicyHolds(t *testing.T) {
 		t.Fatal("asus still reports fit although its stop failed past the deadline")
 	} else {
 		t.Logf("asus unfit: %s", why)
+	}
+}
+
+// The same unstoppable, partitioned leader under policy=block, but with a
+// power fence (an exec peer fence) in the chain: the new leader runs it, and
+// starts only once it has confirmed. The power-off is simulated by the test
+// flipping asus's instance to stopped when the command asks for it.
+func TestExecPeerFence_PowerOffUnblocksFailover(t *testing.T) {
+	dir := t.TempDir()
+	requested, off := filepath.Join(dir, "requested"), filepath.Join(dir, "off")
+	plugOff := filepath.Join(dir, "plug-off")
+	plugIsOff := filepath.Join(dir, "plug-is-off")
+	if err := os.WriteFile(plugOff, []byte(fmt.Sprintf("#!/bin/sh\necho \"$1\" >> %q\n", requested)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plugIsOff, []byte(fmt.Sprintf("#!/bin/sh\ngrep -qx \"$1\" %q\n", off)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, func(c *config.Config) {
+		c.Fences.Peer = &[]config.FenceStep{
+			{Kind: "incus-api-stop", Budget: c.Fence.APITimeout},
+			{Kind: "exec", Budget: config.Duration(2 * time.Second), Command: []string{plugOff, "{member}"}, Confirm: []string{plugIsOff, "{member}"}},
+		}
+	})
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.sim.set("asus", func(m *simMember) { m.stopFail, m.killFail = true, true })
+	h.partition("asus", true)
+	t0 := time.Now()
+
+	// The "power strip": cut asus when the fence asks for it.
+	go func() {
+		for time.Since(t0) < 30*time.Second {
+			if b, err := os.ReadFile(requested); err == nil && strings.Contains(string(b), "asus") {
+				h.sim.set("asus", func(m *simMember) { m.running = false })
+				_ = os.WriteFile(off, []byte("asus\n"), 0o644)
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	took := h.waitRunning("dell", 30*time.Second)
+	t.Logf("dell running %s after the partition (power fence, policy=block)", took)
+	if st := h.memberStates()["asus"]; st.State != coord.Stopped || !strings.Contains(st.Reason, "exec") {
+		t.Fatalf("asus record %+v, want stopped via exec", st)
 	}
 }
 

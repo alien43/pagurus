@@ -110,3 +110,20 @@ func TestSelfChainRejections(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultPeerChainIsThePrototypes(t *testing.T) {
+	c, err := parse(`"fence": {"api_timeout": "7s"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := c.PeerFences()
+	if len(got) != 2 || got[0].Kind != "incus-api-stop" || got[0].Budget != 7*time.Second || got[1].Kind != "watchdog-wait" {
+		t.Fatalf("default peer chain %+v, want incus-api-stop 7s then watchdog-wait", got)
+	}
+	if _, err := parse(`"fences": {"peer": [{"kind": "exec", "budget": "1s"}]}`); err == nil {
+		t.Fatal("exec peer fence without a command accepted")
+	}
+	if _, err := parse(`"fences": {"peer": []}`); err != nil {
+		t.Fatalf("an empty peer chain (unverified policy only) must be allowed: %v", err)
+	}
+}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/lease"
 )
@@ -272,69 +273,68 @@ func (t *termState) fenceOthers() error {
 	}
 }
 
+// fenceVia names a peer fence in a member record; the API stop keeps the
+// prototype's wording, which records and operators already know.
+func fenceVia(kind string) string {
+	if kind == fence.KindIncusAPIStop {
+		return "Incus API"
+	}
+	return kind
+}
+
 // fenceMember tries to establish that m runs nothing. It returns done=true
 // when that is confirmed or covered by a policy, else a reason to wait.
+//
+// It runs the configured peer chain (by default incus-api-stop, then
+// watchdog-wait); the first fence that does not skip decides. When every
+// fence skips (m unreachable and no fence applies), the record and
+// fence.unverified decide, as before.
 func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why string, retry time.Duration) {
 	retry = t.a.cfg.Fence.RetryInterval.D()
 	a := t.a
-	cctx, cancel := context.WithTimeout(t.op, a.cfg.Fence.APITimeout.D())
-	defer cancel()
-
-	online, err := a.rt.MemberOnline(cctx, m)
-	if err == nil && online {
-		insts, lerr := a.rt.List(cctx, m)
-		if lerr == nil && !incus.AllStopped(insts) {
-			t.log.Warn("fencing: stopping instances on member via Incus API", "peer", m, "running", incus.Running(insts))
-			if serr := a.rt.Stop(cctx, m, 0); serr != nil {
-				t.log.Warn("fencing: stop via API failed", "peer", m, "err", serr)
-			}
-			insts, lerr = a.rt.List(cctx, m)
+	since := a.now().Sub(t.acquired)
+	pt := fence.PeerTarget{
+		Target:          fence.Target{Member: m, Project: a.cfg.Project(m)},
+		MayRun:          st.State == coord.MayRun,
+		FencesByReboot:  st.Caps.FencesByReboot,
+		WatchdogTimeout: st.Caps.WatchdogTimeout,
+		SinceAcquired:   since,
+	}
+	out, by := a.peerChain().Attempt(t.op, pt)
+	switch out.Status {
+	case fence.Wait:
+		if out.Retry > 0 {
+			retry = min(retry, out.Retry)
 		}
-		if lerr == nil && incus.AllStopped(insts) {
-			for _, in := range insts {
-				if in.Location != m {
-					return false, fmt.Sprintf("BLOCKED: instance %s of project %s is located on %s — project pinning is broken", in.Name, a.cfg.Project(m), in.Location), retry
-				}
-			}
-			if st.State == coord.MayRun {
-				err := a.co.Guarded(t.op, t.epoch, t.k.ID(), a.co.OpPutMS(m, coord.MemberState{
-					State: coord.Stopped, Epoch: st.Epoch, By: a.member, At: a.now().UTC(), Caps: st.Caps,
-					Reason: fmt.Sprintf("fenced via Incus API by epoch %d", t.epoch),
-				}))
-				if err != nil {
-					return false, "cannot record fence: " + err.Error(), retry
-				}
-				t.log.Info("fenced via Incus API (confirmed stopped)", "peer", m, "their_epoch", st.Epoch)
-			}
+		return false, out.Why, retry
+	case fence.Confirmed:
+		if !out.Verified {
+			t.log.Warn("member unreachable; treating as fenced", "peer", m, "by", by, "waited", since.Round(time.Second))
 			return true, "", 0
 		}
-		if lerr == nil {
-			// The cluster sees m and its instances, and they are not stopped:
-			// no record can override that.
-			return false, fmt.Sprintf("instances on %s still not stopped after API stop", m), retry
+		if st.State == coord.MayRun {
+			err := a.co.Guarded(t.op, t.epoch, t.k.ID(), a.co.OpPutMS(m, coord.MemberState{
+				State: coord.Stopped, Epoch: st.Epoch, By: a.member, At: a.now().UTC(), Caps: st.Caps,
+				Reason: fmt.Sprintf("fenced via %s by epoch %d", fenceVia(by), t.epoch),
+			}))
+			if err != nil {
+				return false, "cannot record fence: " + err.Error(), retry
+			}
+			t.log.Info("fenced (confirmed stopped)", "peer", m, "by", by, "their_epoch", st.Epoch)
 		}
-		err = lerr
-	}
-	reach := "offline in the Incus cluster"
-	if err != nil {
-		reach = "Incus API error: " + err.Error()
+		return true, "", 0
 	}
 
+	reach := out.Why
+	if reach == "" {
+		reach = "no peer fence applies"
+	}
 	if st.State != coord.MayRun {
 		t.log.Info("member unreachable but recorded stopped; nothing to fence", "peer", m, "reach", reach, "record", st.State)
 		return true, "", 0
 	}
-	since := a.now().Sub(t.acquired)
-	if st.Caps.FencesByReboot {
-		wait := st.Caps.WatchdogTimeout + a.cfg.Fence.RebootMargin.D()
-		if since >= wait {
-			t.log.Warn("member unreachable; its armed watchdog has had time to reset it — treating as fenced", "peer", m, "waited", since.Round(time.Second))
-			return true, "", 0
-		}
-		return false, fmt.Sprintf("waiting %s for %s's watchdog (%s)", (wait - since).Round(time.Second), m, reach), min(retry, wait-since)
-	}
 	if a.cfg.Fence.Unverified == config.UnverifiedProceed && st.Caps.NoVerifiedSelfFence {
-		return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is %s, and advertises no verified self-fence, so policy=proceed cannot trust it; "+
+		return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is unreachable (%s), and advertises no verified self-fence, so policy=proceed cannot trust it; "+
 			"run `pagurus fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
 	}
 	if a.cfg.Fence.Unverified == config.UnverifiedProceed {
@@ -346,7 +346,7 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 		}
 		return false, fmt.Sprintf("waiting %s before trusting %s's self-fence (%s)", (wait - since).Round(time.Second), m, reach), min(retry, wait-since)
 	}
-	return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is %s, and has no reboot watchdog; "+
+	return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is unreachable (%s), and no peer fence confirmed; "+
 		"waiting for it to come back, or run `pagurus fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
 }
 

@@ -357,6 +357,15 @@ func (a *Agent) selfChain() fence.Chain {
 	return c
 }
 
+// peerChain is the configured peer-fence chain over the runtime.
+func (a *Agent) peerChain() fence.PeerChain {
+	c, err := fence.BuildPeer(a.rt, a.cfg.Fence.RebootMargin.D(), a.cfg.PeerFences())
+	if err != nil {
+		panic(err) // config.Validate builds the same chain
+	}
+	return c
+}
+
 func (a *Agent) selfTarget() fence.Target {
 	return fence.Target{Member: a.member, Project: a.cfg.Project(a.member)}
 }

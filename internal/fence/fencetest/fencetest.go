@@ -98,9 +98,20 @@ func (c *CgroupFS) SetPopulated(t testing.TB, project, name string, on bool) {
 	if on {
 		v = "1"
 	}
-	if err := os.WriteFile(filepath.Join(c.dir(project, name), "cgroup.events"), []byte("populated "+v+"\nfrozen 0\n"), 0o644); err != nil {
+	if err := writeEvents(c.dir(project, name), v); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// writeEvents replaces cgroup.events atomically, as the kernel does: a reader
+// never sees a half-written file. (os.WriteFile truncates first, and a reader
+// racing it sees an empty file; found by -race on 2026-10-08.)
+func writeEvents(dir, populated string) error {
+	tmp := filepath.Join(dir, ".cgroup.events.tmp")
+	if err := os.WriteFile(tmp, []byte("populated "+populated+"\nfrozen 0\n"), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(dir, "cgroup.events"))
 }
 
 // Killed reports whether anything wrote cgroup.kill for the container.
@@ -132,7 +143,7 @@ func (c *CgroupFS) watch() {
 		kills, _ := filepath.Glob(filepath.Join(c.Root, "lxc.payload.*", "cgroup.kill"))
 		for _, k := range kills {
 			if b, err := os.ReadFile(k); err == nil && strings.TrimSpace(string(b)) == "1" {
-				_ = os.WriteFile(filepath.Join(filepath.Dir(k), "cgroup.events"), []byte("populated 0\nfrozen 0\n"), 0o644)
+				_ = writeEvents(filepath.Dir(k), "0")
 			}
 		}
 	}
