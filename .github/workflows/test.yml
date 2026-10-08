@@ -39,7 +39,9 @@ jobs:
       - name: Test (race)
         run: go test -race -count=1 -v ./... 2>&1 | tee test.log; test ${PIPESTATUS[0]} -eq 0
 
-      # testutil.Etcd skips when no etcd binary is found; in CI that would turn
-      # every integration test into a silent pass.
-      - name: No skipped tests
-        run: '! grep -- "--- SKIP" test.log'
+      # testutil.Etcd / EtcdTLS skip when no etcd binary is found; in CI that
+      # would turn every integration test into a silent pass. Other skips are
+      # deliberate (e.g. the qemu-kill contract's hang cases: nothing can make
+      # SIGKILL wait) and stay allowed.
+      - name: No tests skipped for want of etcd
+        run: '! grep -- "etcd binary not found" test.log'
