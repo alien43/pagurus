@@ -175,8 +175,7 @@ itself only fences, records `may-run`, calls `Start`, then checks location and a
   project (`examples/whoami-instances/`). The preflight checks each one exists, is a
   container, and has `boot.autostart=false`.
 
-Both starters run containers only, because the self-fences confirm from cgroupfs. VMs are
-`singleton-vm-support` (configs repo).
+The **instances** starter also runs VMs. compose runs containers only.
 
 ## Fences
 
@@ -213,6 +212,31 @@ chain the member runs on itself before its lease can expire. It stops at the fir
 `pagurus fence-check -c cfg --member <m>` runs only the *confirm* of each fence and prints
 the chain. It is read-only, so safe on production. Run it **on** that member, because the
 container fences read the local cgroupfs.
+
+### VMs
+
+An Incus API stop **needs cluster quorum** for VMs exactly as for containers. It opens
+cluster-DB transactions before it reaches the qemu driver (Incus v7.5.1
+`internal/server/instance/instance_utils.go:335`, `internal/server/operations/linux.go:20`).
+And a VM's qemu has **no `lxc.payload` cgroup**: it runs in `incus.service`'s. So for VMs:
+
+```jsonc
+"fences": {"self": [{"kind": "incus-stop", "budget": "6s"}, {"kind": "qemu-kill", "budget": "5s"}]}
+```
+
+`incus-stop` and `cgroup-kill` skip VMs, because they confirm from cgroupfs, which cannot see
+qemu. `qemu-kill` is the Incus-free VM self-fence:
+- it reads `/run/incus/<project>_<name>/qemu.pid` and opens a pidfd;
+- it accepts the process only if its cmdline is qemu (`qemu-system`/`qemu-kvm`) and names that
+  pidfile, as Incus checks its own PID (`driver_qemu.go:6517`);
+- it SIGKILLs through the pidfd, so a reused PID is never hit, and confirms when no such
+  process is left.
+
+Measured on asus (Alpine VM): confirmed in 117 ms, and Incus then reports the VM `STOPPED`
+and can start it again. Without `qemu-kill` a VM member has no verified self-fence, which is
+allowed and advertised (§ Fences). `boot.autostart=false` keeps a VM down across a host reboot
+just as for a container: `instanceShouldAutoStart` (`cmd/incusd/instances.go:276`) ignores the
+instance type.
 
 ### Writing a fence
 
@@ -285,7 +309,7 @@ internal/config/        schema, defaults, the timing validation
 internal/lease/         lease keeper with the local validity bound
 internal/coord/         etcd schema: leader/epoch, member states, registrations, pin
 internal/incus/         incus / incus-compose / cgroupfs driver
-internal/fence/         fence kinds, the chain runner, fencetest (fakes + contract)
+internal/fence/         fence kinds (incl. qemu-kill), the chain runner, fencetest (fakes + contract)
 internal/start/         starters: compose, instances
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
 internal/agent/         the state machine (agent.go: lifecycle; lead.go: a term)

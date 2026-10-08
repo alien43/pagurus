@@ -170,6 +170,54 @@ func FakeProc(t testing.TB) *Proc {
 	return p
 }
 
+// Qemu is a fake VM process: a real `sleep` whose argv[0] reads like a qemu
+// command line naming its pidfile, laid out the way Incus keeps it:
+// <RunRoot>/<project>_<name>/qemu.pid.
+type Qemu struct {
+	RunRoot string
+	PIDFile string
+	Cmd     *exec.Cmd
+}
+
+// FakeQemu starts one fake qemu for project/name under runRoot (created if
+// empty: pass "" for a fresh temp dir).
+func FakeQemu(t testing.TB, runRoot, project, name string) *Qemu {
+	t.Helper()
+	if runRoot == "" {
+		runRoot = t.TempDir()
+	}
+	dir := filepath.Join(runRoot, project+"_"+name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	pf := filepath.Join(dir, "qemu.pid")
+	cmd := exec.Command("bash", "-c", `exec -a "qemu-system-x86_64 -name `+name+` -pidfile `+pf+`" sleep 1000`)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	// Reap it as soon as it dies, as init does for a real qemu.
+	go func() { _, _ = cmd.Process.Wait() }()
+	if err := os.WriteFile(pf, []byte(fmt.Sprint(cmd.Process.Pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Wait until the exec has replaced bash's cmdline.
+	for i := 0; i < 100; i++ {
+		b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", cmd.Process.Pid))
+		if strings.Contains(string(b), "qemu-system") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return &Qemu{RunRoot: runRoot, PIDFile: pf, Cmd: cmd}
+}
+
+// Alive reports whether the fake qemu still runs.
+func (q *Qemu) Alive() bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", q.Cmd.Process.Pid))
+	return err == nil && strings.Contains(string(b), "qemu-system")
+}
+
 // Env is one ready-made target environment for a contract run.
 type Env struct {
 	Target fence.Target
@@ -224,6 +272,9 @@ func Contract(t *testing.T, setup Setup) {
 	t.Run("honours its budget", func(t *testing.T) {
 		budget := 300 * time.Millisecond
 		f, e := setup(t, budget)
+		if e.Hang == nil {
+			t.Skip("this environment cannot make the fence hang")
+		}
 		e.Running(t)
 		e.Hang(t)
 		start := time.Now()
@@ -238,6 +289,9 @@ func Contract(t *testing.T, setup Setup) {
 	})
 	t.Run("errors name the kind", func(t *testing.T) {
 		f, e := setup(t, 200*time.Millisecond)
+		if e.Hang == nil {
+			t.Skip("this environment cannot make the fence hang")
+		}
 		e.Running(t)
 		e.Hang(t)
 		res := fence.Chain{f}.Run(context.Background(), e.Target, nil)

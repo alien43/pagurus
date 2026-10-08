@@ -380,7 +380,7 @@ func cmdFenceCheck(ctx context.Context, cfg *config.Config, rt *incus.Driver, me
 	if err != nil {
 		return err
 	}
-	tg := fence.Target{Member: member, Project: cfg.Project(member)}
+	tg := targetFor(ctx, cfg, rt, member)
 	fmt.Printf("self chain of %s (project %s): %d fence(s), total budget %s, verified=%v\n",
 		member, tg.Project, len(chain), chain.Budget(), chain.Verified(tg))
 	for i, f := range chain {
@@ -419,7 +419,7 @@ func cmdFenceRun(ctx context.Context, cfg *config.Config, rt *incus.Driver, memb
 	if idx > len(chain) {
 		return fmt.Errorf("fence-run: the self chain has %d fence(s)", len(chain))
 	}
-	res := fence.Chain{chain[idx-1]}.Run(ctx, fence.Target{Member: member, Project: cfg.Project(member)}, log)
+	res := fence.Chain{chain[idx-1]}.Run(ctx, targetFor(ctx, cfg, rt, member), log)
 	fmt.Println(res.String())
 	if !res.Stopped {
 		return fmt.Errorf("fence %s did not confirm", chain[idx-1].Kind())
@@ -441,4 +441,22 @@ func newStarter(cfg *config.Config, drv *incus.Driver) start.Starter {
 	default:
 		return start.Compose{Run: incus.Run, Project: cfg.Project, File: cfg.Start.File, Args: cfg.Start.Args, UpArgs: cfg.Start.UpArgs}
 	}
+}
+
+// targetFor is member's fence target with the instance types its project
+// holds, read through Incus (best effort: these are operator commands, run
+// while Incus is up; without types, only type-agnostic fences apply).
+func targetFor(ctx context.Context, cfg *config.Config, rt *incus.Driver, member string) fence.Target {
+	t := fence.Target{Member: member, Project: cfg.Project(member)}
+	insts, err := rt.List(ctx, member)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: cannot list %s's instances (%v); fences that depend on the instance type will skip\n", member, err)
+		return t
+	}
+	for _, in := range insts {
+		if in.Type != "" && !slices.Contains(t.Types, in.Type) {
+			t.Types = append(t.Types, in.Type)
+		}
+	}
+	return t
 }

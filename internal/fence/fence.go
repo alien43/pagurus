@@ -152,13 +152,15 @@ func BuildSelf(l Local, specs []Spec) (Chain, error) {
 			c = append(c, IncusStop{L: l, B: s.Budget})
 		case KindCgroupKill:
 			c = append(c, CgroupKill{L: l, B: s.Budget})
+		case KindQemuKill:
+			c = append(c, QemuKill{B: s.Budget})
 		case KindExec:
 			if len(s.Command) == 0 {
 				return nil, fmt.Errorf("fences.self[%d] (exec): command required", i)
 			}
 			c = append(c, &Exec{Argv: s.Command, ConfirmArgv: s.Confirm, B: s.Budget, For: s.For})
 		default:
-			return nil, fmt.Errorf("fences.self[%d]: unknown kind %q (want %s, %s or %s)", i, s.Kind, KindIncusStop, KindCgroupKill, KindExec)
+			return nil, fmt.Errorf("fences.self[%d]: unknown kind %q (want %s, %s, %s or %s)", i, s.Kind, KindIncusStop, KindCgroupKill, KindQemuKill, KindExec)
 		}
 	}
 	return c, nil

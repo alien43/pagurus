@@ -374,10 +374,8 @@ func (t *termState) start() error {
 		if in.Location != a.member {
 			return fmt.Errorf("%w: instance %s landed on %s, not %s", errMisplaced, in.Name, in.Location, a.member)
 		}
-		if in.Type != "container" {
-			return fmt.Errorf("%w: instance %s is a %s", errMisplaced, in.Name, in.Type)
-		}
 	}
+	a.setTypes(insts)
 	t.publish()
 	return nil
 }

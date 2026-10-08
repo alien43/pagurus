@@ -84,7 +84,7 @@ type Instances struct {
 }
 
 func (s Instances) Kind() string    { return KindInstances }
-func (s Instances) Types() []string { return []string{"container"} }
+func (s Instances) Types() []string { return []string{"container", "virtual-machine"} }
 
 func (s Instances) bin() string {
 	if s.Bin == "" {
@@ -121,16 +121,17 @@ func (s Instances) selected(ctx context.Context, member string) ([]incus.Instanc
 	return out, nil
 }
 
-// CheckStart: every selected instance exists, is a container (the fences
-// confirm from cgroupfs), and will not start on its own at boot.
+// CheckStart: every selected instance exists, is a container or a VM, and
+// will not start on its own at boot. Which fences can confirm it stopped is
+// the self chain's business (cgroup-kill: containers; qemu-kill: VMs).
 func (s Instances) CheckStart(ctx context.Context, member string) error {
 	insts, err := s.selected(ctx, member)
 	if err != nil {
 		return err
 	}
 	for _, in := range insts {
-		if in.Type != "" && in.Type != "container" {
-			return fmt.Errorf("instance %s is a %s; the instances starter runs containers only", in.Name, in.Type)
+		if in.Type != "" && in.Type != "container" && in.Type != "virtual-machine" {
+			return fmt.Errorf("instance %s is a %s; the instances starter runs containers and VMs", in.Name, in.Type)
 		}
 		if in.Expanded["boot.autostart"] != "false" {
 			return fmt.Errorf("instance %s: boot.autostart must be \"false\" (unset restores the last state on boot)", in.Name)

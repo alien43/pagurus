@@ -78,12 +78,19 @@ func TestInstancesCheckRefuses(t *testing.T) {
 	}{
 		"missing name":    {fakeList{inst("web", "Stopped", "container", "false")}, []string{"web", "db"}, "no instance(s) db"},
 		"empty project":   {fakeList{}, nil, "no instances"},
-		"a VM":            {fakeList{inst("vm", "Stopped", "virtual-machine", "false")}, nil, "containers only"},
+		"unknown type":    {fakeList{inst("x", "Stopped", "potato", "false")}, nil, "containers and VMs"},
 		"autostart unset": {fakeList{inst("web", "Stopped", "container", "")}, nil, "boot.autostart"},
 	} {
 		s := start.Instances{Run: incus.Run, Project: project, L: c.l, Names: c.names}
 		if err := s.CheckStart(context.Background(), "rpi5"); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err %v, want %q", name, err, c.want)
 		}
+	}
+}
+
+func TestInstancesAcceptsVMs(t *testing.T) {
+	s := start.Instances{Run: incus.Run, Project: project, L: fakeList{inst("vm", "Stopped", "virtual-machine", "false")}}
+	if err := s.CheckStart(context.Background(), "asus"); err != nil {
+		t.Fatalf("a VM was refused: %v", err)
 	}
 }

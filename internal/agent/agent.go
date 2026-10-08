@@ -68,8 +68,12 @@ type Agent struct {
 	http    *http.Client
 	version string
 
-	member  string
-	arch    string
+	member string
+	arch   string
+	// types are the instance types in this member's project, learned at
+	// preflight and after each start; the self-fence chain is chosen by them.
+	typesMu sync.Mutex
+	types   []string
 	agentID string
 
 	// now is replaceable in tests.
@@ -205,10 +209,10 @@ func (a *Agent) Preflight(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, in := range insts {
-		if in.Type != "container" {
-			return fmt.Errorf("instance %s is a %s; only containers can be fenced via cgroup.kill", in.Name, in.Type)
-		}
+	a.setTypes(insts)
+	if t := a.selfTarget(); len(t.Types) > 0 && !a.selfChain().Verified(t) {
+		a.log.Warn("no fence in the self chain applies to this project's instances: no verified self-fence (advertised; peers will not trust it under proceed)",
+			"types", t.Types, "chain", a.cfg.SelfFences())
 	}
 	return a.rt.CheckStart(cctx, m)
 }
@@ -368,7 +372,23 @@ func (a *Agent) peerChain() fence.PeerChain {
 }
 
 func (a *Agent) selfTarget() fence.Target {
-	return fence.Target{Member: a.member, Project: a.cfg.Project(a.member)}
+	a.typesMu.Lock()
+	defer a.typesMu.Unlock()
+	return fence.Target{Member: a.member, Project: a.cfg.Project(a.member), Types: slices.Clone(a.types)}
+}
+
+// setTypes records the distinct instance types of insts (sorted).
+func (a *Agent) setTypes(insts []incus.Instance) {
+	var ts []string
+	for _, in := range insts {
+		if in.Type != "" && !slices.Contains(ts, in.Type) {
+			ts = append(ts, in.Type)
+		}
+	}
+	slices.Sort(ts)
+	a.typesMu.Lock()
+	a.types = ts
+	a.typesMu.Unlock()
 }
 
 // stopLocal runs this member's self-fence chain (by default incus-stop, then
