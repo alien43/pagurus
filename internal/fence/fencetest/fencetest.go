@@ -201,21 +201,23 @@ func FakeQemu(t testing.TB, runRoot, project, name string) *Qemu {
 	if err := os.WriteFile(pf, []byte(fmt.Sprint(cmd.Process.Pid)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Wait until the exec has replaced bash's cmdline.
-	for i := 0; i < 100; i++ {
-		b, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", cmd.Process.Pid))
-		if strings.Contains(string(b), "qemu-system") {
-			break
+	// Wait until the exec has replaced bash: argv[0] must *start* with
+	// qemu-system. (bash's own cmdline already *contains* the string, inside
+	// its -c argument, so a Contains check returned before the exec, and on a
+	// slow CI runner a fence then raced the exec: CI run for f09c991.)
+	q := &Qemu{RunRoot: runRoot, PIDFile: pf, Cmd: cmd}
+	for deadline := time.Now().Add(5 * time.Second); !q.Alive(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("fake qemu %d never exec'd", cmd.Process.Pid)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	return &Qemu{RunRoot: runRoot, PIDFile: pf, Cmd: cmd}
+	return q
 }
 
 // Alive reports whether the fake qemu still runs.
 func (q *Qemu) Alive() bool {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", q.Cmd.Process.Pid))
-	return err == nil && strings.Contains(string(b), "qemu-system")
+	return err == nil && strings.HasPrefix(string(b), "qemu-system")
 }
 
 // Env is one ready-made target environment for a contract run.
