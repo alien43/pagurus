@@ -24,6 +24,7 @@ func TestValidityBoundNeverExceedsServerExpiry(t *testing.T) {
 	observer := testutil.Client(t, ep)
 
 	opts := Options{TTL: 5 * time.Second, RenewInterval: 500 * time.Millisecond, Margin: 500 * time.Millisecond, OpTimeout: 400 * time.Millisecond, Log: quiet()}
+	warmUp(t, cli)
 	k, err := Grant(t.Context(), cli, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -69,6 +70,7 @@ func TestRenewalExtendsBoundAndRevokeStops(t *testing.T) {
 	ep := testutil.Etcd(t)
 	cli := testutil.Client(t, ep)
 	opts := Options{TTL: 5 * time.Second, RenewInterval: 200 * time.Millisecond, Margin: 500 * time.Millisecond, OpTimeout: 200 * time.Millisecond, Log: quiet()}
+	warmUp(t, cli)
 	k, err := Grant(t.Context(), cli, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -95,6 +97,7 @@ func TestResumeRequiresLiveLease(t *testing.T) {
 	ep := testutil.Etcd(t)
 	cli := testutil.Client(t, ep)
 	opts := Options{TTL: 5 * time.Second, RenewInterval: time.Second, Margin: 500 * time.Millisecond, OpTimeout: time.Second, Log: quiet()}
+	warmUp(t, cli)
 	k, err := Grant(t.Context(), cli, opts)
 	if err != nil {
 		t.Fatal(err)
@@ -108,5 +111,17 @@ func TestResumeRequiresLiveLease(t *testing.T) {
 	}
 	if _, err := Resume(t.Context(), cli, clientv3.LeaseID(12345), opts); err != ErrLost {
 		t.Fatalf("resume of an unknown lease: got %v, want ErrLost", err)
+	}
+}
+
+// warmUp makes the client's first request outside the timings under test: a
+// fresh client dials lazily, and on a slow CI runner under -race that first
+// dial alone outlasted a 200ms OpTimeout (CI, 2026-10-10).
+func warmUp(t *testing.T, cli *clientv3.Client) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	if _, err := cli.Get(ctx, "warm-up"); err != nil {
+		t.Fatalf("etcd not reachable: %v", err)
 	}
 }
