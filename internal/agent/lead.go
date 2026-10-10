@@ -35,6 +35,7 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 	// localStopped again.
 	a.role, a.localStopped, a.unfitAfter = roleLeader, false, time.Time{}
 	a.mu.Unlock()
+	a.m.Bool("pagurus_role", true)
 	defer a.setRole(roleFollower)
 	a.beat(time.Minute)
 	hctx, stopHB := context.WithCancel(context.Background())
@@ -48,6 +49,8 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 
 	t := &termState{a: a, lease: lease, epoch: epoch, acquired: acquired, log: log, op: op}
 	log.Info("won the office", "lease", fmt.Sprintf("%x", int64(lease)))
+	a.m.Inc("pagurus_terms_total")
+	defer a.m.SetGauge("pagurus_lease_remaining_seconds", 0)
 
 	finish := func() int {
 		if lost.Err() != nil {
@@ -158,17 +161,20 @@ func (t *termState) fenceOthers() error {
 		}
 	}
 	alerted := map[string]bool{}
+	defer a.m.Bool("pagurus_fence_blocked", false)
 	for {
 		a.beat(a.cfg.Fence.RetryInterval.D() + time.Duration(len(pending)+1)*a.cfg.Fence.APITimeout.D())
 		next := a.cfg.Fence.RetryInterval.D()
 		states, err := a.co.MemberStates(t.op)
 		if err == nil {
 			var left []string
+			blocked := false
 			for _, m := range pending {
 				done, why, retry := t.fenceMember(m, states[m])
 				if !done {
 					next = min(next, max(retry, 100*time.Millisecond))
 					left = append(left, m)
+					blocked = blocked || strings.HasPrefix(why, "BLOCKED")
 					if why != "" && !alerted[m+why] {
 						alerted[m+why] = true
 						if strings.HasPrefix(why, "BLOCKED") {
@@ -180,6 +186,7 @@ func (t *termState) fenceOthers() error {
 				}
 			}
 			pending = left
+			a.m.Bool("pagurus_fence_blocked", blocked)
 		} else if t.op.Err() == nil {
 			t.log.Warn("cannot read member states", "err", err)
 		}
@@ -189,6 +196,19 @@ func (t *termState) fenceOthers() error {
 		if !sleep(t.op, next) {
 			return t.op.Err()
 		}
+	}
+}
+
+func peerResult(o fence.Outcome) string {
+	switch {
+	case o.Status == fence.Confirmed && o.Verified:
+		return "confirmed"
+	case o.Status == fence.Confirmed:
+		return "assumed"
+	case o.Status == fence.Wait:
+		return "wait"
+	default:
+		return "skipped"
 	}
 }
 
@@ -220,6 +240,11 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 		SinceAcquired:   since,
 	}
 	out, by := a.peerChain().Attempt(t.op, pt)
+	kind := by
+	if kind == "" {
+		kind = "none"
+	}
+	a.m.Inc("pagurus_fence_runs_total", "chain", "peer", "kind", kind, "result", peerResult(out))
 	switch out.Status {
 	case fence.Wait:
 		if out.Retry > 0 {
@@ -476,6 +501,9 @@ func (t *termState) supervise() {
 		err := t.health()
 		if t.op.Err() != nil {
 			return
+		}
+		if ttl, terr := a.cli.TimeToLive(t.op, t.lease); terr == nil {
+			a.m.SetGauge("pagurus_lease_remaining_seconds", float64(max(ttl.TTL, 0)))
 		}
 		switch {
 		case err == nil:

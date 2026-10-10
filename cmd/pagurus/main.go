@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -27,6 +29,7 @@ import (
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/metrics"
 	"github.com/alien43/pagurus/internal/provision"
 	"github.com/alien43/pagurus/internal/start"
 	"github.com/alien43/pagurus/internal/versions"
@@ -91,6 +94,7 @@ func main() {
 	yes := fs.Bool("yes", false, "provision: allow cluster group changes without asking")
 	iKnow := fs.Bool("i-know", false, "fence-run: confirm that this really stops the member's workload")
 	endpoints := fs.String("etcd", "", "override etcd.endpoints (comma-separated; drill harness)")
+	metricsAddr := fs.String("metrics-addr", "", "run: serve Prometheus metrics on this address (e.g. :9478); off by default")
 	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		fmt.Fprint(os.Stderr, usage)
@@ -125,7 +129,7 @@ func main() {
 	case "validate":
 		err = cmdValidate(ctx, cfg, rt)
 	case "run":
-		err = cmdRun(ctx, cfg, rt, log, *self, *cfgPath)
+		err = cmdRun(ctx, cfg, rt, log, *self, *cfgPath, *metricsAddr)
 	case "fence-self":
 		os.Exit(cmdFenceSelf(cfg, drv, *member, log))
 	case "status":
@@ -203,7 +207,7 @@ func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime) error {
 	return nil
 }
 
-func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logger, self, cfgPath string) error {
+func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logger, self, cfgPath, metricsAddr string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("run must be root (cgroup.kill, watchdog)")
 	}
@@ -220,8 +224,21 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logg
 	if err != nil {
 		return err
 	}
+	ms := metrics.New(cfg.Service, self)
 	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log),
-		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: []string{exe, "term", "--socket"}})
+		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: []string{exe, "term", "--socket"}, Metrics: ms})
+	if metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", ms.Handler())
+		srv := &http.Server{Addr: metricsAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+		ln, err := net.Listen("tcp", metricsAddr)
+		if err != nil {
+			return fmt.Errorf("metrics: %w", err)
+		}
+		go func() { _ = srv.Serve(ln) }()
+		defer srv.Close()
+		log.Info("serving metrics", "addr", ln.Addr().String())
+	}
 	if err := a.Preflight(ctx); err != nil {
 		// No lease is held by a starting agent, so nothing may run here. If
 		// the local Incus is what failed, cgroup.kill still works: use it,

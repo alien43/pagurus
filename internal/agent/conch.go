@@ -90,6 +90,7 @@ func (a *Agent) spawnConch(delay time.Duration) (chan error, error) {
 	a.mu.Lock()
 	a.conch = cmd
 	a.mu.Unlock()
+	a.m.Bool("pagurus_conch_running", true)
 	a.log.Info("campaigning", "member", a.member, "office", a.co.Office(), "campaign_after", delay, "conch_pid", cmd.Process.Pid)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -125,6 +126,15 @@ func (a *Agent) conchExited(err error) {
 	a.mu.Unlock()
 	if termPID > 0 {
 		_ = syscall.Kill(termPID, syscall.SIGKILL)
+	}
+	a.m.Bool("pagurus_conch_running", false)
+	switch code {
+	case 0:
+		a.m.Inc("pagurus_conch_exits_total", "result", "ok")
+	case 71:
+		a.m.Inc("pagurus_conch_exits_total", "result", "fence_failed")
+	default:
+		a.m.Inc("pagurus_conch_exits_total", "result", "other")
 	}
 	switch code {
 	case 0:

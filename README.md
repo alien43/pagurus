@@ -425,6 +425,33 @@ plus half of it.
 
 **The prototype runs `systemd` mode without a `FailureAction`: no machine is ever rebooted.**
 
+## Metrics
+
+`pagurus run --metrics-addr :9478` serves Prometheus metrics on `/metrics` (off by default).
+Every series carries `svc` and `member` labels; no label has unbounded values.
+
+| Metric | Type | Meaning |
+| :--- | :--- | :--- |
+| `pagurus_role` | gauge | 1 while this member holds the office and runs its term |
+| `pagurus_conch_running` | gauge | 1 while this member's `conch elect` runs |
+| `pagurus_local_running` | gauge | containers of this member's project with live processes, **from cgroupfs** every health interval: each member's own ground truth, independent of the office |
+| `pagurus_fit` | gauge | 1 while the agent pets its watchdog backend |
+| `pagurus_lease_remaining_seconds` | gauge | server-side TTL left on the holder's lease (0 when not holding) |
+| `pagurus_fence_blocked` | gauge | 1 while this leader waits on a member it cannot fence (`block`) |
+| `pagurus_self_chain_verified` | gauge | 1 when the self chain can confirm a stop for this project's instance types |
+| `pagurus_terms_total` | counter | terms held |
+| `pagurus_fence_runs_total{chain,kind,result}` | counter | fences run by the agent (self: `confirmed\|failed\|skipped`; peer: `confirmed\|assumed\|wait\|skipped`). `pagurus fence-self` runs inside conch and isn't counted; its failures show as `pagurus_conch_exits_total{result="fence_failed"}` |
+| `pagurus_conch_exits_total{result}` | counter | `ok`, `fence_failed`, `other` |
+
+`deploy/grafana/pagurus-rules.yaml` holds Grafana rules for the four conditions that need a
+human. None fires on a normal failover or move:
+- **two running:** `count by (svc) (pagurus_local_running > 0) > 1`, at once;
+- **fence blocked:** for 2 min;
+- **unfit:** per member, for 1 min;
+- **nobody running:** while ≥ 2 agents report, for 3 min.
+
+`TestMetricsShowTheFourConditions` drives each condition in the sim.
+
 ## Layout
 
 ```
@@ -437,6 +464,8 @@ internal/incus/         incus / incus-compose / cgroupfs driver
 internal/fence/         fence kinds (incl. qemu-kill), the chain runner, fencetest (fakes + contract)
 internal/start/         starters: compose, instances
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
+internal/metrics/       Prometheus text exposition (no client library)
+deploy/grafana/         alert rules, to move into the fleet's Grafana provisioning
 internal/agent/         agent.go: the daemon (ground truth, campaigning); conch.go: conch,
                         the watchdog relay, the term socket; lead.go: a term
 examples/whoami/        a generic compose example (placeholder addresses, 192.0.2.0/24)

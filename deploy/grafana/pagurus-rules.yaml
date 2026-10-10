@@ -1,0 +1,200 @@
+# Grafana alert rules for pagurus: the four conditions that need a human.
+# NOT provisioned yet: move into fleet/monitoring/grafana/provisioning/alerting/
+# (or merge into rules.yaml) once the agents export metrics and Prometheus scrapes
+# them (job "pagurus"); see tasks/singleton-observability.md. The datasource UID
+# is fleet/monitoring's Prometheus.
+#
+# PagurusNobodyRunning waits 3m: more than 2 x (TTL 20s + grace 10s +
+# unverified_wait 40s) = 140s, the longest normal failover at the default
+# timing, so ordinary failovers (25-40s) and moves (~10s) never page.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: pagurus
+    folder: Infrastructure
+    interval: 30s
+    rules:
+      - uid: pagurus-two-running
+        title: PagurusTwoRunning
+        condition: B
+        for: 0s
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "pagurus {{ $labels.svc }}: the workload runs on more than one member (from each member's own cgroupfs) — the at-most-one invariant broke; run 'pagurus status' and stop the copy that does not hold the office"
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: derpa48qhefpcf
+            model:
+              editorMode: code
+              expr: count by (svc) (pagurus_local_running > 0) > bool 1
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold
+
+      - uid: pagurus-fence-blocked
+        title: PagurusFenceBlocked
+        condition: B
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "pagurus {{ $labels.svc }}: the new leader is blocked on a member it cannot fence (fence.unverified=block) — the service is down until that member returns or 'pagurus fence-ack --member <m>' after checking it is down"
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: derpa48qhefpcf
+            model:
+              editorMode: code
+              expr: max by (svc) (pagurus_fence_blocked) == bool 1
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold
+
+      - uid: pagurus-unfit
+        title: PagurusUnfit
+        condition: B
+        for: 1m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "pagurus {{ $labels.svc }} on {{ $labels.member }}: unfit, withholding its watchdog pet (a self-fence failed or conch stopped petting) — a possible second copy; only the watchdog stands between"
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: derpa48qhefpcf
+            model:
+              editorMode: code
+              expr: min by (svc, member) (pagurus_fit) == bool 0
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold
+
+      - uid: pagurus-nobody-running
+        title: PagurusNobodyRunning
+        condition: B
+        for: 3m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: critical
+        annotations:
+          summary: "pagurus {{ $labels.svc }}: no member runs the workload for > 3m although at least two agents report — failover is not happening; run 'pagurus status'"
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: derpa48qhefpcf
+            model:
+              editorMode: code
+              expr: (count by (svc) (pagurus_local_running > 0) or on (svc) (0 * count by (svc) (pagurus_fit))) == bool 0 and on (svc) count by (svc) (pagurus_fit) >= 2
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold

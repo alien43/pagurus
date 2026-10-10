@@ -32,6 +32,7 @@ import (
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/metrics"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
 
@@ -92,6 +93,7 @@ type Agent struct {
 	now func() time.Time
 
 	relay *notifyRelay // conch's watchdog pets (nil with the watchdog off)
+	m     *metrics.Set
 
 	mu               sync.Mutex
 	role             string
@@ -126,6 +128,8 @@ type Options struct {
 	FenceCmd, TermCmd []string
 	// ProcOutput receives conch's (and its children's) output (default stderr).
 	ProcOutput io.Writer
+	// Metrics, if set, receives the agent's metrics (else a private set).
+	Metrics *metrics.Set
 }
 
 func New(o Options) *Agent {
@@ -139,7 +143,11 @@ func New(o Options) *Agent {
 		o.ProcOutput = os.Stderr
 	}
 	host, _ := os.Hostname()
+	if o.Metrics == nil {
+		o.Metrics = metrics.New(o.Config.Service, o.Member)
+	}
 	return &Agent{
+		m:        o.Metrics,
 		cfg:      o.Config,
 		rt:       o.Runtime,
 		cli:      o.Etcd,
@@ -168,6 +176,29 @@ func (a *Agent) setRole(r string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.role = r
+	a.m.Bool("pagurus_role", r == roleLeader)
+}
+
+// fitness is Fit, recorded as pagurus_fit each time the petter evaluates it.
+func (a *Agent) fitness() (bool, string) {
+	ok, why := a.Fit()
+	a.m.Bool("pagurus_fit", ok)
+	return ok, why
+}
+
+// sampleLocal records pagurus_local_running from cgroupfs every health
+// interval: each member's own ground truth, independent of the office.
+func (a *Agent) sampleLocal(ctx context.Context) {
+	for {
+		if running, err := a.rt.LocalRunning(a.member); err == nil {
+			a.m.SetGauge("pagurus_local_running", float64(len(running)))
+		}
+		a.m.Bool("pagurus_self_chain_verified", a.selfChain().Verified(a.selfTarget()))
+		a.fitness() // records pagurus_fit even when no watchdog backend evaluates it
+		if !sleep(ctx, a.cfg.Health.Interval.D()) {
+			return
+		}
+	}
 }
 
 // beat records a term's progress; the next beat must come within d (plus
@@ -240,6 +271,7 @@ func (a *Agent) Preflight(ctx context.Context) error {
 		return fmt.Errorf("configured member %q but local Incus is %q", a.member, m)
 	}
 	a.member, a.arch = m, arch
+	a.m.SetMember(m)
 	if !slices.Contains(a.cfg.Members, m) {
 		return fmt.Errorf("member %q is not in members %v", m, a.cfg.Members)
 	}
@@ -299,7 +331,8 @@ func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 	a.mu.Unlock()
 	wctx, wcancel := context.WithCancel(context.Background())
 	wdDone := make(chan struct{})
-	go func() { defer close(wdDone); wd.Run(wctx, a.Fit) }()
+	go func() { defer close(wdDone); wd.Run(wctx, a.fitness) }()
+	go a.sampleLocal(wctx)
 	defer func() { wcancel(); <-wdDone }()
 
 	log := a.log.With("member", a.member)
@@ -480,6 +513,17 @@ func (a *Agent) setTypes(insts []incus.Instance) {
 	}
 }
 
+func stepResult(st fence.Step) string {
+	switch {
+	case st.Skipped:
+		return "skipped"
+	case st.Stopped:
+		return "confirmed"
+	default:
+		return "failed"
+	}
+}
+
 func typesPath(cfg *config.Config) string { return filepath.Join(cfg.StateDir, cfg.Service+".types") }
 
 // WriteTypes records the project's instance types for `pagurus fence-self`,
@@ -518,6 +562,9 @@ func (a *Agent) stopLocal(ctx context.Context, reason string) bool {
 	log := a.log.With("member", a.member, "reason", reason)
 	start := a.now()
 	res := a.selfChain().Run(context.WithoutCancel(ctx), a.selfTarget(), log)
+	for _, st := range res.Steps {
+		a.m.Inc("pagurus_fence_runs_total", "chain", "self", "kind", st.Kind, "result", stepResult(st))
+	}
 	ok := res.Stopped
 	a.setLocalStopped(ok)
 	if ok {
