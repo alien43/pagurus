@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -27,6 +28,7 @@ import (
 	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/provision"
 	"github.com/alien43/pagurus/internal/start"
+	"github.com/alien43/pagurus/internal/versions"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
 
@@ -166,6 +168,18 @@ func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime) error {
 	}
 	fmt.Printf("ok: member %s, project %s pinned, %s starter check passes, timing valid (TTL %s, self-fence lead %s)\n",
 		a.Member(), cfg.Project(a.Member()), rt.Starter.Kind(), cfg.Lease.TTL.D(), cfg.SelfFenceLead())
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	v := toolVersions(ctx, cfg, rt.Driver, quiet)
+	fmt.Printf("versions: incus %q", v["incus"])
+	if ic, ok := v["incus-compose"]; ok {
+		fmt.Printf(", incus-compose %q", ic)
+	}
+	fmt.Println()
+	for tool, ver := range v {
+		if w := versions.Check(tool, ver); w != "" {
+			fmt.Printf("WARNING: %s\n", w)
+		}
+	}
 	for _, m := range cfg.Members {
 		if err := rt.CheckProject(ctx, m); err != nil {
 			fmt.Printf("WARNING: %v\n", err)
@@ -183,7 +197,7 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logg
 		return err
 	}
 	defer cli.Close()
-	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Etcd: cli, Log: log, Version: version, Member: self})
+	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log)})
 	if err := a.Preflight(ctx); err != nil {
 		// No lease is held by a starting agent, so nothing may run here. If
 		// the local Incus is what failed, cgroup.kill still works: use it,
@@ -254,6 +268,12 @@ func cmdStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, cli *c
 		ag, wd := "-", "-"
 		if r, ok := regs[m]; ok {
 			ag = r.Version
+			if v := r.Versions["incus"]; v != "" {
+				ag += " incus " + v
+			}
+			if v := r.Versions["incus-compose"]; v != "" {
+				ag += " ic " + v
+			}
 			wd = r.Caps.WatchdogMode
 			if r.Caps.FencesByReboot {
 				wd += "(reboot)"
@@ -506,4 +526,32 @@ func cmdProvision(ctx context.Context, cfg *config.Config, api incus.API, dryRun
 	}
 	fmt.Printf("applied %d change(s)\n", len(plan.Actions))
 	return nil
+}
+
+// toolVersions reads the Incus server version and, with the compose
+// starter, the incus-compose version, warning on any outside what pagurus is
+// built for. They go into the agent's registration.
+func toolVersions(ctx context.Context, cfg *config.Config, drv *incus.Driver, log *slog.Logger) map[string]string {
+	vctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	v := map[string]string{}
+	if s, err := drv.ServerVersion(vctx); err == nil {
+		v["incus"] = s
+	}
+	if cfg.Start.Kind == start.KindCompose {
+		if out, err := incus.Run(vctx, "incus-compose", "version"); err == nil {
+			v["incus-compose"] = versions.Parse(string(out))
+		} else {
+			v["incus-compose"] = ""
+		}
+	}
+	for _, tool := range []string{"incus", "incus-compose"} {
+		if tool == "incus-compose" && cfg.Start.Kind != start.KindCompose {
+			continue
+		}
+		if w := versions.Check(tool, v[tool]); w != "" {
+			log.Warn("unsupported tool version", "tool", tool, "warning", w)
+		}
+	}
+	return v
 }

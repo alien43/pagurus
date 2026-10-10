@@ -360,3 +360,8 @@ func (d *Driver) StartInstances(ctx context.Context, member string, names []stri
 	}
 	return errors.Join(errs...)
 }
+
+// ServerVersion is the Incus server's version.
+func (d *Driver) ServerVersion(ctx context.Context) (string, error) {
+	return d.o.API.ServerVersion(ctx)
+}

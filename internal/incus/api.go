@@ -20,6 +20,8 @@ type API interface {
 	// Server returns this server's cluster member name, whether it is
 	// clustered, and its architectures.
 	Server(ctx context.Context) (name string, clustered bool, archs []string, err error)
+	// ServerVersion is the Incus server's version (e.g. "7.5.1").
+	ServerVersion(ctx context.Context) (string, error)
 	ProjectConfig(ctx context.Context, project string) (map[string]string, error)
 	ClusterGroupMembers(ctx context.Context, group string) ([]string, error)
 	// MemberStatus is the cluster member's status ("Online", "Offline", ...).
@@ -132,6 +134,18 @@ func (c *Client) Server(ctx context.Context) (string, bool, []string, error) {
 		return "", false, nil, err
 	}
 	return srv.Environment.ServerName, srv.Environment.ServerClustered, srv.Environment.Architectures, nil
+}
+
+func (c *Client) ServerVersion(ctx context.Context) (string, error) {
+	s, err := c.server(ctx)
+	if err != nil {
+		return "", err
+	}
+	srv, _, err := s.GetServer()
+	if err != nil {
+		return "", err
+	}
+	return srv.Environment.ServerVersion, nil
 }
 
 func (c *Client) ProjectConfig(ctx context.Context, project string) (map[string]string, error) {

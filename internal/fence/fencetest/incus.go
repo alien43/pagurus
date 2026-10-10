@@ -114,6 +114,13 @@ func (f *FakeIncus) Server(ctx context.Context) (string, bool, []string, error) 
 	return f.ServerName, true, f.Archs, nil
 }
 
+func (f *FakeIncus) ServerVersion(ctx context.Context) (string, error) {
+	if err := f.gate(ctx); err != nil {
+		return "", err
+	}
+	return "7.5.1", nil
+}
+
 func (f *FakeIncus) ProjectConfig(ctx context.Context, project string) (map[string]string, error) {
 	if err := f.gate(ctx); err != nil {
 		return nil, err

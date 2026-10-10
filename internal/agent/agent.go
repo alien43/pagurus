@@ -58,15 +58,16 @@ const (
 var UpTimeout = 5 * time.Minute
 
 type Agent struct {
-	cfg     *config.Config
-	rt      Runtime
-	cli     *clientv3.Client
-	co      *coord.Coord
-	wd      watchdog.Watchdog
-	log     *slog.Logger
-	alerter *Alerter
-	http    *http.Client
-	version string
+	cfg      *config.Config
+	rt       Runtime
+	cli      *clientv3.Client
+	co       *coord.Coord
+	wd       watchdog.Watchdog
+	log      *slog.Logger
+	alerter  *Alerter
+	http     *http.Client
+	version  string
+	versions map[string]string
 
 	member string
 	arch   string
@@ -97,6 +98,8 @@ type Options struct {
 	Etcd    *clientv3.Client
 	Log     *slog.Logger
 	Version string
+	// Versions of the tools the agent drives, recorded in its registration.
+	Versions map[string]string
 	// Member overrides Identity() (tests).
 	Member string
 }
@@ -107,18 +110,19 @@ func New(o Options) *Agent {
 	}
 	host, _ := os.Hostname()
 	return &Agent{
-		cfg:     o.Config,
-		rt:      o.Runtime,
-		cli:     o.Etcd,
-		co:      coord.New(o.Etcd, o.Config.EtcdPrefix, o.Config.Etcd.OpTimeout.D()),
-		log:     o.Log,
-		alerter: NewAlerter(o.Config.AlertURL, o.Config.Service, o.Log),
-		http:    &http.Client{Timeout: o.Config.Health.Timeout.D()},
-		version: o.Version,
-		member:  o.Member,
-		agentID: fmt.Sprintf("%s/%d/%d", host, os.Getpid(), time.Now().UnixNano()),
-		now:     time.Now,
-		role:    roleStarting,
+		cfg:      o.Config,
+		rt:       o.Runtime,
+		cli:      o.Etcd,
+		co:       coord.New(o.Etcd, o.Config.EtcdPrefix, o.Config.Etcd.OpTimeout.D()),
+		log:      o.Log,
+		alerter:  NewAlerter(o.Config.AlertURL, o.Config.Service, o.Log),
+		http:     &http.Client{Timeout: o.Config.Health.Timeout.D()},
+		version:  o.Version,
+		versions: o.Versions,
+		member:   o.Member,
+		agentID:  fmt.Sprintf("%s/%d/%d", host, os.Getpid(), time.Now().UnixNano()),
+		now:      time.Now,
+		role:     roleStarting,
 	}
 }
 
@@ -281,7 +285,7 @@ func (a *Agent) grant(ctx context.Context) (*lease.Keeper, error) {
 		k, err := lease.Grant(ctx, a.cli, a.leaseOpts())
 		if err == nil {
 			go k.Run()
-			reg := coord.Registration{AgentID: a.agentID, Version: a.version, Arch: a.arch, Caps: a.caps(), Started: a.now().UTC()}
+			reg := coord.Registration{AgentID: a.agentID, Version: a.version, Arch: a.arch, Caps: a.caps(), Started: a.now().UTC(), Versions: a.versions}
 			if err := a.co.Register(ctx, a.member, k.ID(), reg); err != nil {
 				a.log.Warn("register failed", "err", err)
 			}

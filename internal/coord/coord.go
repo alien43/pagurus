@@ -75,6 +75,9 @@ type Registration struct {
 	Arch    string    `json:"arch"`
 	Caps    Caps      `json:"caps"`
 	Started time.Time `json:"started"`
+	// Versions of what the agent drives, e.g. {"incus": "7.5.1",
+	// "incus-compose": "1.3.4"}; empty values were unreadable.
+	Versions map[string]string `json:"versions,omitempty"`
 }
 
 type Endpoint struct {
