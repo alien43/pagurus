@@ -442,6 +442,29 @@ scripts/proto-down.sh --purge              # remove everything
 member's project through the cluster API once a second. It reports, and exits non-zero on, any
 instant where instances run in more than one project.
 
+## Results (2026-10-10, under conch)
+
+**Simulated:** all 13 original scenarios plus 5 later ones (fence chain, cgroup layout, config
+skew) run against a **real conch** (`0609155`, then `1834068`) for every member, plus a relay
+test. `go test -race ./... -count=2`: ok. `RestartWithinTTL` now recovers on a new term with no
+overlap instead of resuming the old one.
+
+**Live** (`scripts/drill.sh`, audited every 500 ms, **0 violations in 400 polls**; run 1 before the
+conch fix: 0 in 447):
+
+| Drill | Outcome |
+| :--- | :--- |
+| `move` asus→dell→rpi5→asus | 9.1 s, 10.0 s, 11.1 s |
+| `graceful` | dell serving 17 s after the stop (incl. its 10 s `--campaign-after`) |
+| `restart` (SIGKILL the agent) | a new term on asus 22 s later (no resume: the dead lease expires first) |
+| `crash` (SIGKILL, kept down) | dell serving 36 s later, old copy stopped via the Incus API |
+| `pause` (SIGSTOP) | systemd's watchdog killed the frozen unit; a new term on asus at 50 s |
+| `partition` | **self-fenced at 8 s** (conch: loss detection 10 s after the last good renewal); dell serving at 34 s |
+
+**Found:** a `conch elect` stopped while still campaigning died from SIGTERM's default action
+and left its candidate key for a whole TTL. That slowed a `move` to 26 s. Fixed in conch
+`1834068`.
+
 ## Results (2026-10-06)
 
 **Simulated** (`go test ./...`): 13 scenarios against a real etcd, with a simulated 3-member
