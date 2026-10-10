@@ -22,6 +22,7 @@ fail=0
 miss() { log "MISS: $*"; fail=1; }
 
 leader() { etcdctl --endpoints=$eps get /pagurus/v2/$svc/leader --print-value-only 2>/dev/null | jq -r '.member // empty'; }
+epoch() { etcdctl --endpoints=$eps get /pagurus/v2/$svc/leader --print-value-only 2>/dev/null | jq -r '.epoch // empty'; }
 running_on() {
   local out=()
   for m in asus dell rpi5; do
@@ -76,9 +77,10 @@ restart_agent() { "$here/scripts/proto-up.sh" --drill-proxy --only "$1" >/dev/nu
 # systemd restarts the agent, whose startup fence stops the orphaned copy; the
 # office comes back once the dead term's lease has expired. Never two.
 drill_restart() {
-  local l pid; l=$(leader); pid=$(mainpid $l); log "== restart: SIGKILL the agent on $l (pid $pid); systemd restarts it within RestartSec"
+  local l pid e; l=$(leader); e=$(epoch); pid=$(mainpid $l); log "== restart: SIGKILL the agent on $l (pid $pid, epoch $e); systemd restarts it within RestartSec"
   on $l "sudo kill -KILL $pid"
-  if t=$(wait_for 120 settled); then log "   $(leader) serving ${t}s after the kill"; else miss "restart (leader=$(leader) running=$(running_on))"; fi
+  new_term() { local n; n=$(epoch); [ -n "$n" ] && [ "$n" != "$e" ] && settled; }
+  if t=$(wait_for 120 new_term); then log "   $(leader) serving a new term (epoch $(epoch)) ${t}s after the kill"; else miss "restart (leader=$(leader) epoch=$(epoch) running=$(running_on))"; fi
 }
 
 drill_crash() {
@@ -88,10 +90,15 @@ drill_crash() {
   restart_agent $l
 }
 
+# The frozen agent stops petting; systemd's watchdog kills the unit (conch
+# with it, unfenced). The restarted agent's startup fence stops the orphaned
+# copy, and a new term starts once the dead lease expires: on the same member
+# if it is the preferred one (it queues with no campaign delay), else another.
 drill_pause() {
-  local l pid; l=$(leader); pid=$(mainpid $l); log "== pause: SIGSTOP the agent on $l for 45s"
+  local l pid e; l=$(leader); e=$(epoch); pid=$(mainpid $l); log "== pause: SIGSTOP the agent on $l (epoch $e) for up to 90s"
   on $l "sudo kill -STOP $pid"
-  if t=$(wait_for 90 some_other_healthy $l); then log "   $(leader) serving ${t}s into the pause"; else miss "no failover during pause"; fi
+  new_term() { local n; n=$(epoch); [ -n "$n" ] && [ "$n" != "$e" ] && settled; }
+  if t=$(wait_for 90 new_term); then log "   $(leader) serving a new term (epoch $(epoch)) ${t}s into the pause"; else miss "no new term during pause (leader=$(leader) epoch=$(epoch))"; fi
   on $l "sudo kill -CONT $pid 2>/dev/null || true"
   sleep 10
   [ "$(running_on)" = "$(leader)" ] || miss "after SIGCONT: running on $(running_on), leader $(leader)"
