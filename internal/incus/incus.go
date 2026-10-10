@@ -147,7 +147,17 @@ func (d *Driver) MemberOnline(ctx context.Context, member string) (bool, error) 
 
 // List returns the instances of member's project, as the cluster sees them.
 func (d *Driver) List(ctx context.Context, member string) ([]Instance, error) {
-	return d.o.API.Instances(ctx, d.Project(member))
+	// A restricted Incus client listing a project it may not see gets an
+	// empty list, not an error (Incus 7.5.1, verified 2026-10-10: 200 OK,
+	// 0 instances, for a project with a running instance). An empty list
+	// reads as "all stopped", which a peer fence would take as a confirmed
+	// fence. Reading the project itself is refused properly (403), so do
+	// that first and fail instead.
+	p := d.Project(member)
+	if _, err := d.o.API.ProjectConfig(ctx, p); err != nil {
+		return nil, fmt.Errorf("project %s not readable, so its instance list cannot be trusted: %w", p, err)
+	}
+	return d.o.API.Instances(ctx, p)
 }
 
 // EnforceNoAutostart sets boot.autostart=false on every instance of member's

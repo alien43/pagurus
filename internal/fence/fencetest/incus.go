@@ -30,6 +30,10 @@ type FakeIncus struct {
 	StopNoop bool
 	// Err, if set, is returned by every call (an API error, no quorum, ...).
 	Err error
+	// Forbidden projects behave as for an Incus client restricted to other
+	// projects: ProjectConfig is refused (403) and Instances is an empty
+	// list, not an error, which is what the real server does.
+	Forbidden map[string]bool
 	// OnStop / OnStart run after an instance changes state (e.g. to update a
 	// FakeCgroupFS the way the kernel would).
 	OnStop, OnStart func(project, name string)
@@ -127,6 +131,9 @@ func (f *FakeIncus) ProjectConfig(ctx context.Context, project string) (map[stri
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.Forbidden[project] {
+		return nil, api.StatusErrorf(http.StatusForbidden, "User does not have permission for project %q", project)
+	}
 	cfg, ok := f.Projects[project]
 	if !ok {
 		return nil, notFound("project " + project)
@@ -166,6 +173,9 @@ func (f *FakeIncus) Instances(ctx context.Context, project string) ([]incus.Inst
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.Forbidden[project] {
+		return nil, nil // the real server's 200 OK with an empty list
+	}
 	return append([]incus.Instance(nil), f.Insts[project]...), nil
 }
 

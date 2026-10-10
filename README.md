@@ -187,10 +187,28 @@ incus-compose has no library API.
 }
 ```
 
-Permissions: the agent today uses the local socket as root, i.e. full Incus access. A restricted
-TLS client confined to the `<prefix>-*` projects has **not** been investigated yet: the
-cluster-scoped reads (`/1.0/cluster/members`, `/1.0/cluster/groups`) may need more than a
-project-restricted certificate grants.
+**Least privilege** (verified on Incus 7.5.1, 2026-10-10). A TLS client certificate restricted to
+the service's projects is enough to run pagurus:
+
+```sh
+incus config trust add-certificate pagurus.crt --restricted --projects <prefix>-<m1>,<prefix>-<m2>,<prefix>-<m3>
+```
+
+| Call | Restricted cert |
+| :--- | :--- |
+| `GET /1.0` (member name, version, architectures) | allowed |
+| `GET /1.0/projects/<own>` · `/1.0/cluster/groups/<g>` · `/1.0/cluster/members/<m>` | allowed |
+| list, start, stop, state and config of instances in its projects | allowed |
+| `POST /1.0/projects`, `POST /1.0/cluster/groups` (`pagurus provision` creating things) | **refused**: run `provision` with an admin certificate |
+
+- 🚨 **List *every* member's project in the certificate.** For a project it may not read, a
+  restricted client gets **an empty instance list, not an error**, even when instances run there
+  (`GET /1.0/instances?project=X` → 200 OK, 0 items; `GET /1.0/projects/X` → 403).
+- An empty list reads as "all stopped", which a peer fence would take as a verified fence. So the
+  driver now reads the project first and fails if it can't
+  (`TestIncusAPIStopNeverConfirmsAnUnreadableProject`). A misconfigured certificate gives errors
+  and blocked failovers, not a second copy.
+- Agents on members can keep using the local unix socket (full access).
 
 ## etcd security
 

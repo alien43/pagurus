@@ -170,3 +170,22 @@ func TestBuildPeer(t *testing.T) {
 		t.Fatalf("default chain: %v %v", c, err)
 	}
 }
+
+// TestIncusAPIStopNeverConfirmsAnUnreadableProject: through a client
+// restricted to other projects, the real server lists a peer's project as
+// empty. The fence must not take that as "stopped" (a second copy would
+// start): the driver errors, and incus-api-stop skips, leaving the decision
+// to the next fence or fence.unverified.
+func TestIncusAPIStopNeverConfirmsAnUnreadableProject(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus", "dell")
+	api.AddInstance("p-dell", incus.Instance{Name: "web", Status: incus.StatusRunning, Location: "dell", Type: "container"})
+	api.Forbidden = map[string]bool{"p-dell": true}
+	d := incus.New(incus.Options{ProjectPrefix: "p", CgroupRoot: t.TempDir(), API: api})
+	out := fence.IncusAPIStop{R: d, B: time.Second}.Attempt(context.Background(), dell)
+	if out.Status == fence.Confirmed {
+		t.Fatalf("confirmed a fence on a project it cannot read: %+v", out)
+	}
+	if out.Status != fence.Skip || !strings.Contains(out.Why, "cannot be trusted") {
+		t.Fatalf("got %+v, want a skip naming the unreadable project", out)
+	}
+}

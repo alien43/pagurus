@@ -122,3 +122,19 @@ func TestIPv4PicksAGlobalNonLoopbackAddress(t *testing.T) {
 		t.Fatalf("got %q %v", ip, err)
 	}
 }
+
+// TestListRefusesAnUnreadableProject: a restricted client sees an empty
+// instance list for a project it may not read. The driver must fail rather
+// than report "nothing running" (which a peer fence would take as fenced).
+func TestListRefusesAnUnreadableProject(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus", "dell")
+	api.AddInstance("p-dell", incus.Instance{Name: "web", Status: incus.StatusRunning, Location: "dell", Type: "container"})
+	api.Forbidden = map[string]bool{"p-dell": true}
+	insts, err := driver(api).List(context.Background(), "dell")
+	if err == nil {
+		t.Fatalf("listed %v from an unreadable project; want an error", insts)
+	}
+	if !strings.Contains(err.Error(), "cannot be trusted") {
+		t.Fatalf("err %v", err)
+	}
+}
