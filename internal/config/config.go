@@ -7,6 +7,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -535,4 +537,24 @@ func (c *Config) ConchEtcdArgs() []string {
 		}
 	}
 	return args
+}
+
+// SafetyHash fingerprints the config fields every member must agree on: who
+// the members are, where the projects and keys live, the lease timing, the
+// fence chains and policy, and what is started. Agents publish it and refuse
+// to campaign while a live peer's differs (a peer with another TTL or chain
+// would be fenced on the wrong assumptions). Per-host settings (etcd and
+// Incus connection, state_dir, alert_url, health, preference) are left out.
+func (c *Config) SafetyHash() string {
+	b, _ := json.Marshal(struct {
+		Members       []string
+		ProjectPrefix string
+		EtcdPrefix    string
+		Lease         Lease
+		Self, Peer    []fence.Spec
+		Fence         Fence
+		Start         Start
+	}{c.Members, c.ProjectPrefix, c.EtcdPrefix, c.Lease, c.SelfFences(), c.PeerFences(), c.Fence, c.Start})
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
 }

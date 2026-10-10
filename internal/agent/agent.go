@@ -85,6 +85,7 @@ type Agent struct {
 	keeper           *lease.Keeper // current leadership term's lease
 	epoch            int64
 	localStopped     bool      // last ground-truth check found nothing running here
+	skewAlerted      string    // the last config-skew reason alerted, to alert once
 	unfitAfter       time.Time // while not leading and not localStopped, fit until then
 	progressDeadline time.Time // main loop must report progress before this
 	backoffUntil     time.Time
@@ -176,7 +177,7 @@ func (a *Agent) Fit() (bool, string) {
 }
 
 func (a *Agent) caps() coord.Caps {
-	c := coord.Caps{SelfFenceLead: a.cfg.SelfFenceLead(), NoVerifiedSelfFence: !a.selfChain().Verified(a.selfTarget())}
+	c := coord.Caps{SelfFenceLead: a.cfg.SelfFenceLead(), NoVerifiedSelfFence: !a.selfChain().Verified(a.selfTarget()), Margin: a.cfg.Lease.Margin.D()}
 	if a.wd != nil {
 		c.WatchdogMode = a.wd.Mode()
 		c.WatchdogTimeout = a.wd.Timeout()
@@ -285,7 +286,7 @@ func (a *Agent) grant(ctx context.Context) (*lease.Keeper, error) {
 		k, err := lease.Grant(ctx, a.cli, a.leaseOpts())
 		if err == nil {
 			go k.Run()
-			reg := coord.Registration{AgentID: a.agentID, Version: a.version, Arch: a.arch, Caps: a.caps(), Started: a.now().UTC(), Versions: a.versions}
+			reg := coord.Registration{AgentID: a.agentID, Version: a.version, Arch: a.arch, Caps: a.caps(), Started: a.now().UTC(), Versions: a.versions, ConfigHash: a.cfg.SafetyHash()}
 			if err := a.co.Register(ctx, a.member, k.ID(), reg); err != nil {
 				a.log.Warn("register failed", "err", err)
 			}
@@ -619,6 +620,35 @@ func (a *Agent) eligible(ctx context.Context) error {
 	if !ok {
 		return errors.New("local instances not confirmed stopped")
 	}
+	return a.checkConfigSkew(cctx)
+}
+
+// checkConfigSkew refuses to campaign while a live peer registration carries
+// a different config.SafetyHash: a leader fencing a peer that runs another
+// TTL, margin or fence chain would do so on the wrong assumptions.
+func (a *Agent) checkConfigSkew(ctx context.Context) error {
+	regs, err := a.co.Registrations(ctx)
+	if err != nil {
+		return fmt.Errorf("reading registrations: %w", err)
+	}
+	mine := a.cfg.SafetyHash()
+	for m, r := range regs {
+		if m == a.member || r.ConfigHash == "" || r.ConfigHash == mine {
+			continue
+		}
+		why := fmt.Sprintf("config skew: %s runs config %s, this member %s; refusing to campaign until they agree", m, r.ConfigHash, mine)
+		a.mu.Lock()
+		first := a.skewAlerted != why
+		a.skewAlerted = why
+		a.mu.Unlock()
+		if first {
+			a.alerter.Alert("config-skew", why, "peer", m, "peer_hash", r.ConfigHash, "hash", mine)
+		}
+		return errors.New(why)
+	}
+	a.mu.Lock()
+	a.skewAlerted = ""
+	a.mu.Unlock()
 	return nil
 }
 

@@ -161,3 +161,40 @@ func TestStartForms(t *testing.T) {
 		t.Error("no start at all: accepted")
 	}
 }
+
+func TestSafetyHashCoversSafetyFieldsOnly(t *testing.T) {
+	base, err := parse("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := base.SafetyHash()
+	for name, extra := range map[string]string{
+		"ttl":         `"lease": {"ttl": "30s"}`,
+		"members":     `"members": ["asus", "dell"]`,
+		"self chain":  `"fences": {"self": []}`,
+		"policy":      `"fence": {"unverified": "proceed", "unverified_wait": "60s"}`,
+		"project pfx": `"project_prefix": "other"`,
+	} {
+		c, err := parse(extra)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.SafetyHash() == h {
+			t.Errorf("%s: hash unchanged", name)
+		}
+	}
+	for name, extra := range map[string]string{
+		"etcd endpoints": `"etcd": {"endpoints": ["10.9.9.9:2379"]}`,
+		"state dir":      `"state_dir": "/run/elsewhere"`,
+		"prefer":         `"prefer": ["dell", "asus", "rpi5"]`,
+		"incus socket":   `"incus": {"socket": "/run/x.sock"}`,
+	} {
+		c, err := parse(extra)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if c.SafetyHash() != h {
+			t.Errorf("%s: per-host setting changed the hash", name)
+		}
+	}
+}

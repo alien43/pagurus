@@ -56,6 +56,9 @@ type Caps struct {
 	// trust it under fence.unverified=proceed. (Zero value: the prototype's
 	// chain, which is verified.)
 	NoVerifiedSelfFence bool `json:"no_verified_self_fence,omitempty"`
+	// Margin is this member's lease margin: with SelfFenceLead, how long
+	// after its lease's server-side expiry it may still be fencing itself.
+	Margin time.Duration `json:"margin,omitempty"`
 }
 
 type MemberState struct {
@@ -78,6 +81,9 @@ type Registration struct {
 	// Versions of what the agent drives, e.g. {"incus": "7.5.1",
 	// "incus-compose": "1.3.4"}; empty values were unreadable.
 	Versions map[string]string `json:"versions,omitempty"`
+	// ConfigHash is config.SafetyHash(); peers refuse to campaign while
+	// theirs differs. Empty from agents that predate it (not compared).
+	ConfigHash string `json:"config_hash,omitempty"`
 }
 
 type Endpoint struct {

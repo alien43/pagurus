@@ -279,6 +279,8 @@ type harness struct {
 	etcd  string
 	nodes map[string]*node
 	state string
+	// nodeCfg, if set for a member, adjusts that member's config only.
+	nodeCfg map[string]func(*config.Config)
 }
 
 func testConfig(t *testing.T, mutate func(*config.Config)) *config.Config {
@@ -335,6 +337,9 @@ func logger(t *testing.T, name string) *slog.Logger {
 func (h *harness) start(name string, dog *simDog) *node {
 	cfg := *h.cfg
 	cfg.StateDir = h.state + "/" + name
+	if f := h.nodeCfg[name]; f != nil {
+		f(&cfg)
+	}
 	px := testutil.NewProxy(h.t, h.etcd)
 	cli := testutil.Client(h.t, px.Addr())
 	rt := &simRT{c: h.sim, me: name}
@@ -646,6 +651,24 @@ func TestUnrecognisedCgroupLayoutAfterStartGivesUp(t *testing.T) {
 	if on := h.sim.runningOn(); len(on) != 1 || on[0] != "dell" {
 		t.Fatalf("running on %v, want only dell", on)
 	}
+}
+
+// dell runs a different lease TTL from asus and rpi5. Nobody may campaign
+// while a live registration disagrees: a leader fencing a peer with another
+// TTL would wait the wrong amount of time. Once dell comes back with the
+// agreed config, the service starts.
+func TestConfigSkewRefusesToCampaign(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nodeCfg = map[string]func(*config.Config){"dell": func(c *config.Config) { c.Lease.TTL = config.Duration(6 * time.Second) }}
+	h.startAll()
+	h.holdNobody(8 * time.Second)
+	// dell is restarted with the agreed config; its old registration lapses
+	// with its lease.
+	h.nodes["dell"].crash()
+	h.nodeCfg = nil
+	h.start("dell", nil)
+	took := h.waitRunning("asus", 20*time.Second)
+	t.Logf("asus running %s after dell came back with the agreed config", took)
 }
 
 // With an armed (simulated) watchdog the same unstoppable leader is reset by

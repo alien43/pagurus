@@ -338,7 +338,9 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 			"run `pagurus fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
 	}
 	if a.cfg.Fence.Unverified == config.UnverifiedProceed {
-		wait := a.cfg.Fence.UnverifiedWait.D()
+		// The victim's own self-fence timing, if it advertised it: it may
+		// still be fencing itself until its lead + margin past its expiry.
+		wait := max(a.cfg.Fence.UnverifiedWait.D(), st.Caps.SelfFenceLead+st.Caps.Margin)
 		if since >= wait {
 			a.alerter.Alert("fence-unverified", "proceeding WITHOUT a verified fence (policy=proceed): trusting the member's self-fence",
 				"member", m, "reach", reach, "their_epoch", st.Epoch, "waited", since.Round(time.Second))

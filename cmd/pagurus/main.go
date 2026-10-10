@@ -274,6 +274,12 @@ func cmdStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, cli *c
 			if v := r.Versions["incus-compose"]; v != "" {
 				ag += " ic " + v
 			}
+			if r.ConfigHash != "" {
+				ag += " cfg " + r.ConfigHash[:6]
+				if r.ConfigHash != cfg.SafetyHash() {
+					ag += "≠"
+				}
+			}
 			wd = r.Caps.WatchdogMode
 			if r.Caps.FencesByReboot {
 				wd += "(reboot)"
