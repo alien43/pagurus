@@ -21,8 +21,8 @@ here=$(cd "$(dirname "$0")/.." && pwd)
 svc=whoami
 unit=singleton-$svc
 remote_dir=/run/singleton-proto
-cfg="$here/examples/whoami/pagurus.json"
-compose="$here/examples/whoami/compose.yaml"
+cfg="$here/examples/landos/whoami.json"
+compose="$here/examples/landos/whoami-compose.yaml"
 drill=0
 only="asus dell rpi5"
 while [ $# -gt 0 ]; do

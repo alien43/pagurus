@@ -6,7 +6,7 @@ running on exactly one member of an Incus cluster, and moves it when that member
 > **Naming.** The project was prototyped as `singleton`. The prototype that still runs live keeps
 > its old names: transient units `singleton-<svc>`, binaries in `/run/singleton-proto` and
 > `/var/lib/singleton-proto`, and etcd keys under `/singleton/v1/` (pinned in
-> `examples/whoami/pagurus.json`). `scripts/` drive that prototype, so they use those names too.
+> `examples/landos/whoami.json`). `scripts/` drive that prototype, so they use those names too.
 > New code and defaults use `pagurus` (`/pagurus/v1/<svc>`, `/run/pagurus`).
 
 > **Status: EXPERIMENTAL PROTOTYPE (2026-10-06).** Not wired into any NixOS module, timer or
@@ -365,7 +365,9 @@ internal/fence/         fence kinds (incl. qemu-kill), the chain runner, fencete
 internal/start/         starters: compose, instances
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
 internal/agent/         the state machine (agent.go: lifecycle; lead.go: a term)
-examples/whoami/        the prototype's compose.yaml + pagurus.json
+examples/whoami/        a generic compose example (placeholder addresses, 192.0.2.0/24)
+examples/whoami-instances/  the same with the instances starter
+examples/landos/        the live prototype's config (this author's cluster)
 scripts/                proto-up.sh, proto-down.sh, drill.sh (the live prototype)
 internal/provision/     `pagurus provision`: per-member cluster groups + pinned projects
 ```

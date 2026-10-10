@@ -1,20 +1,39 @@
 {
   "service": "whoami",
-  "start": {"kind": "compose", "file": "/run/singleton-proto/whoami/compose.yaml"},
-  "project_prefix": "sgl-whoami",
-  "etcd_prefix": "/singleton/v1/whoami",
-  "members": ["asus", "dell", "rpi5"],
-  "prefer": ["asus", "dell", "rpi5"],
+  "start": {
+    "kind": "compose",
+    "file": "/etc/pagurus/whoami/compose.yaml"
+  },
+  "project_prefix": "whoami",
+  "members": [
+    "node1",
+    "node2",
+    "node3"
+  ],
+  "prefer": [
+    "node1",
+    "node2",
+    "node3"
+  ],
   "grace": "10s",
-
   "etcd": {
-    "endpoints": ["10.0.1.3:2379", "10.0.1.6:2379", "10.0.1.8:2379"],
+    "endpoints": [
+      "192.0.2.1:2379",
+      "192.0.2.2:2379",
+      "192.0.2.3:2379"
+    ],
     "dial_timeout": "3s",
     "op_timeout": "2s"
   },
-  "lease": {"ttl": "20s", "renew_interval": "2s", "margin": "2s"},
-  "self_fence": {"stop_budget": "6s", "kill_budget": "3s"},
-
+  "lease": {
+    "ttl": "20s",
+    "renew_interval": "2s",
+    "margin": "2s"
+  },
+  "self_fence": {
+    "stop_budget": "6s",
+    "kill_budget": "3s"
+  },
   "fence": {
     "api_timeout": "15s",
     "unverified": "proceed",
@@ -22,7 +41,6 @@
     "retry_interval": "5s",
     "reboot_margin": "10s"
   },
-
   "health": {
     "interval": "5s",
     "start_period": "30s",
@@ -33,7 +51,8 @@
     "timeout": "3s",
     "release_backoff": "2m"
   },
-
-  "watchdog": {"mode": "systemd"},
-  "state_dir": "/run/singleton-proto/state"
+  "watchdog": {
+    "mode": "systemd"
+  },
+  "state_dir": "/run/pagurus"
 }
