@@ -37,6 +37,12 @@ type simCluster struct {
 	violations int
 	maxRunning int
 	log        []string
+
+	// tolerate records overlaps (how long two ran) instead of failing:
+	// only for measuring the residual start window.
+	tolerate     bool
+	overlapSince time.Time
+	maxOverlap   time.Duration
 }
 
 type simMember struct {
@@ -50,6 +56,14 @@ type simMember struct {
 	// hideCgroup: cgroupfs shows no payload cgroup although Incus says it
 	// runs (a liblxc that names payload cgroups differently).
 	hideCgroup bool
+	// slowPause, once set, pauses the next slow start phase (Prepare, or a
+	// Start not preceded by Prepare: a whole `up`) for that long, ignoring
+	// cancellation, as a paused process would. paused is set while it waits.
+	slowPause time.Duration
+	paused    bool
+	prepared  bool
+	// launchPause pauses inside the launch itself (the residual window).
+	launchPause time.Duration
 }
 
 func newSim(t *testing.T, members ...string) *simCluster {
@@ -78,9 +92,17 @@ func (c *simCluster) check(what string) {
 	}
 	slices.Sort(on)
 	c.maxRunning = max(c.maxRunning, n)
-	if n > 1 {
+	switch {
+	case n > 1 && c.tolerate:
+		if c.overlapSince.IsZero() {
+			c.overlapSince = time.Now()
+		}
+	case n > 1:
 		c.violations++
 		c.t.Errorf("AT-MOST-ONE VIOLATED after %s: running on %v", what, on)
+	case !c.overlapSince.IsZero():
+		c.maxOverlap = max(c.maxOverlap, time.Since(c.overlapSince))
+		c.overlapSince = time.Time{}
 	}
 	c.log = append(c.log, fmt.Sprintf("%s %s -> %v", time.Now().Format("05.000"), what, on))
 }
@@ -163,9 +185,45 @@ func (r *simRT) List(_ context.Context, m string) ([]incus.Instance, error) {
 	return []incus.Instance{{Name: "svc-1", Status: st, Location: m, Type: "container"}}, nil
 }
 
-func (r *simRT) Start(_ context.Context, m string) error {
+// pauseIf sleeps for *d (once) without the lock, ignoring cancellation.
+func (r *simRT) pauseIf(m string, d *time.Duration) {
+	r.c.mu.Lock()
+	p := *d
+	*d = 0
+	if p > 0 {
+		r.c.m[m].paused = true
+	}
+	r.c.mu.Unlock()
+	if p > 0 {
+		time.Sleep(p)
+		r.c.mu.Lock()
+		r.c.m[m].paused = false
+		r.c.mu.Unlock()
+	}
+}
+
+func (r *simRT) Prepare(_ context.Context, m string) error {
+	r.pauseIf(m, &r.c.m[m].slowPause)
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
+	if err := r.clusterOp(); err != nil {
+		return err
+	}
+	r.c.m[m].prepared = true
+	return nil
+}
+
+func (r *simRT) Start(_ context.Context, m string) error {
+	r.c.mu.Lock()
+	unprepared := !r.c.m[m].prepared
+	r.c.mu.Unlock()
+	if unprepared { // a whole `up`: the slow part is here
+		r.pauseIf(m, &r.c.m[m].slowPause)
+	}
+	r.pauseIf(m, &r.c.m[m].launchPause)
+	r.c.mu.Lock()
+	defer r.c.mu.Unlock()
+	r.c.m[m].prepared = false
 	if err := r.clusterOp(); err != nil {
 		return err
 	}

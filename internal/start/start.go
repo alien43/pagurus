@@ -22,7 +22,13 @@ type Starter interface {
 	Kind() string
 	// CheckStart is the preflight: the workload is startable on member.
 	CheckStart(ctx context.Context, member string) error
-	// Start brings member's project up. It must be idempotent.
+	// Prepare does everything slow that runs nothing (pulls, creates), so
+	// that the leader's last authorising check comes right before Start.
+	// It must be idempotent.
+	Prepare(ctx context.Context, member string) error
+	// Start brings member's project up. It must be idempotent, and after
+	// Prepare it should be quick: the time it takes is the window in which a
+	// deposed leader can still start a copy (Incus has no fencing token).
 	Start(ctx context.Context, member string) error
 	// Types are the Incus instance types it may run ("container", ...).
 	Types() []string
@@ -70,6 +76,13 @@ func (c Compose) base(member string) []string {
 // CheckStart renders the compose file, proving it parses.
 func (c Compose) CheckStart(ctx context.Context, member string) error {
 	_, err := c.Run(ctx, c.bin(), append(c.base(member), "config")...)
+	return err
+}
+
+// Prepare is `incus-compose up --no-start`: pull and create, start nothing.
+func (c Compose) Prepare(ctx context.Context, member string) error {
+	args := append(append(c.base(member), "up", "--no-start"), c.UpArgs...)
+	_, err := c.Run(ctx, c.bin(), args...)
 	return err
 }
 
@@ -137,6 +150,9 @@ func (s Instances) CheckStart(ctx context.Context, member string) error {
 	}
 	return nil
 }
+
+// Prepare has nothing to do: the instances exist already.
+func (s Instances) Prepare(context.Context, string) error { return nil }
 
 // Start starts every selected instance that is not running.
 func (s Instances) Start(ctx context.Context, member string) error {

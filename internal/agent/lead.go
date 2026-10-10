@@ -273,13 +273,33 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 
 // ---------------------------------------------------------------- supervise -
 
+// start brings the workload up in three steps, so the window in which a
+// deposed leader can still start a copy is one quick call, not a whole `up`:
+//
+//  1. Prepare: pull and create, nothing runs (the slow part);
+//  2. a linearizable read that our election key still holds the office;
+//  3. Start; then the same read again, stopping at once if it moved.
+//
+// Incus has no fencing token on start (PUT /1.0/instances/<n>/state ignores
+// If-Match), so this narrows the window; it cannot close it.
 func (t *termState) start() error {
 	a := t.a
 	a.beat(UpTimeout)
 	uctx, cancel := context.WithTimeout(t.op, UpTimeout)
 	defer cancel()
+	if err := a.rt.Prepare(uctx, a.member); err != nil {
+		return fmt.Errorf("prepare: %w", err)
+	}
+	if err := t.authorised(uctx); err != nil {
+		return err
+	}
 	if err := a.rt.Start(uctx, a.member); err != nil {
 		return fmt.Errorf("start: %w", err)
+	}
+	if still, err := a.co.StillLeader(context.WithoutCancel(uctx), t.epoch, t.lease); err == nil && !still {
+		a.alerter.Alert("deposed-at-start", "the office moved while starting; stopping at once", "member", a.member, "epoch", t.epoch)
+		a.stopLocal(context.WithoutCancel(uctx), "deposed while starting")
+		return fmt.Errorf("%w: the office moved while starting", errDeposed)
 	}
 	if err := a.rt.EnforceNoAutostart(uctx, a.member); err != nil {
 		return fmt.Errorf("enforce boot.autostart=false: %w", err)
@@ -304,7 +324,26 @@ func (t *termState) start() error {
 	return nil
 }
 
-var errMisplaced = errors.New("refusing to run")
+var (
+	errMisplaced = errors.New("refusing to run")
+	errDeposed   = errors.New("deposed")
+)
+
+// authorised is the last check before anything may run: the term is still
+// live and our election key still holds the office (a fresh read).
+func (t *termState) authorised(ctx context.Context) error {
+	if t.op.Err() != nil {
+		return fmt.Errorf("%w: term ended before start", errDeposed)
+	}
+	still, err := t.a.co.StillLeader(ctx, t.epoch, t.lease)
+	if err != nil {
+		return fmt.Errorf("%w: cannot confirm the office before start: %v", errDeposed, err)
+	}
+	if !still {
+		return fmt.Errorf("%w: the office moved before start", errDeposed)
+	}
+	return nil
+}
 
 func (t *termState) publish() {
 	a := t.a
@@ -399,6 +438,11 @@ func (t *termState) supervise() {
 				t.giveUp(err.Error(), time.Hour)
 				return false
 			}
+			if errors.Is(err, errDeposed) {
+				t.log.Warn("not starting", "err", err)
+				t.giveUp(err.Error(), 0)
+				return false
+			}
 			return true // counted as unhealthy below
 		}
 		t.log.Info("workload started")
@@ -407,7 +451,7 @@ func (t *termState) supervise() {
 	if !startOnce() {
 		return
 	}
-	startedAt, lastAudit := a.now(), a.now()
+	startedAt, lastAudit := a.now(), time.Time{}
 	tick := time.NewTicker(hc.Interval.D())
 	defer tick.Stop()
 	healthy := false
@@ -461,7 +505,10 @@ func (t *termState) supervise() {
 			}
 			startedAt = a.now()
 		}
-		if a.now().Sub(lastAudit) >= a.cfg.AuditInterval.D() {
+		// Right after a start, audit every tick: a deposed leader's late
+		// start is caught in one health interval, not one audit interval.
+		fast := a.now().Sub(startedAt) < 3*hc.Interval.D()
+		if fast || a.now().Sub(lastAudit) >= a.cfg.AuditInterval.D() {
 			lastAudit = a.now()
 			t.audit()
 		}

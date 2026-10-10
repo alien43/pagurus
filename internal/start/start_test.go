@@ -18,11 +18,15 @@ func TestComposeArgv(t *testing.T) {
 	if err := c.CheckStart(context.Background(), "asus"); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.Prepare(context.Background(), "asus"); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.Start(context.Background(), "asus"); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
 		"-p p-asus -f /x/compose.yaml --env-file /x/.env config",
+		"-p p-asus -f /x/compose.yaml --env-file /x/.env up --no-start --detach --no-healthd",
 		"-p p-asus -f /x/compose.yaml --env-file /x/.env up --detach --no-healthd",
 	}
 	if got := bin.Calls(t); strings.Join(got, "|") != strings.Join(want, "|") {

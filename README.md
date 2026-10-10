@@ -161,10 +161,25 @@ Under `block`, that case leaves the service down instead. With an armed watchdog
 (`FailureAction=reboot-force`, or `device` mode with `arm: true`), the host resets and the gap
 closes. That is the `stonith_exploration.md` §7 rung.
 
-A **process pause** between a lease check and an `incus-compose up` (GC, SIGSTOP) is the
-classic lease hazard. Incus has no fencing-token check to close it. It is narrowed, not closed:
-the authorising guarded write comes immediately before `up`, conch's fence stops the copy at
-lease loss, and the new leader's API fence and audit stop it within seconds.
+A **process pause** between the last "am I still the leader" check and the start (GC,
+SIGSTOP) is the classic lease hazard. **Incus has no fencing token to close it.** Its
+`PUT /1.0/instances/<name>/state` handler (`cmd/incusd/instance_state.go:153`,
+`instanceStatePut`, Incus 7.5.1) never calls `EtagCheck`, unlike `instance_put.go` and most
+other PUTs, so a start cannot be made conditional on an `If-Match`/ETag. pagurus narrows the
+window instead (`termState.start`):
+
+1. **Prepare first.** `incus-compose up --no-start` pulls and creates, with nothing running.
+   This is the slow part, and it comes after the guarded `may-run` write.
+2. **A fresh linearizable read** that our election key still holds the office, then the
+   start. The window is now the launch call alone, not a whole `up`.
+3. **Re-check after the start.** If the office moved, stop at once.
+4. **Fast audit.** For three health intervals after a start, the new leader audits the other
+   members on every tick, not every `audit_interval`.
+
+In the sim, a leader paused in step 1 while it lost the office no longer starts at all
+(`TestPausedStart`; before the change, it started a second copy). A pause *inside* the launch
+call still lets a late copy start. The re-check stops it within milliseconds: in `TestPausedLaunchWindow`, 2 ms of overlap,
+against 57 ms without the re-check (and up to `audit_interval`, 30 s, before conch).
 
 ## Timing
 

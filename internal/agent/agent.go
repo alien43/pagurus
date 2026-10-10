@@ -42,6 +42,7 @@ type Runtime interface {
 	CheckProject(ctx context.Context, member string) error
 	// CheckStart / Start are the configured starter (internal/start).
 	CheckStart(ctx context.Context, member string) error
+	Prepare(ctx context.Context, member string) error
 	CheckCgroup2() error
 	MemberOnline(ctx context.Context, member string) (bool, error)
 	List(ctx context.Context, member string) ([]incus.Instance, error)
