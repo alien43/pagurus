@@ -158,6 +158,18 @@ With the prototype config (TTL 20 s, renew 2 s, margin 2 s, stop 6 s, kill 3 s):
 
 Failback is never automatic. Use `pagurus move`.
 
+## Provisioning
+
+`pagurus provision -c cfg` prepares Incus for a service. Each member gets a cluster group
+`host-<member>` holding exactly that member, and a project `<prefix>-<member>` pinned to it.
+- It plans before it acts. `--dry-run` prints the equivalent `incus` commands and changes
+  nothing.
+- It is idempotent: an already-right setup reports `[ok]` lines and does nothing.
+- It only creates things, or fills an empty group. A group shared with other members, or a
+  project pinned elsewhere, is reported and **left alone**.
+- Cluster group changes are cluster-wide, so they need `--yes` or a "y" on a terminal.
+  Creating projects doesn't.
+
 ## Reaching Incus
 
 pagurus talks to Incus through its Go client (`github.com/lxc/incus/v7/client`), not by running
@@ -354,7 +366,8 @@ internal/start/         starters: compose, instances
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
 internal/agent/         the state machine (agent.go: lifecycle; lead.go: a term)
 examples/whoami/        the prototype's compose.yaml + pagurus.json
-scripts/                provision.sh, proto-up.sh, proto-down.sh, drill.sh
+scripts/                proto-up.sh, proto-down.sh, drill.sh (the live prototype)
+internal/provision/     `pagurus provision`: per-member cluster groups + pinned projects
 ```
 
 ## Running it

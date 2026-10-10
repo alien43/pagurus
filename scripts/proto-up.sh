@@ -64,7 +64,8 @@ for a in amd64 arm64; do
   (cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w" -o "$build/blackhole-proxy-$a" ./cmd/blackhole-proxy)
 done
 
-"$here/scripts/provision.sh" sgl-$svc asus dell rpi5
+# Per-member groups and pinned projects (idempotent; the groups exist on this cluster).
+"$build/singleton-$(go env GOARCH)" provision -c "$cfg" --yes
 
 for m in $only; do
   echo "== $m"

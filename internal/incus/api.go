@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,6 +31,12 @@ type API interface {
 	// Stop stops an instance; timeout > 0 tries a clean shutdown first.
 	Stop(ctx context.Context, project, name string, timeout time.Duration, force bool) error
 	Start(ctx context.Context, project, name string) error
+
+	// Provisioning (pagurus provision). Missing things are reported with
+	// IsNotFound.
+	CreateClusterGroup(ctx context.Context, group string, members []string) error
+	SetClusterGroupMembers(ctx context.Context, group string, members []string) error
+	CreateProject(ctx context.Context, project string, config map[string]string) error
 }
 
 // Address is one address of an instance interface.
@@ -247,3 +254,34 @@ func IsNotFound(err error) bool {
 }
 
 var _ API = (*Client)(nil)
+
+func (c *Client) CreateClusterGroup(ctx context.Context, group string, members []string) error {
+	s, err := c.server(ctx)
+	if err != nil {
+		return err
+	}
+	return s.CreateClusterGroup(api.ClusterGroupsPost{Name: group, ClusterGroupPut: api.ClusterGroupPut{
+		Description: "pagurus: pins projects to member " + strings.Join(members, ","), Members: members}})
+}
+
+func (c *Client) SetClusterGroupMembers(ctx context.Context, group string, members []string) error {
+	s, err := c.server(ctx)
+	if err != nil {
+		return err
+	}
+	g, etag, err := s.GetClusterGroup(group)
+	if err != nil {
+		return err
+	}
+	put := g.Writable()
+	put.Members = members
+	return s.UpdateClusterGroup(group, put, etag)
+}
+
+func (c *Client) CreateProject(ctx context.Context, project string, config map[string]string) error {
+	s, err := c.server(ctx)
+	if err != nil {
+		return err
+	}
+	return s.CreateProject(api.ProjectsPost{Name: project, ProjectPut: api.ProjectPut{Config: config, Description: "pagurus"}})
+}

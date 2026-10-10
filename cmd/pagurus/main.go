@@ -25,6 +25,7 @@ import (
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/provision"
 	"github.com/alien43/pagurus/internal/start"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
@@ -45,6 +46,9 @@ commands:
               pagurus fence-check -c cfg --member <member>
               Run it ON that member: incus-stop and cgroup-kill confirm
               from the local cgroupfs.
+  provision   create the per-member cluster groups (host-<member>) and pinned
+              projects: pagurus provision -c cfg [--dry-run] [--yes]
+              (group changes need --yes or an interactive "y")
   fence-run   run ONE fence of this member's self chain for real (drills on
               scratch projects): pagurus fence-run -c cfg --member <m>
               --fence <1-based index> --i-know
@@ -68,6 +72,8 @@ func main() {
 	timeout := fs.Duration("timeout", 3*time.Minute, "move: how long to wait for the new holder")
 	self := fs.String("self", "", "run: this host's cluster member name; lets the agent fence locally even when the local Incus is down at startup")
 	fenceIdx := fs.Int("fence", 0, "fence-run: 1-based index into the member's self chain")
+	dryRun := fs.Bool("dry-run", false, "provision: print the incus commands, change nothing")
+	yes := fs.Bool("yes", false, "provision: allow cluster group changes without asking")
 	iKnow := fs.Bool("i-know", false, "fence-run: confirm that this really stops the member's workload")
 	endpoints := fs.String("etcd", "", "override etcd.endpoints (comma-separated; drill harness)")
 	_ = fs.Parse(args)
@@ -115,6 +121,8 @@ func main() {
 		err = cmdAudit(ctx, cfg, drv, *every, *dur)
 	case "fence-check":
 		err = cmdFenceCheck(ctx, cfg, drv, *member)
+	case "provision":
+		err = cmdProvision(ctx, cfg, api, *dryRun, *yes)
 	case "fence-run":
 		err = cmdFenceRun(ctx, cfg, drv, *member, *fenceIdx, *iKnow, log)
 	default:
@@ -460,4 +468,42 @@ func targetFor(ctx context.Context, cfg *config.Config, rt *incus.Driver, member
 		}
 	}
 	return t
+}
+
+// cmdProvision plans the per-member groups and projects, prints the plan, and
+// applies it unless --dry-run. Cluster group changes need --yes or a "y" on
+// an interactive terminal.
+func cmdProvision(ctx context.Context, cfg *config.Config, api incus.API, dryRun, yes bool) error {
+	plan, err := provision.Make(ctx, api, cfg.ProjectPrefix, cfg.Members)
+	if err != nil {
+		return err
+	}
+	for _, ok := range plan.OK {
+		fmt.Println("[ok]  " + ok)
+	}
+	for _, a := range plan.Actions {
+		fmt.Println("[new] " + a.Command)
+	}
+	if len(plan.Actions) == 0 || dryRun {
+		if dryRun && len(plan.Actions) > 0 {
+			fmt.Println("dry run: nothing changed")
+		}
+		return nil
+	}
+	if plan.NeedsConfirmation() && !yes {
+		if fi, err := os.Stdin.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+			return fmt.Errorf("cluster group changes need --yes (stdin is not a terminal)")
+		}
+		fmt.Print("This changes cluster groups. Apply? [y/N] ")
+		var answer string
+		_, _ = fmt.Scanln(&answer)
+		if answer != "y" && answer != "Y" {
+			return fmt.Errorf("not applied")
+		}
+	}
+	if err := plan.Apply(ctx, api); err != nil {
+		return err
+	}
+	fmt.Printf("applied %d change(s)\n", len(plan.Actions))
+	return nil
 }

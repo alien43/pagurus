@@ -3,10 +3,12 @@ package fencetest
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/alien43/pagurus/internal/incus"
+	"github.com/lxc/incus/v7/shared/api"
 )
 
 // FakeIncus is an in-memory incus.API: members, cluster groups, projects and
@@ -120,7 +122,7 @@ func (f *FakeIncus) ProjectConfig(ctx context.Context, project string) (map[stri
 	defer f.mu.Unlock()
 	cfg, ok := f.Projects[project]
 	if !ok {
-		return nil, fmt.Errorf("project %q not found", project)
+		return nil, notFound("project " + project)
 	}
 	return cfg, nil
 }
@@ -133,7 +135,7 @@ func (f *FakeIncus) ClusterGroupMembers(ctx context.Context, group string) ([]st
 	defer f.mu.Unlock()
 	m, ok := f.Groups[group]
 	if !ok {
-		return nil, fmt.Errorf("cluster group %q not found", group)
+		return nil, notFound("cluster group " + group)
 	}
 	return m, nil
 }
@@ -229,6 +231,55 @@ func (f *FakeIncus) Start(ctx context.Context, project, name string) error {
 	if hook != nil {
 		hook(project, name)
 	}
+	return nil
+}
+
+// notFound mimics an Incus 404, so incus.IsNotFound recognises it.
+func notFound(what string) error { return api.StatusErrorf(http.StatusNotFound, "%s not found", what) }
+
+func (f *FakeIncus) CreateClusterGroup(ctx context.Context, group string, members []string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.Groups[group]; ok {
+		return fmt.Errorf("cluster group %q already exists", group)
+	}
+	f.mutations++
+	f.Groups[group] = append([]string(nil), members...)
+	return nil
+}
+
+func (f *FakeIncus) SetClusterGroupMembers(ctx context.Context, group string, members []string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.Groups[group]; !ok {
+		return notFound("cluster group " + group)
+	}
+	f.mutations++
+	f.Groups[group] = append([]string(nil), members...)
+	return nil
+}
+
+func (f *FakeIncus) CreateProject(ctx context.Context, project string, config map[string]string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.Projects[project]; ok {
+		return fmt.Errorf("project %q already exists", project)
+	}
+	f.mutations++
+	cfg := map[string]string{}
+	for k, v := range config {
+		cfg[k] = v
+	}
+	f.Projects[project] = cfg
 	return nil
 }
 
