@@ -34,8 +34,8 @@
     "margin": "2s"
   },
   "self_fence": {
-    "stop_budget": "6s",
-    "kill_budget": "3s"
+    "stop_budget": "4s",
+    "kill_budget": "2s"
   },
   "fence": {
     "api_timeout": "15s",

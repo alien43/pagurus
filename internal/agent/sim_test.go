@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
+
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/incus"
@@ -264,20 +266,21 @@ func (d *simDog) Run(ctx context.Context, fit watchdog.Fitness) {
 // ------------------------------------------------------------------ harness -
 
 type node struct {
-	name   string
-	rt     *simRT
-	proxy  *testutil.Proxy
-	cancel context.CancelFunc
-	done   chan struct{}
-	agent  *Agent
-	dog    *simDog
+	name    string
+	rt      *simRT
+	proxies []*testutil.Proxy // one per etcd endpoint: this node's network
+	cancel  context.CancelFunc
+	done    chan struct{}
+	agent   *Agent
+	dog     *simDog
 }
 
 type harness struct {
 	t     *testing.T
 	cfg   *config.Config
 	sim   *simCluster
-	etcd  string
+	eps   []string // etcd endpoints (one member, or a cluster's client proxies)
+	obs   *clientv3.Client
 	mu    sync.Mutex // nodes, read by the simulated host
 	nodes map[string]*node
 	state string
@@ -320,8 +323,24 @@ func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(state) })
+	return newHarnessOn(t, mutate, []string{testutil.Etcd(t)}, state)
+}
+
+// newClusterHarness runs the sim against a 3-member etcd cluster.
+func newClusterHarness(t *testing.T, mutate func(*config.Config)) (*harness, *testutil.Cluster) {
+	state, err := os.MkdirTemp("/tmp", "pg-state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(state) })
+	c := testutil.EtcdCluster(t, 3)
+	return newHarnessOn(t, mutate, c.Endpoints(), state), c
+}
+
+func newHarnessOn(t *testing.T, mutate func(*config.Config), eps []string, state string) *harness {
 	h := &harness{t: t, cfg: testConfig(t, mutate), sim: newSim(t, "asus", "dell", "rpi5"),
-		etcd: testutil.Etcd(t), nodes: map[string]*node{}, state: state}
+		eps: eps, nodes: map[string]*node{}, state: state}
+	h.obs = testutil.Client(t, eps[0], eps[1:]...)
 	h.host = h.serveHost(t)
 	t.Cleanup(func() {
 		h.mu.Lock()
@@ -362,9 +381,14 @@ func (h *harness) start(name string, dog *simDog) *node {
 	if f := h.nodeCfg[name]; f != nil {
 		f(&cfg)
 	}
-	px := testutil.NewProxy(h.t, h.etcd)
-	cfg.Etcd.Endpoints = []string{px.Addr()} // conch too: a partition cuts it off
-	cli := testutil.Client(h.t, px.Addr())
+	var pxs []*testutil.Proxy
+	var addrs []string
+	for _, ep := range h.eps {
+		px := testutil.NewProxy(h.t, ep)
+		pxs, addrs = append(pxs, px), append(addrs, px.Addr())
+	}
+	cfg.Etcd.Endpoints = addrs // conch too: a partition cuts it off
+	cli := testutil.Client(h.t, addrs[0], addrs[1:]...)
 	rt := &simRT{c: h.sim, me: name}
 	self, err := os.Executable()
 	if err != nil {
@@ -377,7 +401,7 @@ func (h *harness) start(name string, dog *simDog) *node {
 		h.t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	n := &node{name: name, rt: rt, proxy: px, cancel: cancel, done: make(chan struct{}), agent: a, dog: dog}
+	n := &node{name: name, rt: rt, proxies: pxs, cancel: cancel, done: make(chan struct{}), agent: a, dog: dog}
 	var wd watchdog.Watchdog
 	if dog != nil {
 		wd = dog
@@ -402,9 +426,15 @@ func (n *node) crash() {
 	n.rt.mu.Lock()
 	n.rt.dead = true
 	n.rt.mu.Unlock()
-	n.proxy.SetBlackhole(true)
+	n.blackhole(true)
 	n.agent.KillProcs()
 	n.cancel() // the in-process agent is inert now; let it wind down, spawning nothing
+}
+
+func (n *node) blackhole(on bool) {
+	for _, p := range n.proxies {
+		p.SetBlackhole(on)
+	}
 }
 
 // kill stops the goroutine for good (test teardown or after crash).
@@ -417,12 +447,12 @@ func (n *node) kill() {
 // partition cuts member off etcd and the Incus cluster, the way a dead NIC
 // would: it can still act on its own cgroups, nothing else.
 func (h *harness) partition(name string, on bool) {
-	h.nodes[name].proxy.SetBlackhole(on)
+	h.nodes[name].blackhole(on)
 	h.sim.set(name, func(m *simMember) { m.online, m.isolated = !on, on })
 }
 
 func (h *harness) leader() string {
-	co := coord.New(testutil.Client(h.t, h.etcd), h.cfg.EtcdPrefix, time.Second)
+	co := coord.New(h.obs, h.cfg.EtcdPrefix, time.Second)
 	rec, _, _, _, err := co.Leader(context.Background())
 	if err != nil || rec == nil {
 		return ""
@@ -430,8 +460,14 @@ func (h *harness) leader() string {
 	return rec.Member
 }
 
+func (h *harness) coord() *coord.Coord { return coord.New(h.obs, h.cfg.EtcdPrefix, time.Second) }
+
+func (h *harness) leaderEpoch() (*coord.LeaderRecord, int64, clientv3.LeaseID, int64, error) {
+	return coord.New(h.obs, h.cfg.EtcdPrefix, time.Second).Leader(context.Background())
+}
+
 func (h *harness) memberStates() map[string]coord.MemberState {
-	co := coord.New(testutil.Client(h.t, h.etcd), h.cfg.EtcdPrefix, time.Second)
+	co := coord.New(h.obs, h.cfg.EtcdPrefix, time.Second)
 	st, _ := co.MemberStates(context.Background())
 	return st
 }
@@ -616,7 +652,7 @@ func TestFenceAckUnblocks(t *testing.T) {
 		}
 	}
 	h.holdNobody(time.Second) // blocked: still nobody runs
-	co := coord.New(testutil.Client(t, h.etcd), h.cfg.EtcdPrefix, time.Second)
+	co := coord.New(h.obs, h.cfg.EtcdPrefix, time.Second)
 	if err := co.AckFenced(context.Background(), "asus", "operator:test"); err != nil {
 		t.Fatal(err)
 	}
@@ -747,7 +783,7 @@ func TestPlannedMove(t *testing.T) {
 	h := newHarness(t, nil)
 	h.startAll()
 	h.waitRunning("asus", 10*time.Second)
-	co := coord.New(testutil.Client(t, h.etcd), h.cfg.EtcdPrefix, time.Second)
+	co := coord.New(h.obs, h.cfg.EtcdPrefix, time.Second)
 	if err := co.SetPin(context.Background(), "rpi5"); err != nil {
 		t.Fatal(err)
 	}

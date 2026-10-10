@@ -1,16 +1,19 @@
-// Package testutil runs a throwaway single-member etcd and a TCP proxy that can
-// blackhole traffic to simulate a network partition.
+// Package testutil runs throwaway etcds (one member, or a cluster) and a TCP
+// proxy that can blackhole traffic to simulate a network partition.
 package testutil
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -27,9 +30,7 @@ func freePort(t testing.TB) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// Etcd starts an etcd for the test and returns its client URL host:port.
-// The test is skipped if no etcd binary is available.
-func Etcd(t testing.TB) string {
+func etcdBin(t testing.TB) string {
 	t.Helper()
 	bin, err := exec.LookPath("etcd")
 	if err != nil {
@@ -42,6 +43,14 @@ func Etcd(t testing.TB) string {
 	if err != nil {
 		t.Skip("etcd binary not found")
 	}
+	return bin
+}
+
+// Etcd starts an etcd for the test and returns its client URL host:port.
+// The test is skipped if no etcd binary is available.
+func Etcd(t testing.TB) string {
+	t.Helper()
+	bin := etcdBin(t)
 	dir := t.TempDir()
 	cp, pp := freePort(t), freePort(t)
 	client := fmt.Sprintf("127.0.0.1:%d", cp)
@@ -72,10 +81,10 @@ func Etcd(t testing.TB) string {
 	return client
 }
 
-func Client(t testing.TB, endpoint string) *clientv3.Client {
+func Client(t testing.TB, endpoint string, more ...string) *clientv3.Client {
 	t.Helper()
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints: []string{endpoint}, DialTimeout: 2 * time.Second,
+		Endpoints: append([]string{endpoint}, more...), DialTimeout: 2 * time.Second,
 		DialKeepAliveTime: time.Second, DialKeepAliveTimeout: time.Second, Logger: zap.NewNop(),
 	})
 	if err != nil {
@@ -162,4 +171,85 @@ func (p *Proxy) pipe(dst, src net.Conn) {
 			return
 		}
 	}
+}
+
+// Cluster is a throwaway 3-member (or n-member) etcd on 127.0.0.1. Each
+// member's client port sits behind a Proxy, so a test can make one member
+// unreachable to every client while the members still talk to each other.
+type Cluster struct {
+	Members []*Member
+}
+
+type Member struct {
+	Name   string
+	Client *Proxy // what clients dial
+	cmd    *exec.Cmd
+}
+
+// Endpoints are the members' client proxies.
+func (c *Cluster) Endpoints() []string {
+	var eps []string
+	for _, m := range c.Members {
+		eps = append(eps, m.Client.Addr())
+	}
+	return eps
+}
+
+// Pause freezes the member's process (SIGSTOP), as a host that hangs or
+// drops off the network would look to its peers; Resume continues it.
+func (m *Member) Pause()  { _ = m.cmd.Process.Signal(syscall.SIGSTOP) }
+func (m *Member) Resume() { _ = m.cmd.Process.Signal(syscall.SIGCONT) }
+
+// EtcdCluster starts an n-member etcd cluster and waits until it serves.
+func EtcdCluster(t testing.TB, n int) *Cluster {
+	t.Helper()
+	bin := etcdBin(t)
+	type ports struct{ client, peer int }
+	ps := make([]ports, n)
+	var initial []string
+	for i := range ps {
+		ps[i] = ports{freePort(t), freePort(t)}
+		initial = append(initial, fmt.Sprintf("m%d=http://127.0.0.1:%d", i, ps[i].peer))
+	}
+	c := &Cluster{}
+	for i, p := range ps {
+		dir := t.TempDir()
+		client := fmt.Sprintf("127.0.0.1:%d", p.client)
+		peer := fmt.Sprintf("http://127.0.0.1:%d", p.peer)
+		cmd := exec.Command(bin,
+			"--name", fmt.Sprintf("m%d", i), "--data-dir", filepath.Join(dir, "data"),
+			"--listen-client-urls", "http://"+client, "--advertise-client-urls", "http://"+client,
+			"--listen-peer-urls", peer, "--initial-advertise-peer-urls", peer,
+			"--initial-cluster", strings.Join(initial, ","), "--initial-cluster-state", "new",
+			"--initial-cluster-token", "pagurus-test",
+			"--heartbeat-interval", "100", "--election-timeout", "1000",
+			"--log-level", "error")
+		logf, _ := os.Create(filepath.Join(dir, "etcd.log"))
+		cmd.Stdout, cmd.Stderr = logf, logf
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Signal(syscall.SIGCONT)
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			logf.Close()
+		})
+		c.Members = append(c.Members, &Member{Name: fmt.Sprintf("m%d", i), Client: NewProxy(t, client), cmd: cmd})
+	}
+	cli := Client(t, c.Endpoints()[0], c.Endpoints()[1:]...)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		_, err := cli.Put(ctx, "pagurus-test/ready", "1")
+		cancel()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("etcd cluster did not start: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return c
 }

@@ -288,9 +288,9 @@ chain the member runs on itself before its lease can expire. It stops at the fir
 ```jsonc
 "fences": {
   "self": [
-    {"kind": "incus-stop",  "budget": "6s"},                    // incus stop --force; confirmed from cgroupfs
-    {"kind": "cgroup-kill", "budget": "3s"},                    // cgroup.kill on lxc.payload.<project>_*; no incusd, no quorum
-    {"kind": "exec", "budget": "5s",                            // anything else: a power fence, a site script
+    {"kind": "incus-stop",  "budget": "3s"},                    // incus stop --force; confirmed from cgroupfs
+    {"kind": "cgroup-kill", "budget": "2s"},                    // cgroup.kill on lxc.payload.<project>_*; no incusd, no quorum
+    {"kind": "exec", "budget": "2s",                            // anything else: a power fence, a site script
      "command": ["/etc/pagurus/plug-off", "{member}"],          // {member} and {project} are expanded per argv element, no shell
      "confirm": ["/etc/pagurus/plug-is-off", "{member}"],       // optional; without it, the command's exit 0 confirms
      "for": ["container"]}                                      // optional: target types it applies to
@@ -323,8 +323,12 @@ cluster-DB transactions before it reaches the qemu driver (Incus v7.5.1
 And a VM's qemu has **no `lxc.payload` cgroup**: it runs in `incus.service`'s. So for VMs:
 
 ```jsonc
-"fences": {"self": [{"kind": "incus-stop", "budget": "6s"}, {"kind": "qemu-kill", "budget": "5s"}]}
+"fences": {"self": [{"kind": "incus-stop", "budget": "4s"}, {"kind": "qemu-kill", "budget": "3s"}]}
 ```
+
+The whole self chain runs inside conch's fence budget (its total + 1s), and conch requires loss
+detection (TTL/2 at the default TTL) + that budget + 1s < TTL. At TTL 20s the chain must total
+under 8s; a longer chain needs a longer `lease.ttl`. `pagurus validate` checks this.
 
 `incus-stop` and `cgroup-kill` skip VMs, because they confirm from cgroupfs, which cannot see
 qemu. `qemu-kill` is the Incus-free VM self-fence:
