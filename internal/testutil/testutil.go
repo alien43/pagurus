@@ -94,9 +94,11 @@ func Client(t testing.TB, endpoint string, more ...string) *clientv3.Client {
 	return cli
 }
 
-// Proxy forwards TCP to a target. While blackholed, connections stay open but
-// every byte is dropped and new connections hang — a partition, as seen from
-// both ends.
+// Proxy forwards TCP to a target. While blackholed, new connections hang and
+// open ones stall: bytes in flight are held, not dropped, and delivered once
+// the partition heals, as TCP retransmission would. (Dropping bytes from a
+// live stream, which no real network does to TCP, corrupted gRPC's HTTP/2
+// framing in the chaos sim: found 2026-10-10.)
 type Proxy struct {
 	ln        net.Listener
 	target    string
@@ -159,7 +161,10 @@ func (p *Proxy) pipe(dst, src net.Conn) {
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := src.Read(buf)
-		if n > 0 && !p.blackhole.Load() {
+		if n > 0 {
+			for p.blackhole.Load() {
+				time.Sleep(20 * time.Millisecond)
+			}
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
 			}
