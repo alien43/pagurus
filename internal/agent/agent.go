@@ -82,9 +82,10 @@ type Agent struct {
 	arch   string
 	// types are the instance types in this member's project, learned at
 	// preflight and after each start; the self-fence chain is chosen by them.
-	typesMu sync.Mutex
-	types   []string
-	agentID string
+	typesMu      sync.Mutex
+	types        []string
+	persistTypes bool // record types for fence-self (Run only)
+	agentID      string
 
 	// now is replaceable in tests.
 	now func() time.Time
@@ -259,9 +260,6 @@ func (a *Agent) Preflight(ctx context.Context) error {
 		a.log.Warn("no fence in the self chain applies to this project's instances: no verified self-fence (advertised; peers will not trust it under proceed)",
 			"types", t.Types, "chain", a.cfg.SelfFences())
 	}
-	if len(a.fenceCmd) == 0 || len(a.termCmd) == 0 {
-		return errors.New("agent: FenceCmd and TermCmd are required")
-	}
 	return a.rt.CheckStart(cctx, m)
 }
 
@@ -269,8 +267,17 @@ func (a *Agent) Preflight(ctx context.Context) error {
 // has been released and conch has exited.
 func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 	a.wd = wd
+	if len(a.fenceCmd) == 0 || len(a.termCmd) == 0 {
+		return errors.New("agent: FenceCmd and TermCmd are required")
+	}
 	if err := os.MkdirAll(a.cfg.StateDir, 0o700); err != nil {
 		return fmt.Errorf("state dir: %w", err)
+	}
+	a.typesMu.Lock()
+	a.persistTypes = true // validate runs Preflight unprivileged; only Run records
+	a.typesMu.Unlock()
+	if err := WriteTypes(a.cfg, a.selfTarget().Types); err != nil {
+		return fmt.Errorf("recording instance types for fence-self: %w", err)
 	}
 	if wd.Mode() != config.WatchdogOff {
 		r, err := listenNotify(filepath.Join(a.cfg.StateDir, a.cfg.Service+".notify"), a.relayFreshness)
@@ -462,7 +469,11 @@ func (a *Agent) setTypes(insts []incus.Instance) {
 	slices.Sort(ts)
 	a.typesMu.Lock()
 	a.types = ts
+	persist := a.persistTypes
 	a.typesMu.Unlock()
+	if !persist {
+		return
+	}
 	if err := WriteTypes(a.cfg, ts); err != nil {
 		a.log.Warn("cannot record instance types for fence-self", "err", err)
 	}
