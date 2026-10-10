@@ -39,5 +39,8 @@ for m in asus dell rpi5; do
   fi
   on "$m" "sudo rm -rf /run/singleton-proto /var/lib/singleton-proto"
 done
-etcdctl --endpoints=10.0.1.3:2379,10.0.1.6:2379,10.0.1.8:2379 del --prefix "/singleton/v1/$svc" >/dev/null
+eps=10.0.1.3:2379,10.0.1.6:2379,10.0.1.8:2379
+etcdctl --endpoints=$eps del --prefix "/singleton/v1/$svc" >/dev/null   # the pre-conch schema
+etcdctl --endpoints=$eps del --prefix "/pagurus/v2/$svc" >/dev/null
+etcdctl --endpoints=$eps del --prefix "/conch/v1/elect/pagurus/v2/$svc/" >/dev/null
 echo "purged"

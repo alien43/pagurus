@@ -1,7 +1,18 @@
 // Package coord holds the etcd schema of one pagurus service.
 //
-//	<prefix>/leader         LeaderRecord, attached to the leader's lease. Its
-//	                        create revision is the epoch (fencing token).
+// The office itself is a conch election (`conch elect <Office()>`):
+//
+//	/conch/v1/elect/<office>/<lease hex>   one key per candidate, attached to
+//	                        its conch session lease; the lowest create
+//	                        revision holds the office. That revision is the
+//	                        epoch (CONCH_REV, the fencing token).
+//
+// where <office> is the service prefix without its leading slash. Under the
+// service prefix:
+//
+//	<prefix>/leader         LeaderRecord, attached to the holder's conch lease,
+//	                        written by the holder: which member holds the
+//	                        office (conch's own value names only the host).
 //	<prefix>/ms/<member>    MemberState, no lease: whether <member> may still be
 //	                        running the workload. Survives every crash.
 //	<prefix>/reg/<member>   Registration, attached to the agent's lease.
@@ -35,6 +46,7 @@ var ErrNotLeader = errors.New("not the leader (epoch superseded)")
 
 type LeaderRecord struct {
 	Member   string    `json:"member"`
+	Epoch    int64     `json:"epoch"`
 	AgentID  string    `json:"agent_id"`
 	Acquired time.Time `json:"acquired"`
 }
@@ -102,7 +114,15 @@ func New(cli *clientv3.Client, prefix string, opTimeout time.Duration) *Coord {
 	return &Coord{cli: cli, prefix: prefix, opTimeout: opTimeout}
 }
 
-func (c *Coord) LeaderKey() string           { return c.prefix + "/leader" }
+func (c *Coord) LeaderKey() string { return c.prefix + "/leader" }
+
+// Office is the conch election name for this service; ElectionPrefix is where
+// conch keeps its candidates, and ElectionKey the candidate key of a lease.
+func (c *Coord) Office() string         { return strings.TrimPrefix(c.prefix, "/") }
+func (c *Coord) ElectionPrefix() string { return "/conch/v1/elect/" + c.Office() + "/" }
+func (c *Coord) ElectionKey(lease clientv3.LeaseID) string {
+	return fmt.Sprintf("%s%x", c.ElectionPrefix(), int64(lease))
+}
 func (c *Coord) PinKey() string              { return c.prefix + "/pin" }
 func (c *Coord) EndpointKey() string         { return c.prefix + "/endpoint" }
 func (c *Coord) MSKey(member string) string  { return c.prefix + "/ms/" + member }
@@ -121,57 +141,41 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
-// Campaign tries to create the leader key atomically. On success it returns
-// the epoch (the key's create revision). On failure it returns the current
-// holder's epoch.
-func (c *Coord) Campaign(ctx context.Context, lease clientv3.LeaseID, rec LeaderRecord) (won bool, epoch int64, err error) {
-	cctx, cancel := c.ctx(ctx)
-	defer cancel()
-	k := c.LeaderKey()
-	resp, err := c.cli.Txn(cctx).
-		If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
-		Then(clientv3.OpPut(k, mustJSON(rec), clientv3.WithLease(lease))).
-		Else(clientv3.OpGet(k)).
-		Commit()
-	if err != nil {
-		return false, 0, err
-	}
-	if resp.Succeeded {
-		return true, resp.Header.Revision, nil
-	}
-	if kvs := resp.Responses[0].GetResponseRange().Kvs; len(kvs) > 0 {
-		return false, kvs[0].CreateRevision, nil
-	}
-	return false, 0, nil
-}
-
-// Leader returns the current leader, or nil if the office is vacant. rev is the
-// store revision of the read, to start a watch from.
+// Leader returns the current office holder, or nil if the office is vacant.
+// epoch and lease are the holder's election key's create revision and lease.
+// rec.Member is "" while the holder has not yet written its LeaderRecord. rev
+// is the store revision of the read, to start a watch from.
 func (c *Coord) Leader(ctx context.Context) (rec *LeaderRecord, epoch int64, lease clientv3.LeaseID, rev int64, err error) {
 	cctx, cancel := c.ctx(ctx)
 	defer cancel()
-	resp, err := c.cli.Get(cctx, c.LeaderKey())
+	resp, err := c.cli.Txn(cctx).Then(
+		clientv3.OpGet(c.ElectionPrefix(), clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByCreateRevision, clientv3.SortAscend), clientv3.WithLimit(1)),
+		clientv3.OpGet(c.LeaderKey()),
+	).Commit()
 	if err != nil {
 		return nil, 0, 0, 0, err
 	}
 	rev = resp.Header.Revision
-	if len(resp.Kvs) == 0 {
+	holders := resp.Responses[0].GetResponseRange().Kvs
+	if len(holders) == 0 {
 		return nil, 0, 0, rev, nil
 	}
-	kv := resp.Kvs[0]
+	h := holders[0]
 	rec = &LeaderRecord{}
-	if err := json.Unmarshal(kv.Value, rec); err != nil {
-		return nil, 0, 0, rev, fmt.Errorf("decode leader record: %w", err)
+	if kvs := resp.Responses[1].GetResponseRange().Kvs; len(kvs) > 0 {
+		var r LeaderRecord
+		if err := json.Unmarshal(kvs[0].Value, &r); err == nil && r.Epoch == h.CreateRevision {
+			rec = &r
+		}
 	}
-	return rec, kv.CreateRevision, clientv3.LeaseID(kv.Lease), rev, nil
+	return rec, h.CreateRevision, clientv3.LeaseID(h.Lease), rev, nil
 }
 
+// leaderGuard: (epoch, lease) still holds the office. A candidate key, once
+// lowest, stays lowest while it exists (later keys get higher revisions), so
+// its existence with that create revision is the whole check.
 func (c *Coord) leaderGuard(epoch int64, lease clientv3.LeaseID) []clientv3.Cmp {
-	k := c.LeaderKey()
-	return []clientv3.Cmp{
-		clientv3.Compare(clientv3.CreateRevision(k), "=", epoch),
-		clientv3.Compare(clientv3.LeaseValue(k), "=", lease),
-	}
+	return []clientv3.Cmp{clientv3.Compare(clientv3.CreateRevision(c.ElectionKey(lease)), "=", epoch)}
 }
 
 // Guarded applies ops only if (epoch, lease) still holds the office. This is
@@ -190,24 +194,27 @@ func (c *Coord) Guarded(ctx context.Context, epoch int64, lease clientv3.LeaseID
 	return nil
 }
 
+// StillLeader reads whether (epoch, lease) still holds the office.
+func (c *Coord) StillLeader(ctx context.Context, epoch int64, lease clientv3.LeaseID) (bool, error) {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.cli.Get(cctx, c.ElectionKey(lease))
+	if err != nil {
+		return false, err
+	}
+	return len(resp.Kvs) == 1 && resp.Kvs[0].CreateRevision == epoch, nil
+}
+
+func (c *Coord) OpPutLeader(rec LeaderRecord, lease clientv3.LeaseID) clientv3.Op {
+	return clientv3.OpPut(c.LeaderKey(), mustJSON(rec), clientv3.WithLease(lease))
+}
+
 func (c *Coord) OpPutMS(member string, ms MemberState) clientv3.Op {
 	return clientv3.OpPut(c.MSKey(member), mustJSON(ms))
 }
 
 func (c *Coord) OpPutEndpoint(ep Endpoint, lease clientv3.LeaseID) clientv3.Op {
 	return clientv3.OpPut(c.EndpointKey(), mustJSON(ep), clientv3.WithLease(lease))
-}
-
-// Resign deletes the leader key if it still belongs to epoch.
-func (c *Coord) Resign(ctx context.Context, epoch int64) error {
-	cctx, cancel := c.ctx(ctx)
-	defer cancel()
-	k := c.LeaderKey()
-	_, err := c.cli.Txn(cctx).
-		If(clientv3.Compare(clientv3.CreateRevision(k), "=", epoch)).
-		Then(clientv3.OpDelete(k), clientv3.OpDelete(c.EndpointKey())).
-		Commit()
-	return err
 }
 
 // MemberStates returns every member's may-run record.
@@ -258,18 +265,22 @@ func (c *Coord) ReportSelfStopped(ctx context.Context, member string, prevModRev
 func (c *Coord) AckFenced(ctx context.Context, member, by string) error {
 	cctx, cancel := c.ctx(ctx)
 	defer cancel()
-	rec, _, _, _, err := c.Leader(cctx)
+	rec, epoch, lease, _, err := c.Leader(cctx)
 	if err != nil {
 		return err
 	}
 	if rec != nil && rec.Member == member {
 		return fmt.Errorf("%s currently holds the office; refusing", member)
 	}
+	if rec != nil && rec.Member == "" {
+		return errors.New("the office was just taken and its holder has not identified itself yet; retry")
+	}
 	ms := MemberState{State: Stopped, By: by, Reason: "operator fence-ack", At: time.Now().UTC()}
-	k := c.LeaderKey()
-	cmp := clientv3.Compare(clientv3.CreateRevision(k), "=", 0)
+	// The office must not change hands between the read and the write: the
+	// same holder, or still nobody (no candidate key at all).
+	cmp := clientv3.Compare(clientv3.CreateRevision(c.ElectionPrefix()), "=", 0).WithPrefix()
 	if rec != nil {
-		cmp = clientv3.Compare(clientv3.Value(k), "=", mustJSON(*rec))
+		cmp = c.leaderGuard(epoch, lease)[0]
 	}
 	resp, err := c.cli.Txn(cctx).If(cmp).Then(c.OpPutMS(member, ms)).Commit()
 	if err != nil {
@@ -337,12 +348,4 @@ func (c *Coord) GetEndpoint(ctx context.Context) (*Endpoint, error) {
 	}
 	ep := &Endpoint{}
 	return ep, json.Unmarshal(resp.Kvs[0].Value, ep)
-}
-
-// WatchOffice watches the whole service prefix from rev+1, so callers wake on
-// leader and pin changes (and, harmlessly, on ms/reg writes) and re-read.
-// WithRequireLeader makes the watch fail rather than hang on a member that
-// lost the etcd quorum.
-func (c *Coord) WatchOffice(ctx context.Context, rev int64) clientv3.WatchChan {
-	return c.cli.Watch(clientv3.WithRequireLeader(ctx), c.prefix+"/", clientv3.WithPrefix(), clientv3.WithRev(rev+1))
 }

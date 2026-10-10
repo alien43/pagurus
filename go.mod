@@ -4,7 +4,6 @@ go 1.26.7
 
 require (
 	github.com/lxc/incus/v7 v7.5.1
-	go.etcd.io/etcd/api/v3 v3.6.12
 	go.etcd.io/etcd/client/pkg/v3 v3.6.12
 	go.etcd.io/etcd/client/v3 v3.6.12
 	go.uber.org/zap v1.27.0
@@ -13,6 +12,7 @@ require (
 
 require (
 	github.com/AdaLogics/go-fuzz-headers v0.0.0-20240806141605-e8a1dd7889d6 // indirect
+	github.com/alien43/conch v0.5.1-0.20261010171837-0609155d50d0 // indirect
 	github.com/apex/log v1.9.0 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -46,6 +46,7 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pkg/sftp v1.13.11 // indirect
 	github.com/pkg/xattr v0.4.12 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/rootless-containers/proto/go-proto v0.0.0-20260207013450-f6ee952d53d9 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	github.com/sirupsen/logrus v1.10.2 // indirect
@@ -53,6 +54,7 @@ require (
 	github.com/vbatts/go-mtree v0.7.0 // indirect
 	github.com/zitadel/oidc/v3 v3.51.3 // indirect
 	github.com/zitadel/schema v1.3.2 // indirect
+	go.etcd.io/etcd/api/v3 v3.6.12 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.46.0 // indirect
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect
@@ -69,3 +71,5 @@ require (
 	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
+
+tool github.com/alien43/conch/cmd/conch

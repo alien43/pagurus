@@ -98,6 +98,33 @@ type Lease struct {
 	Margin Duration `json:"margin"`
 }
 
+// Conch locates the conch binary (>= 0609155: --fence, --watchdog,
+// --campaign-after, etcd TLS/auth flags).
+type Conch struct {
+	Path string `json:"path"`
+}
+
+// FenceOverhead is added to the self chain's budgets for conch's
+// --fence-budget: `pagurus fence-self` must start and load its config before
+// the chain's first fence runs.
+const FenceOverhead = time.Second
+
+// ConchFenceBudget is the --fence-budget pagurus gives conch.
+func (c *Config) ConchFenceBudget() time.Duration { return c.SelfFenceLead() + FenceOverhead }
+
+// ConchLossDetect is conch's LossDetectTimeout(ttl) (core/session.go): how
+// long after the last good renewal conch declares the lease lost and starts
+// the fence. conch refuses to start unless that, the fence budget and 1s fit
+// in the TTL; Validate checks the same so the refusal comes at config time.
+func ConchLossDetect(ttl time.Duration) time.Duration {
+	interval := ttl / 3
+	margin := 1500 * time.Millisecond
+	if interval > 2*time.Second {
+		margin = interval / 2
+	}
+	return interval + margin
+}
+
 type SelfFence struct {
 	// StopBudget bounds `incus stop --force` of the local project.
 	StopBudget Duration `json:"stop_budget"`
@@ -253,8 +280,11 @@ type Config struct {
 	Health     Health    `json:"health"`
 	Watchdog   Watchdog  `json:"watchdog"`
 
-	// StateDir holds the lease-resume file. Must be on tmpfs (/run) so that a
-	// reboot never resumes a lease.
+	// Conch says which conch runs the office (`conch elect`).
+	Conch Conch `json:"conch"`
+
+	// StateDir holds the agent's sockets (conch's watchdog relay, the term
+	// handle) and the term heartbeat. Must be on tmpfs (/run).
 	StateDir string `json:"state_dir"`
 	// AlertURL, if set, receives a POST for every event that needs a human.
 	AlertURL string `json:"alert_url"`
@@ -295,7 +325,7 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	if c.EtcdPrefix == "" {
-		c.EtcdPrefix = "/pagurus/v1/" + c.Service
+		c.EtcdPrefix = "/pagurus/v2/" + c.Service
 	}
 	if len(c.Prefer) == 0 {
 		c.Prefer = slices.Clone(c.Members)
@@ -320,8 +350,11 @@ func (c *Config) applyDefaults() {
 	def(&c.Lease.TTL, 20*time.Second)
 	def(&c.Lease.RenewInterval, 2*time.Second)
 	def(&c.Lease.Margin, 2*time.Second)
-	def(&c.SelfFence.StopBudget, 6*time.Second)
-	def(&c.SelfFence.KillBudget, 3*time.Second)
+	def(&c.SelfFence.StopBudget, 4*time.Second)
+	def(&c.SelfFence.KillBudget, 2*time.Second)
+	if c.Conch.Path == "" {
+		c.Conch.Path = "conch"
+	}
 	if c.Fences.Self == nil {
 		c.Fences.Self = &[]FenceStep{
 			{Kind: fence.KindIncusStop, Budget: c.SelfFence.StopBudget},
@@ -481,10 +514,11 @@ func (c *Config) Validate() error {
 	if c.Etcd.OpTimeout.D() > renew {
 		bad("etcd.op_timeout %s must be <= lease.renew_interval %s, or one slow renewal delays the next", c.Etcd.OpTimeout.D(), renew)
 	}
-	// At least two renewals must be allowed to fail before self-fencing
-	// starts, or ordinary jitter fences a healthy leader.
-	if need := 3*renew + c.SelfFenceLead() + margin; need > ttl {
-		bad("lease.ttl %s too short: 3*renew_interval + self-fence chain budget + margin = %s", ttl, need)
+	// conch's own rule (FitFence): the fence starts at loss detection and must
+	// confirm, with 1s to spare, before the server can expire the lease.
+	if need := ConchLossDetect(ttl) + c.ConchFenceBudget() + time.Second; need >= ttl {
+		bad("lease.ttl %s too short for conch: loss detection %s + fence budget %s (self chain + %s) + 1s = %s",
+			ttl, ConchLossDetect(ttl).Round(time.Millisecond), c.ConchFenceBudget(), FenceOverhead, need.Round(time.Millisecond))
 	}
 	if c.Fence.Unverified == UnverifiedProceed && c.Fence.UnverifiedWait.D() < c.SelfFenceLead()+margin {
 		bad("fence.unverified_wait %s must cover the old leader's self-fence (>= %s)", c.Fence.UnverifiedWait.D(), c.SelfFenceLead()+margin)

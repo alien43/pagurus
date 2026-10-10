@@ -4,7 +4,7 @@
 # on whichever member currently leads and waits for the expected outcome.
 # Run from rpi5.
 #
-#   drill.sh [move|graceful|resume|crash|pause|partition]...   (default: all, in that order)
+#   drill.sh [move|graceful|restart|crash|pause|partition]...   (default: all, in that order)
 #
 # Exit status is non-zero if any drill misses its expectation or the audit
 # ever saw two members running at once.
@@ -21,7 +21,7 @@ log() { printf '%s  %s\n' "$(date +%T)" "$*"; }
 fail=0
 miss() { log "MISS: $*"; fail=1; }
 
-leader() { etcdctl --endpoints=$eps get /singleton/v1/$svc/leader --print-value-only 2>/dev/null | jq -r '.member // empty'; }
+leader() { etcdctl --endpoints=$eps get /pagurus/v2/$svc/leader --print-value-only 2>/dev/null | jq -r '.member // empty'; }
 running_on() {
   local out=()
   for m in asus dell rpi5; do
@@ -35,7 +35,7 @@ wait_for() {
   while (( SECONDS - s < t )); do "$@" && { echo $((SECONDS - s)); return 0; }; sleep 1; done
   return 1
 }
-endpoint_ip() { etcdctl --endpoints=$eps get /singleton/v1/$svc/endpoint --print-value-only 2>/dev/null | jq -r '.addresses["whoami-1"] // empty'; }
+endpoint_ip() { etcdctl --endpoints=$eps get /pagurus/v2/$svc/endpoint --print-value-only 2>/dev/null | jq -r '.addresses["whoami-1"] // empty'; }
 # healthy_on M: M leads, only M runs, and whoami answers on M (curl from M: the
 # instance sits on M's own incusbr0)
 healthy_on() {
@@ -72,11 +72,13 @@ drill_graceful() {
 }
 restart_agent() { "$here/scripts/proto-up.sh" --drill-proxy --only "$1" >/dev/null || miss "could not restart the agent on $1"; }
 
-drill_resume() {
-  local l pid; l=$(leader); pid=$(mainpid $l); log "== resume: SIGKILL the agent on $l (pid $pid); systemd restarts it within RestartSec"
+# conch has no lease resume (Andrey's Q3 decision): a killed agent's term ends.
+# systemd restarts the agent, whose startup fence stops the orphaned copy; the
+# office comes back once the dead term's lease has expired. Never two.
+drill_restart() {
+  local l pid; l=$(leader); pid=$(mainpid $l); log "== restart: SIGKILL the agent on $l (pid $pid); systemd restarts it within RestartSec"
   on $l "sudo kill -KILL $pid"
-  sleep 25   # > TTL: a failover would have happened by now
-  if [ "$(leader)" = "$l" ] && healthy_on $l; then log "   $l resumed its term, no failover"; else miss "resume (leader=$(leader) running=$(running_on))"; fi
+  if t=$(wait_for 120 settled); then log "   $(leader) serving ${t}s after the kill"; else miss "restart (leader=$(leader) running=$(running_on))"; fi
 }
 
 drill_crash() {
@@ -108,7 +110,7 @@ drill_partition() {
   [ "$(running_on)" = "$(leader)" ] || miss "after healing: running on $(running_on), leader $(leader)"
 }
 
-drills=("$@"); [ ${#drills[@]} -gt 0 ] || drills=(move graceful resume crash pause partition)
+drills=("$@"); [ ${#drills[@]} -gt 0 ] || drills=(move graceful restart crash pause partition)
 for d in "${drills[@]}"; do settle; "drill_$d"; done
 settle
 kill -INT $audit_pid; wait $audit_pid; audit_rc=$?

@@ -62,6 +62,8 @@ trap 'rm -rf "$build"' EXIT
 for a in amd64 arm64; do
   (cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w -X main.version=$ver" -o "$build/singleton-$a" ./cmd/pagurus)
   (cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w" -o "$build/blackhole-proxy-$a" ./cmd/blackhole-proxy)
+  # conch at the commit pinned in go.mod (a tool dependency); found on PATH
+  (cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH=$a go build -trimpath -ldflags "-s -w" -o "$build/conch-$a" github.com/alien43/conch/cmd/conch)
 done
 
 # Per-member groups and pinned projects (idempotent; the groups exist on this cluster).
@@ -74,6 +76,7 @@ for m in $only; do
   fi
   push "$m" "$build/singleton-${arch[$m]}" "${bin[$m]}/singleton"
   push "$m" "$build/blackhole-proxy-${arch[$m]}" "${bin[$m]}/blackhole-proxy"
+  push "$m" "$build/conch-${arch[$m]}" "${bin[$m]}/conch"
   push "$m" "$cfg" "$remote_dir/$svc/singleton.json"
   push "$m" "$compose" "$remote_dir/$svc/compose.yaml"
   on "$m" "sudo chmod 0755 $remote_dir $remote_dir/$svc && sudo chmod 0644 $remote_dir/$svc/singleton.json $remote_dir/$svc/compose.yaml"
@@ -87,13 +90,13 @@ for m in $only; do
     # a failed transient unit lingers until reset; clear it before re-creating
     on "$m" "systemctl is-active --quiet $unit-px" || on "$m" "sudo systemctl reset-failed $unit-px 2>/dev/null; sudo systemctl stop $unit-px 2>/dev/null; sudo systemd-run --quiet --unit=$unit-px --description='singleton drill etcd proxy' -p Restart=always ${bin[$m]}/blackhole-proxy$specs"
   fi
-  on "$m" "env PATH=${path[$m]} ${bin[$m]}/singleton validate -c $remote_dir/$svc/singleton.json"
+  on "$m" "env PATH=${bin[$m]}:${path[$m]} ${bin[$m]}/singleton validate -c $remote_dir/$svc/singleton.json"
   on "$m" "sudo systemctl reset-failed $unit 2>/dev/null; true"
   on "$m" "sudo systemd-run --quiet --unit=$unit --description='singleton prototype ($svc)' \
     -p Type=notify -p NotifyAccess=main -p WatchdogSec=30s \
     -p Restart=always -p RestartSec=3s -p StartLimitIntervalSec=0 \
     -p TimeoutStopSec=60s -p KillMode=mixed \
-    --setenv=PATH=${path[$m]} \
+    --setenv=PATH=${bin[$m]}:${path[$m]} \
     ${bin[$m]}/singleton run -c $remote_dir/$svc/singleton.json --self $m --etcd $eps"
   echo "   started $unit ($ver)"
 done

@@ -7,7 +7,7 @@
     ]
   },
   "project_prefix": "pgs-whoami",
-  "etcd_prefix": "/pagurus/v1/whoami-instances",
+  "etcd_prefix": "/pagurus/v2/whoami-instances",
   "members": [
     "node1",
     "node2",

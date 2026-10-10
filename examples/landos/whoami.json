@@ -2,7 +2,7 @@
   "service": "whoami",
   "start": {"kind": "compose", "file": "/run/singleton-proto/whoami/compose.yaml"},
   "project_prefix": "sgl-whoami",
-  "etcd_prefix": "/singleton/v1/whoami",
+  "etcd_prefix": "/pagurus/v2/whoami",
   "members": ["asus", "dell", "rpi5"],
   "prefer": ["asus", "dell", "rpi5"],
   "grace": "10s",
@@ -13,7 +13,7 @@
     "op_timeout": "2s"
   },
   "lease": {"ttl": "20s", "renew_interval": "2s", "margin": "2s"},
-  "self_fence": {"stop_budget": "6s", "kill_budget": "3s"},
+  "self_fence": {"stop_budget": "4s", "kill_budget": "2s"},
 
   "fence": {
     "api_timeout": "15s",

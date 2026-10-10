@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -17,58 +16,43 @@ import (
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/incus"
-	"github.com/alien43/pagurus/internal/lease"
 )
 
-var (
-	errReleased  = errors.New("office released")
-	errSelfFence = errors.New("self-fence")
-)
-
-// lead runs one leadership term. It returns once the workload is stopped here
-// (or, if that cannot be confirmed, once the failure is alerted and left to the
-// watchdog) and the term is over.
+// lead runs one term, handed over by `pagurus term` (conch's child). epoch is
+// CONCH_REV and lease conch's session lease. It returns the term process's
+// exit code: 0 after a confirmed local stop, so conch's fence confirms at once
+// and conch resigns; non-zero otherwise.
 //
 // Two contexts govern a term:
 //   - ctx, the agent's lifetime. Its end asks for a graceful release.
-//   - term, ended by the guardian when the lease cannot be kept or the office
-//     was taken away. Its end means "stop now", and the guardian does the
-//     stopping itself, so a main loop stuck in a slow call cannot delay it.
-func (a *Agent) lead(ctx context.Context, k *lease.Keeper, epoch int64) {
+//   - lost, ended when the term process goes (conch lost the lease or died).
+//     Its end means "stop acting now": conch's fence stops the workload.
+func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.LeaseID) int {
 	log := a.log.With("member", a.member, "epoch", epoch)
 	acquired := a.now()
 	a.mu.Lock()
 	// From here on the workload may run here: only a confirmed stop may set
-	// localStopped again (it is what keeps the watchdog fed past the deadline).
-	// unfitAfter is zeroed so an unconfirmed stop at the end of the term is
-	// unfit at once, not after some window left over from before.
-	a.role, a.keeper, a.epoch, a.localStopped, a.unfitAfter = roleLeader, k, epoch, false, time.Time{}
+	// localStopped again.
+	a.role, a.localStopped, a.unfitAfter = roleLeader, false, time.Time{}
 	a.mu.Unlock()
-	defer func() {
-		a.mu.Lock()
-		a.role, a.keeper = roleFollower, nil
-		a.mu.Unlock()
-	}()
-	a.saveResume(k, epoch)
+	defer a.setRole(roleFollower)
+	a.beat(time.Minute)
+	hctx, stopHB := context.WithCancel(context.Background())
+	defer stopHB()
+	go a.heartbeat(hctx)
 
-	term, endTerm := context.WithCancelCause(context.Background())
-	defer endTerm(errReleased)
-	var releasing atomic.Bool
-	fenced := make(chan struct{})
-	go a.guardian(term, endTerm, k, epoch, &releasing, fenced)
-
-	// op is cancelled by either: every leader-side operation runs under it.
-	op, cancelOp := context.WithCancel(term)
+	op, cancelOp := context.WithCancel(lost)
 	defer cancelOp()
 	stopAfter := context.AfterFunc(ctx, cancelOp)
 	defer stopAfter()
 
-	t := &termState{a: a, k: k, epoch: epoch, acquired: acquired, log: log, op: op}
+	t := &termState{a: a, lease: lease, epoch: epoch, acquired: acquired, log: log, op: op}
+	log.Info("won the office", "lease", fmt.Sprintf("%x", int64(lease)))
 
-	finish := func() {
-		if errors.Is(context.Cause(term), errSelfFence) {
-			<-fenced
-			return
+	finish := func() int {
+		if lost.Err() != nil {
+			log.Warn("term lost (conch ended it); conch's fence stops the workload")
+			return 70
 		}
 		reason, backoff := "agent shutdown", time.Duration(0)
 		switch {
@@ -77,108 +61,45 @@ func (a *Agent) lead(ctx context.Context, k *lease.Keeper, epoch int64) {
 		case ctx.Err() == nil:
 			reason = "term ended"
 		}
-		releasing.Store(true)
-		a.release(k, epoch, reason, backoff, log)
-		endTerm(errReleased)
+		if a.release(epoch, lease, reason, backoff, log) {
+			return 0
+		}
+		return 1
 	}
 
-	if err := t.fenceOthers(); err != nil {
-		finish()
-		return
+	if err := a.co.Guarded(op, epoch, lease, a.co.OpPutLeader(coord.LeaderRecord{
+		Member: a.member, Epoch: epoch, AgentID: a.agentID, Acquired: acquired.UTC(),
+	}, lease)); err != nil {
+		log.Warn("cannot record the office; not starting", "err", err)
+		return finish()
 	}
-	if err := a.co.Guarded(op, epoch, k.ID(), a.co.OpPutMS(a.member, coord.MemberState{
+	// What made us campaign may have changed while conch waited.
+	if pin, err := a.co.Pin(op); err == nil && pin != "" && pin != a.member {
+		t.giveUp("office pinned to "+pin, 0)
+		return finish()
+	}
+	if err := a.checkConfigSkew(op); err != nil {
+		t.giveUp(err.Error(), a.cfg.EligibleInterval.D())
+		return finish()
+	}
+	if err := t.fenceOthers(); err != nil {
+		return finish()
+	}
+	if err := a.co.Guarded(op, epoch, lease, a.co.OpPutMS(a.member, coord.MemberState{
 		State: coord.MayRun, Epoch: epoch, By: a.member, Reason: "starting", At: a.now().UTC(), Caps: a.caps(),
 	})); err != nil {
 		log.Warn("cannot record may-run; not starting", "err", err)
-		if errors.Is(err, coord.ErrNotLeader) {
-			// Deposed already. A resumed term may still have the workload
-			// running from before the restart: stop it, but there is no
-			// office left to release.
-			releasing.Store(true)
-			endTerm(errReleased)
-			<-fenced
-			a.stopLocal(context.WithoutCancel(ctx), "deposed before start")
-			return
-		}
-		finish()
-		return
+		return finish()
 	}
 	t.supervise()
-	finish()
+	return finish()
 }
 
-// guardian ends the term and fences locally when the lease is lost, its safe
-// deadline approaches without renewals, or the office is taken from us.
-func (a *Agent) guardian(term context.Context, endTerm context.CancelCauseFunc, k *lease.Keeper, epoch int64, releasing *atomic.Bool, fenced chan<- struct{}) {
-	defer close(fenced)
-	deposed := a.watchDeposed(term, epoch)
-	lead := a.cfg.SelfFenceLead()
-	for {
-		trigger := k.SafeDeadline().Add(-lead)
-		timer := time.NewTimer(max(trigger.Sub(a.now()), 0))
-		var reason string
-		select {
-		case <-term.Done():
-			timer.Stop()
-			return
-		case <-k.Lost():
-			reason = "lease lost"
-		case <-deposed:
-			if releasing.Load() {
-				timer.Stop()
-				return
-			}
-			reason = "office taken away (leader key deleted or replaced)"
-		case <-timer.C:
-			if a.now().Before(k.SafeDeadline().Add(-lead)) {
-				continue // a renewal moved the deadline
-			}
-			reason = fmt.Sprintf("lease renewals failing (last error: %v); %s to safe deadline", k.LastError(), k.Remaining().Round(time.Millisecond))
-		}
-		timer.Stop()
-		endTerm(fmt.Errorf("%w: %s", errSelfFence, reason))
-		a.alerter.Alert("self-fence", "self-fencing: "+reason, "member", a.member, "epoch", epoch)
-		a.stopLocal(context.Background(), "self-fence: "+reason)
-		return
-	}
-}
-
-// watchDeposed signals when the leader key no longer carries our epoch.
-// Watch failures are retried; partitions are the lease's job, not this one's.
-func (a *Agent) watchDeposed(term context.Context, epoch int64) <-chan struct{} {
-	ch := make(chan struct{})
-	go func() {
-		for term.Err() == nil {
-			_, cur, _, rev, err := a.co.Leader(term)
-			if err == nil && cur != epoch {
-				close(ch)
-				return
-			}
-			if err != nil {
-				sleep(term, time.Second)
-				continue
-			}
-			for resp := range a.co.Client().Watch(clientv3.WithRequireLeader(term), a.co.LeaderKey(), clientv3.WithRev(rev+1)) {
-				if resp.Err() != nil {
-					break
-				}
-				for _, ev := range resp.Events {
-					if ev.Type == clientv3.EventTypeDelete || ev.Kv.CreateRevision != epoch {
-						close(ch)
-						return
-					}
-				}
-			}
-			sleep(term, time.Second)
-		}
-	}()
-	return ch
-}
-
-// release gives the office up gracefully: stop here, confirm, record, resign.
-// If the stop cannot be confirmed the office is not resigned explicitly and
-// the member state stays may-run: the next leader must fence us.
-func (a *Agent) release(k *lease.Keeper, epoch int64, reason string, backoff time.Duration, log *slog.Logger) {
+// release gives the office up gracefully: stop here, confirm, record. conch
+// then runs the fence (which confirms at once) and resigns. If the stop cannot
+// be confirmed the member state stays may-run: conch's fence tries again, and
+// failing that the next leader must fence us.
+func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, backoff time.Duration, log *slog.Logger) bool {
 	log.Info("releasing the office", "reason", reason)
 	bg := context.Background()
 	sctx, cancel := context.WithTimeout(bg, a.cfg.SelfFence.StopBudget.D()+5*time.Second)
@@ -195,24 +116,22 @@ func (a *Agent) release(k *lease.Keeper, epoch int64, reason string, backoff tim
 	a.backoffUntil = a.now().Add(backoff)
 	a.mu.Unlock()
 	if !ok {
-		log.Warn("release: local stop unconfirmed; leaving member state may-run for the next leader to fence")
-		return
+		log.Warn("release: local stop unconfirmed; leaving member state may-run for conch's fence and the next leader")
+		return false
 	}
-	if err := a.co.Guarded(bg, epoch, k.ID(), a.co.OpPutMS(a.member, coord.MemberState{
+	if err := a.co.Guarded(bg, epoch, lease, a.co.OpPutMS(a.member, coord.MemberState{
 		State: coord.Stopped, Epoch: epoch, By: a.member, Reason: "released: " + reason, At: a.now().UTC(), Caps: a.caps(),
 	})); err != nil {
 		log.Warn("release: could not record stopped", "err", err)
 	}
-	if err := a.co.Resign(bg, epoch); err != nil {
-		log.Warn("release: resign failed; the lease will expire on its own", "err", err)
-	}
 	log.Info("office released", "reason", reason)
+	return true
 }
 
 // termState carries one term's working state.
 type termState struct {
 	a        *Agent
-	k        *lease.Keeper
+	lease    clientv3.LeaseID
 	epoch    int64
 	acquired time.Time
 	log      *slog.Logger
@@ -313,7 +232,7 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 			return true, "", 0
 		}
 		if st.State == coord.MayRun {
-			err := a.co.Guarded(t.op, t.epoch, t.k.ID(), a.co.OpPutMS(m, coord.MemberState{
+			err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutMS(m, coord.MemberState{
 				State: coord.Stopped, Epoch: st.Epoch, By: a.member, At: a.now().UTC(), Caps: st.Caps,
 				Reason: fmt.Sprintf("fenced via %s by epoch %d", fenceVia(by), t.epoch),
 			}))
@@ -397,7 +316,7 @@ func (t *termState) publish() {
 			}
 		}
 	}
-	if err := a.co.Guarded(t.op, t.epoch, t.k.ID(), a.co.OpPutEndpoint(ep, t.k.ID())); err != nil {
+	if err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutEndpoint(ep, t.lease)); err != nil {
 		t.log.Warn("cannot publish endpoint", "err", err)
 	}
 }
@@ -501,6 +420,13 @@ func (t *termState) supervise() {
 		}
 		if pin, err := a.co.Pin(t.op); err == nil && pin != "" && pin != a.member {
 			t.giveUp("office pinned to "+pin, 0)
+			return
+		}
+		// The office can also be taken away outside conch (its key deleted):
+		// conch only notices a lost lease.
+		if still, err := a.co.StillLeader(t.op, t.epoch, t.lease); err == nil && !still {
+			a.alerter.Alert("deposed", "office taken away (election key gone); stopping", "member", a.member, "epoch", t.epoch)
+			t.giveUp("deposed", 0)
 			return
 		}
 		err := t.health()

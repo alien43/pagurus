@@ -34,7 +34,7 @@ func TestDefaultsAreValid(t *testing.T) {
 	if c.Project("dell") != "sgl-whoami-dell" || c.Rank("asus") != 0 || c.Rank("rpi5") != 2 {
 		t.Error("project/rank derivation wrong")
 	}
-	if c.EtcdPrefix != "/pagurus/v1/whoami" {
+	if c.EtcdPrefix != "/pagurus/v2/whoami" {
 		t.Errorf("etcd prefix %q", c.EtcdPrefix)
 	}
 }

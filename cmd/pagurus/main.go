@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -56,6 +57,12 @@ commands:
               --fence <1-based index> --i-know
   audit       watch every member's project and report any moment with more
               than one member running the workload (drill tool)
+
+run by conch (the agent passes these to ` + "`conch elect`" + `; not for operators):
+  fence-self  this member's self chain, as conch's --fence:
+              pagurus fence-self -c cfg --member <member>
+  term        conch's child while it holds the office; hands the term to
+              the agent: pagurus term --socket <path>
 `
 
 func main() {
@@ -64,6 +71,12 @@ func main() {
 		os.Exit(64)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
+	if cmd == "term" { // no config: a pipe between conch and the agent
+		tfs := flag.NewFlagSet(cmd, flag.ExitOnError)
+		sock := tfs.String("socket", "", "the agent's term socket")
+		_ = tfs.Parse(args)
+		os.Exit(agent.RunTermShim(*sock))
+	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	cfgPath := fs.String("c", "", "config file")
 	to := fs.String("to", "", "move: target member")
@@ -112,7 +125,9 @@ func main() {
 	case "validate":
 		err = cmdValidate(ctx, cfg, rt)
 	case "run":
-		err = cmdRun(ctx, cfg, rt, log, *self)
+		err = cmdRun(ctx, cfg, rt, log, *self, *cfgPath)
+	case "fence-self":
+		os.Exit(cmdFenceSelf(cfg, drv, *member, log))
 	case "status":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdStatus(ctx, cfg, drv, cli) })
 	case "move":
@@ -188,7 +203,7 @@ func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime) error {
 	return nil
 }
 
-func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logger, self string) error {
+func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logger, self, cfgPath string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("run must be root (cgroup.kill, watchdog)")
 	}
@@ -197,7 +212,16 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logg
 		return err
 	}
 	defer cli.Close()
-	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log)})
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(cfgPath)
+	if err != nil {
+		return err
+	}
+	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log),
+		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: []string{exe, "term", "--socket"}})
 	if err := a.Preflight(ctx); err != nil {
 		// No lease is held by a starting agent, so nothing may run here. If
 		// the local Incus is what failed, cgroup.kill still works: use it,
@@ -244,7 +268,11 @@ func cmdStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, cli *c
 		if r, err := cli.TimeToLive(ctx, lid); err == nil {
 			ttl = r.TTL
 		}
-		fmt.Printf("office:   %s  epoch=%d  since=%s  lease_ttl=%ds\n", rec.Member, epoch, rec.Acquired.Local().Format(time.TimeOnly), ttl)
+		if rec.Member == "" {
+			fmt.Printf("office:   held (holder not yet identified)  epoch=%d  lease_ttl=%ds\n", epoch, ttl)
+		} else {
+			fmt.Printf("office:   %s  epoch=%d  since=%s  lease_ttl=%ds\n", rec.Member, epoch, rec.Acquired.Local().Format(time.TimeOnly), ttl)
+		}
 	}
 	if pin, _ := co.Pin(ctx); pin != "" {
 		fmt.Printf("pin:      %s\n", pin)
@@ -460,6 +488,36 @@ func cmdFenceRun(ctx context.Context, cfg *config.Config, rt *incus.Driver, memb
 		return fmt.Errorf("fence %s did not confirm", chain[idx-1].Kind())
 	}
 	return nil
+}
+
+// cmdFenceSelf is conch's --fence: run this member's self chain within the
+// budget conch gives it, and exit 0 only if it confirmed that nothing runs.
+// The instance types come from what the agent recorded, so the chain is chosen
+// without waiting on Incus; unknown, every type is assumed.
+func cmdFenceSelf(cfg *config.Config, rt *incus.Driver, member string, log *slog.Logger) int {
+	if !slices.Contains(cfg.Members, member) {
+		log.Error("fence-self: --member is not a member", "member", member)
+		return 64
+	}
+	chain, err := fence.BuildSelf(rt, cfg.SelfFences())
+	if err != nil {
+		log.Error("fence-self", "err", err)
+		return 64
+	}
+	t := fence.Target{Member: member, Project: cfg.Project(member)}
+	if ts, ok := agent.ReadTypes(cfg); ok {
+		t.Types = ts
+	} else {
+		t.Types = []string{"container", "virtual-machine"}
+	}
+	log = log.With("member", member, "reason", os.Getenv("CONCH_FENCE_REASON"), "rev", os.Getenv("CONCH_REV"))
+	res := chain.Run(context.Background(), t, log)
+	if !res.Stopped {
+		log.Error("fence-self did not confirm", "chain", res.String())
+		return 1
+	}
+	log.Info("fence-self confirmed", "by", res.By)
+	return 0
 }
 
 // runtime is the agent's view of the world: the Incus driver (projects,

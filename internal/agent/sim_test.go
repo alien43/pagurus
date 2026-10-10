@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -277,8 +278,10 @@ type harness struct {
 	cfg   *config.Config
 	sim   *simCluster
 	etcd  string
+	mu    sync.Mutex // nodes, read by the simulated host
 	nodes map[string]*node
 	state string
+	host  string // the simulated host's socket (sim-fence)
 	// nodeCfg, if set for a member, adjusts that member's config only.
 	nodeCfg map[string]func(*config.Config)
 }
@@ -289,7 +292,7 @@ func testConfig(t *testing.T, mutate func(*config.Config)) *config.Config {
 	  "service": "svc", "compose": "/dev/null", "project_prefix": "sgl-svc",
 	  "members": ["asus", "dell", "rpi5"],
 	  "etcd": {"endpoints": ["x"], "op_timeout": "400ms"},
-	  "lease": {"ttl": "5s", "renew_interval": "500ms", "margin": "500ms"},
+	  "lease": {"ttl": "8s", "renew_interval": "500ms", "margin": "500ms"},
 	  "self_fence": {"stop_budget": "1s", "kill_budget": "500ms"},
 	  "grace": "1s", "eligible_interval": "300ms", "audit_interval": "1s",
 	  "fence": {"api_timeout": "1s", "retry_interval": "500ms", "reboot_margin": "1s", "unverified_wait": "6s"},
@@ -311,10 +314,20 @@ func testConfig(t *testing.T, mutate func(*config.Config)) *config.Config {
 }
 
 func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
+	// Short: unix socket paths are limited to 108 bytes.
+	state, err := os.MkdirTemp("/tmp", "pg-state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(state) })
 	h := &harness{t: t, cfg: testConfig(t, mutate), sim: newSim(t, "asus", "dell", "rpi5"),
-		etcd: testutil.Etcd(t), nodes: map[string]*node{}, state: t.TempDir()}
+		etcd: testutil.Etcd(t), nodes: map[string]*node{}, state: state}
+	h.host = h.serveHost(t)
 	t.Cleanup(func() {
-		for _, n := range h.nodes {
+		h.mu.Lock()
+		nodes := maps.Clone(h.nodes)
+		h.mu.Unlock()
+		for _, n := range nodes {
 			n.kill()
 		}
 		if t.Failed() {
@@ -327,10 +340,19 @@ func newHarness(t *testing.T, mutate func(*config.Config)) *harness {
 }
 
 func logger(t *testing.T, name string) *slog.Logger {
-	if os.Getenv("SINGLETON_TEST_LOG") != "" {
+	if verbose() {
 		return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})).With("node", name)
 	}
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func verbose() bool { return os.Getenv("SINGLETON_TEST_LOG") != "" }
+
+func procOutput() io.Writer {
+	if verbose() {
+		return os.Stderr
+	}
+	return io.Discard
 }
 
 // start launches (or restarts) member's agent. dog may be nil (watchdog off).
@@ -341,9 +363,16 @@ func (h *harness) start(name string, dog *simDog) *node {
 		f(&cfg)
 	}
 	px := testutil.NewProxy(h.t, h.etcd)
+	cfg.Etcd.Endpoints = []string{px.Addr()} // conch too: a partition cuts it off
 	cli := testutil.Client(h.t, px.Addr())
 	rt := &simRT{c: h.sim, me: name}
-	a := New(Options{Config: &cfg, Runtime: rt, Etcd: cli, Log: logger(h.t, name), Version: "test"})
+	self, err := os.Executable()
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	a := New(Options{Config: &cfg, Runtime: rt, Etcd: cli, Log: logger(h.t, name), Version: "test",
+		Conch: []string{conchBin}, FenceCmd: []string{self, "sim-fence", h.host}, TermCmd: []string{self, "sim-term"},
+		ProcOutput: procOutput()})
 	if err := a.Preflight(h.t.Context()); err != nil {
 		h.t.Fatal(err)
 	}
@@ -360,17 +389,22 @@ func (h *harness) start(name string, dog *simDog) *node {
 		wd, _ = watchdog.New(watchdog.Options{Mode: "off"})
 	}
 	go func() { defer close(n.done); _ = a.Run(ctx, wd) }()
+	h.mu.Lock()
 	h.nodes[name] = n
+	h.mu.Unlock()
 	return n
 }
 
-// crash: the agent process dies without running any cleanup. Its etcd
-// connection goes silent and its runtime handle becomes inert.
+// crash: the agent's unit dies at once without any cleanup (SIGKILL, OOM):
+// conch and the term process are killed, the agent's etcd connection goes
+// silent and its runtime handle becomes inert. No fence runs.
 func (n *node) crash() {
 	n.rt.mu.Lock()
 	n.rt.dead = true
 	n.rt.mu.Unlock()
 	n.proxy.SetBlackhole(true)
+	n.agent.KillProcs()
+	n.cancel() // the in-process agent is inert now; let it wind down, spawning nothing
 }
 
 // kill stops the goroutine for good (test teardown or after crash).
@@ -486,15 +520,21 @@ func TestCrashedAgentIsFencedViaAPI(t *testing.T) {
 	}
 }
 
-// Agent crash + quick restart (within TTL): the term resumes, no failover.
-func TestRestartWithinTTLResumes(t *testing.T) {
+// Agent crash + quick restart (within TTL). conch has no lease resume
+// (Andrey's Q3 decision: accept it): the restarted agent stops the orphaned
+// copy at startup, and the office comes back after the dead term's lease
+// expires. asus, queued with no campaign delay, wins it again. Never two.
+func TestRestartWithinTTLRecoversWithoutOverlap(t *testing.T) {
 	h := newHarness(t, nil)
 	h.startAll()
 	h.waitRunning("asus", 10*time.Second)
 	h.nodes["asus"].crash()
 	time.Sleep(500 * time.Millisecond)
 	h.start("asus", nil)
-	h.holdOne("asus", 8*time.Second) // > TTL: a failover would have happened
+	h.waitRunning("", 3*time.Second) // the startup fence stopped the orphan
+	took := h.waitRunning("asus", 2*h.cfg.Lease.TTL.D()+10*time.Second)
+	t.Logf("asus running again %s after its restart", took)
+	h.holdOne("asus", 2*time.Second)
 }
 
 // The leader is partitioned from everything. It must fence itself (Incus
@@ -568,6 +608,14 @@ func TestFenceAckUnblocks(t *testing.T) {
 	h.partition("asus", true)
 	h.waitRunning("", 6*time.Second)
 	h.holdNobody(3 * time.Second)
+	// The operator acks once a new leader is blocked on asus: before that,
+	// asus's lease is still live and the ack is (rightly) refused.
+	for deadline := time.Now().Add(2 * h.cfg.Lease.TTL.D()); h.leader() == "asus" || h.leader() == ""; time.Sleep(100 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the office never left asus (leader %q)", h.leader())
+		}
+	}
+	h.holdNobody(time.Second) // blocked: still nobody runs
 	co := coord.New(testutil.Client(t, h.etcd), h.cfg.EtcdPrefix, time.Second)
 	if err := co.AckFenced(context.Background(), "asus", "operator:test"); err != nil {
 		t.Fatal(err)

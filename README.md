@@ -3,11 +3,11 @@
 A hermit crab lives in one shell at a time and moves when it has to. `pagurus` keeps a workload
 running on exactly one member of an Incus cluster, and moves it when that member fails.
 
-> **Naming.** The project was prototyped as `singleton`. The prototype that still runs live keeps
-> its old names: transient units `singleton-<svc>`, binaries in `/run/singleton-proto` and
-> `/var/lib/singleton-proto`, and etcd keys under `/singleton/v1/` (pinned in
-> `examples/landos/whoami.json`). `scripts/` drive that prototype, so they use those names too.
-> New code and defaults use `pagurus` (`/pagurus/v1/<svc>`, `/run/pagurus`).
+> **Naming.** The project was prototyped as `singleton`. The live prototype keeps its old unit
+> and path names: transient units `singleton-<svc>`, binaries in `/run/singleton-proto` and
+> `/var/lib/singleton-proto`. `scripts/` drive that prototype, so they use those names too. etcd
+> keys are `/pagurus/v2/<svc>` everywhere (v2: the office became a conch election), and the
+> default state dir is `/run/pagurus`.
 
 > **Status: EXPERIMENTAL PROTOTYPE (2026-10-06).** Not wired into any NixOS module, timer or
 > `fleet/` stack. When it runs on the live cluster it does so only as *transient* systemd units
@@ -30,17 +30,44 @@ watchdog are as `incus_ha.md` §4/§10 and `stonith_exploration.md` §4–§7 de
 no bytes: replication stays out of scope, as in `incus_fleet.md` §13.
 
 ```
-            etcd (asus-infra, dell-infra, rpi-infra) — /singleton/v1/<svc>/
-                 leader (leased; create-rev = epoch)   ms/<member> may-run|stopped
-                 reg/<member> (leased)   endpoint (leased)   pin
-                    ▲                ▲                 ▲
-          ┌─────────┴──┐     ┌───────┴────┐     ┌──────┴─────┐
-          │ agent@asus │     │ agent@dell │     │ agent@rpi5 │   one Go binary per host,
-          └─────┬──────┘     └─────┬──────┘     └─────┬──────┘   root, systemd watchdog
-                │ incus-compose up / incus stop / cgroup.kill
-          project sgl-whoami-asus  sgl-whoami-dell  sgl-whoami-rpi5
-          (restricted.cluster.groups = host-asus / host-dell / host-rpi5)
+   etcd (asus-infra, dell-infra, rpi-infra)
+     /conch/v1/elect/pagurus/v2/<svc>/<lease>   the office: a conch election (create-rev = epoch)
+     /pagurus/v2/<svc>/  leader (who holds it)   ms/<member> may-run|stopped
+                         reg/<member>   endpoint   pin
+                    ▲                  ▲                  ▲
+   ┌────────────────┴─┐    ┌───────────┴──────┐    ┌──────┴───────────┐
+   │ pagurus@asus     │    │ pagurus@dell     │    │ pagurus@rpi5     │  one unit per service and host;
+   │  └ conch elect   │    │  └ conch elect   │    │  └ conch elect   │  pagurus is main, the only
+   │     └ pagurus    │    │     (campaigning)│    │     (campaigning)│  petter of systemd's watchdog
+   │       term       │    │                  │    │                  │
+   └────────┬─────────┘    └──────────────────┘    └──────────────────┘
+            │ incus-compose up / incus stop / cgroup.kill
+   project sgl-whoami-asus  sgl-whoami-dell  sgl-whoami-rpi5
+   (restricted.cluster.groups = host-asus / host-dell / host-rpi5)
 ```
+
+## Process shape
+
+One systemd unit per service and host runs the pagurus daemon (the unit's main process). The
+daemon keeps the local ground truth, and while this member is eligible it runs
+`conch elect <office> --fence 'pagurus fence-self …' --watchdog --campaign-after <rank × grace>
+-- pagurus term`. conch (`tools/conch/docs/03_elect.md`) owns the election, the lease, the lease's
+local validity bound, the fence before expiry, and the watchdog fitness of a term. When conch
+wins, its child `pagurus term` hands the term (CONCH_REV, CONCH_LEASE) back to the daemon over a
+unix socket, and the daemon runs it in-process.
+
+- **Watchdog.** conch is given `NOTIFY_SOCKET` pointing at a relay in the daemon. The daemon is
+  the only process that pets systemd (`NotifyAccess=main`). While conch runs, the daemon pets
+  exactly while conch's last pet is fresh. While conch isn't running, it pets while cgroupfs
+  shows nothing of ours running here. It has no other fitness rules. The term's loop touches
+  conch's `--watchdog-heartbeat` file, so a wedged term makes conch unfit.
+- **Preference.** `--campaign-after <rank × grace>`: a member campaigns only after the office
+  has been vacant for that long, unbroken, so a preferred member that comes back within the
+  window keeps the office. The member the office is pinned to (`move`) uses 0.
+- **No lease resume.** A killed agent's term ends with it. The restarted agent's startup fence
+  stops the orphaned copy, and the office comes back once the dead lease expires.
+- One conch run is one term. The daemon starts a new conch for each campaign, so eligibility,
+  backoff after giving up, and pins stay with the daemon.
 
 ## Why per-member projects
 
@@ -55,29 +82,31 @@ re-checks every instance's `location` after every `up`.
 
 **Invariant:** at no instant does more than one member's project have a running instance.
 
-1. **One office.** Holding the office means owning `<prefix>/leader`, which is attached to a
-   lease. It is created with a compare-and-swap on `CreateRevision == 0`. Its create revision is
-   the **epoch**. Every leader write is a transaction guarded on "the leader key still has my
-   epoch and my lease". That covers recording `may-run`, recording a fence, and publishing the
-   endpoint. So a deposed leader cannot authorise anything.
+1. **One office.** The office is a conch election (etcd's `concurrency.Election`): the candidate
+   key with the lowest create revision holds it, and that revision is the **epoch** (CONCH_REV).
+   A key that is lowest stays lowest while it exists, so every leader write is a transaction
+   guarded on "my candidate key still exists with my epoch". That covers recording the leader,
+   recording `may-run`, recording a fence, and publishing the endpoint. So a deposed leader
+   cannot authorise anything. Each supervision tick also re-reads the key, so a term whose key
+   was deleted outside conch stops.
 
-2. **The leader stops itself before its lease can expire.** `internal/lease` tracks
-   `ValidUntil`: the send time of the newest renewal that succeeded, plus the TTL, on this
-   host's monotonic clock. etcd extends the lease from the moment it *receives* the renewal, so
-   `ValidUntil` can never be later than the real expiry. etcd leader changes only extend leases.
-   `TestValidityBoundNeverExceedsServerExpiry` measures this against a real etcd: the bound came
-   12–22 ms before the attached key vanished. The **guardian** goroutine starts the self-fence at
-   `ValidUntil − margin − (self-fence chain budget)`. It does this itself, so a main loop stuck
-   in a slow call cannot delay it. The steps are:
-   - it runs the member's **self-fence chain** (§ Fences). The default chain is:
+2. **The leader stops itself before its lease can expire.** This is conch's guarantee
+   (`03_elect.md` § Fencing). conch tracks `ValidUntil`: the send time of the newest renewal
+   that succeeded, plus the TTL, on this host's monotonic clock. etcd extends a lease from the
+   moment it *receives* the renewal, so `ValidUntil` can never be later than the real expiry.
+   conch's guardian starts the fence (`pagurus fence-self`) at loss detection, and at the
+   latest at `ValidUntil − fence budget − 1 s`, whatever the term is doing. The fence runs the
+   member's **self-fence chain** (§ Fences). The default chain is:
    - `incus stop --force` on the local project, within `stop_budget`;
    - then **`cgroup.kill`** on `lxc.payload.<project>_*`, within `kill_budget`. This needs no
      Incus daemon and no cluster quorum, which matters because a partitioned member's Incus has
      lost the dqlite quorum and cannot stop anything;
    - success is confirmed from **cgroupfs** (`cgroup.events: populated 0`), not from Incus.
 
-   No rival can create the leader key before the lease is gone server-side. So a successful
-   self-fence always finishes before any rival can start.
+   conch's budget is the chain's total plus 1 s for `fence-self` to start. A fence that fails
+   is not resigned: the lease is left to expire, conch stays unfit, and the next leader must
+   fence this member. No rival can acquire before the lease is gone server-side. So a
+   successful self-fence always finishes before any rival can start.
 
 3. **A new leader fences every member that may still run the workload, not just the last
    one.** `ms/<member>` is a lease-less record. A member writes `may-run` (guarded) before it
@@ -111,12 +140,14 @@ re-checks every instance's `location` after every `up`.
    even with `--no-healthd`, so that flag is not the thing to check.) A follower checks cgroupfs every `eligible_interval` and stops anything it
    finds. The leader audits the other members' projects every `audit_interval`.
 
-5. **A wedged or unfit agent is not trusted.** The watchdog is fed only while `Fit()` holds:
-   - **leading:** before the safe deadline, or after it only once the local stop is confirmed;
-   - **not leading:** while cgroupfs shows nothing running here;
-   - **always:** the main loop has made progress recently.
+5. **A wedged or unfit agent is not trusted.** systemd's watchdog is fed only while:
+   - **conch runs:** conch's own pet is fresh. conch is fit while not holding, while holding
+     with the fence's start deadline ahead and the term's heartbeat fresh, while a fence runs
+     within its budget, and never after a fence failed (`03_elect.md` § Watchdog);
+   - **conch doesn't run:** cgroupfs shows nothing of ours running here (or briefly, while a
+     stray copy or a dead term's remains are being stopped).
 
-   This is `sbd`'s idea, using the conch-style lease as the quorum signal.
+   This is `sbd`'s idea, using the conch lease as the quorum signal.
 
 ### The residual gap, stated plainly
 
@@ -132,26 +163,27 @@ closes. That is the `stonith_exploration.md` §7 rung.
 
 A **process pause** between a lease check and an `incus-compose up` (GC, SIGSTOP) is the
 classic lease hazard. Incus has no fencing-token check to close it. It is narrowed, not closed:
-the authorising guarded write comes immediately before `up`, the deposition watch stops the
-copy, and the new leader's API fence and audit stop it within seconds.
+the authorising guarded write comes immediately before `up`, conch's fence stops the copy at
+lease loss, and the new leader's API fence and audit stop it within seconds.
 
 ## Timing
 
 ```
-renew_interval ×3 + self chain budget + margin  ≤  ttl              (config.Validate refuses otherwise)
-self-fence starts at  ValidUntil − margin − (stop+kill)              ≈ last good renewal + 9 s  (prod defaults)
-rival can acquire at  real lease expiry ≥ ValidUntil                ≈ last good renewal + 20 s
-watchdog-fenced peer: new leader waits watchdog_timeout + reboot_margin after acquiring
-unverified (proceed): new leader waits unverified_wait (≥ stop+kill+margin) after acquiring
+conch loss detection  D(ttl) = ttl/3 + max(1.5 s, ttl/6)                 = 10 s at ttl 20 s
+D(ttl) + fence budget (self chain + 1 s) + 1 s  <  ttl     (config.Validate and conch refuse otherwise)
+self-fence starts at  loss detection, at the latest ValidUntil − budget − 1 s
+rival can acquire at  real lease expiry ≥ ValidUntil, then waits its --campaign-after
+watchdog-fenced peer: new leader waits watchdog_timeout (+ relay freshness) + reboot_margin after acquiring
+unverified (proceed): new leader waits unverified_wait after acquiring
 ```
 
-With the prototype config (TTL 20 s, renew 2 s, margin 2 s, stop 6 s, kill 3 s):
+With the prototype config (TTL 20 s, stop 4 s, kill 2 s, grace 10 s):
 
 | Event | Time to the workload on a new member |
 | :--- | :--- |
 | planned `move` | stop + start, ~seconds |
-| leader agent `systemctl stop` (graceful) | stop + start, ~seconds |
-| leader agent crash, host fine | ≤ TTL (20 s) + API fence + start |
+| leader agent `systemctl stop` (graceful) | stop + the next member's `grace` + start |
+| leader agent crash, host fine | ≤ TTL (20 s) + `grace` + API fence + start |
 | leader host partitioned/powered off, `proceed` | ≤ TTL + `unverified_wait` (40 s) + start |
 | same, `block` | until the member returns or `fence-ack` |
 | preferred member blips back within `grace` | no failover |
@@ -368,21 +400,26 @@ then its confirm. It is meant for drills on scratch projects.
 | `systemd` | the unit's `WatchdogSec=` fires. Default: systemd kills the agent and restarts it, and the restarted agent kills anything still running locally (startup fence). With `FailureAction=reboot-force` the host reboots; the agent reads its own unit's `FailureAction` to decide what it advertises. | only with a reboot `FailureAction` |
 | `device` | opens `watchdog.device` (e.g. `/dev/watchdog1`, unused on asus/dell; `/dev/watchdog0` is systemd's `RuntimeWatchdogSec`) **only with `arm: true`**, else behaves as dry-run. Magic-close disarm only on a clean exit with nothing running. | yes, when armed |
 
+In every mode except `off`, conch's pets come through the daemon's relay (§ Process shape):
+the backend is petted only while they are fresh, so the advertised timeout is the backend's
+plus half of it.
+
 **The prototype runs `systemd` mode without a `FailureAction`: no machine is ever rebooted.**
 
 ## Layout
 
 ```
-cmd/pagurus/            CLI: run | validate | status | move | fence-ack | audit
+cmd/pagurus/            CLI: run | validate | status | move | fence-ack | audit | …;
+                        fence-self and term are run by conch
 cmd/blackhole-proxy/    drill-only TCP proxy; SIGUSR1 = partition the agent from etcd
-internal/config/        schema, defaults, the timing validation
-internal/lease/         lease keeper with the local validity bound
-internal/coord/         etcd schema: leader/epoch, member states, registrations, pin
+internal/config/        schema, defaults, the timing validation (conch's rule)
+internal/coord/         etcd schema: the office (conch's election keys), member states, registrations, pin
 internal/incus/         incus / incus-compose / cgroupfs driver
 internal/fence/         fence kinds (incl. qemu-kill), the chain runner, fencetest (fakes + contract)
 internal/start/         starters: compose, instances
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
-internal/agent/         the state machine (agent.go: lifecycle; lead.go: a term)
+internal/agent/         agent.go: the daemon (ground truth, campaigning); conch.go: conch,
+                        the watchdog relay, the term socket; lead.go: a term
 examples/whoami/        a generic compose example (placeholder addresses, 192.0.2.0/24)
 examples/whoami-instances/  the same with the instances starter
 examples/landos/        the live prototype's config (this author's cluster)
@@ -393,7 +430,8 @@ internal/provision/     `pagurus provision`: per-member cluster groups + pinned 
 ## Running it
 
 ```fish
-go test ./...                              # needs an `etcd` binary on PATH; ~2 min
+go test ./...                              # needs an `etcd` binary on PATH; ~3 min. The sim
+                                           # builds the conch pinned in go.mod (a tool dep)
 scripts/proto-up.sh --drill-proxy          # live prototype, from rpi5 (build + copy + transient units)
 /var/lib/singleton-proto/singleton status -c /run/singleton-proto/whoami/singleton.json
 scripts/drill.sh                           # live drills, audited (see below)
