@@ -2,18 +2,17 @@
 // this member's project, and stops (fences) a member's project through the
 // Incus cluster API or, locally, through cgroup.kill.
 //
-// Everything shells out to the `incus` and `incus-compose` binaries with a
-// context deadline and process-group kill, so a hung daemon can delay the
-// agent by at most the caller's budget.
+// Incus is reached through the API interface (the Incus Go client, or a fake
+// in tests); every call carries the caller's context, so a hung daemon can
+// delay the agent by at most the caller's budget. Run is kept for the CLIs
+// that have no library (incus-compose).
 package incus
 
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -42,8 +41,8 @@ type Options struct {
 	ProjectPrefix string
 	// CgroupRoot is the cgroup2 mount (default /sys/fs/cgroup).
 	CgroupRoot string
-	// IncusBin overrides the binary (tests).
-	IncusBin string
+	// API reaches Incus (default: NewClient over the local unix socket).
+	API API
 }
 
 type Driver struct {
@@ -54,8 +53,8 @@ func New(o Options) *Driver {
 	if o.CgroupRoot == "" {
 		o.CgroupRoot = "/sys/fs/cgroup"
 	}
-	if o.IncusBin == "" {
-		o.IncusBin = "incus"
+	if o.API == nil {
+		o.API = NewClient(ClientOptions{})
 	}
 	return &Driver{o: o}
 }
@@ -83,33 +82,19 @@ func Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-func (d *Driver) query(ctx context.Context, path string, v any) error {
-	out, err := Run(ctx, d.o.IncusBin, "query", path)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(out, v)
-}
-
 // Identity returns this host's cluster member name and kernel architecture.
 func (d *Driver) Identity(ctx context.Context) (member, arch string, err error) {
-	var srv struct {
-		Environment struct {
-			ServerName      string   `json:"server_name"`
-			ServerClustered bool     `json:"server_clustered"`
-			Architectures   []string `json:"architectures"`
-		} `json:"environment"`
-	}
-	if err := d.query(ctx, "/1.0", &srv); err != nil {
+	name, clustered, archs, err := d.o.API.Server(ctx)
+	if err != nil {
 		return "", "", err
 	}
-	if !srv.Environment.ServerClustered {
+	if !clustered {
 		return "", "", errors.New("local Incus is not clustered")
 	}
-	if len(srv.Environment.Architectures) == 0 {
+	if len(archs) == 0 {
 		return "", "", errors.New("local Incus reports no architecture")
 	}
-	return srv.Environment.ServerName, srv.Environment.Architectures[0], nil
+	return name, archs[0], nil
 }
 
 // CheckProject verifies project(member) is pinned to exactly member: a
@@ -118,25 +103,21 @@ func (d *Driver) Identity(ctx context.Context) (member, arch string, err error) 
 // member and the per-member fencing below would fence the wrong host.
 func (d *Driver) CheckProject(ctx context.Context, member string) error {
 	p := d.Project(member)
-	var proj struct {
-		Config map[string]string `json:"config"`
-	}
-	if err := d.query(ctx, "/1.0/projects/"+url.PathEscape(p), &proj); err != nil {
+	cfg, err := d.o.API.ProjectConfig(ctx, p)
+	if err != nil {
 		return fmt.Errorf("project %s: %w", p, err)
 	}
-	groups := strings.Split(proj.Config["restricted.cluster.groups"], ",")
+	groups := strings.Split(cfg["restricted.cluster.groups"], ",")
 	if len(groups) == 0 || groups[0] == "" {
 		return fmt.Errorf("project %s: restricted.cluster.groups is unset; it must pin the project to %s", p, member)
 	}
 	for _, g := range groups {
-		var grp struct {
-			Members []string `json:"members"`
-		}
-		if err := d.query(ctx, "/1.0/cluster/groups/"+url.PathEscape(strings.TrimSpace(g)), &grp); err != nil {
+		members, err := d.o.API.ClusterGroupMembers(ctx, strings.TrimSpace(g))
+		if err != nil {
 			return fmt.Errorf("project %s: cluster group %s: %w", p, g, err)
 		}
-		if len(grp.Members) != 1 || grp.Members[0] != member {
-			return fmt.Errorf("project %s: cluster group %s has members %v, want exactly [%s]", p, g, grp.Members, member)
+		if len(members) != 1 || members[0] != member {
+			return fmt.Errorf("project %s: cluster group %s has members %v, want exactly [%s]", p, g, members, member)
 		}
 	}
 	// incus-compose marks the project user.healthcheck.enabled=true even with
@@ -157,20 +138,16 @@ func (d *Driver) CheckProject(ctx context.Context, member string) error {
 
 // MemberOnline reports the cluster's view of member.
 func (d *Driver) MemberOnline(ctx context.Context, member string) (bool, error) {
-	var m struct {
-		Status string `json:"status"`
-	}
-	if err := d.query(ctx, "/1.0/cluster/members/"+url.PathEscape(member), &m); err != nil {
+	status, err := d.o.API.MemberStatus(ctx, member)
+	if err != nil {
 		return false, err
 	}
-	return m.Status == "Online", nil
+	return status == "Online", nil
 }
 
 // List returns the instances of member's project, as the cluster sees them.
 func (d *Driver) List(ctx context.Context, member string) ([]Instance, error) {
-	var out []Instance
-	err := d.query(ctx, "/1.0/instances?recursion=1&project="+url.QueryEscape(d.Project(member)), &out)
-	return out, err
+	return d.o.API.Instances(ctx, d.Project(member))
 }
 
 // EnforceNoAutostart sets boot.autostart=false on every instance of member's
@@ -185,7 +162,7 @@ func (d *Driver) EnforceNoAutostart(ctx context.Context, member string) error {
 		if in.Expanded["boot.autostart"] == "false" {
 			continue
 		}
-		if _, err := Run(ctx, d.o.IncusBin, "config", "set", in.Name, "--project", d.Project(member), "boot.autostart=false"); err != nil {
+		if err := d.o.API.SetConfig(ctx, d.Project(member), in.Name, "boot.autostart", "false"); err != nil {
 			return err
 		}
 	}
@@ -213,21 +190,29 @@ func (d *Driver) Stop(ctx context.Context, member string, graceful time.Duration
 	if err != nil || len(names) == 0 {
 		return err
 	}
-	base := []string{"stop", "--project", d.Project(member)}
+	p := d.Project(member)
+	stopAll := func(ctx context.Context, timeout time.Duration, force bool) error {
+		var errs []error
+		for _, n := range names {
+			if err := d.o.API.Stop(ctx, p, n, timeout, force); err != nil {
+				errs = append(errs, fmt.Errorf("stop %s/%s: %w", p, n, err))
+			}
+		}
+		return errors.Join(errs...)
+	}
 	if graceful > 0 {
 		gctx, cancel := context.WithTimeout(ctx, graceful+2*time.Second)
-		_, gerr := Run(gctx, d.o.IncusBin, append(append(base, fmt.Sprintf("--timeout=%d", int(graceful.Seconds()))), names...)...)
+		gerr := stopAll(gctx, graceful, false)
 		cancel()
 		if gerr == nil {
 			return nil
 		}
-		// Some may have stopped; `incus stop` errors on an already-stopped one.
+		// Some may have stopped; stopping a stopped instance is an error.
 		if names, err = notStopped(); err != nil || len(names) == 0 {
 			return err
 		}
 	}
-	_, err = Run(ctx, d.o.IncusBin, append(append(base, "--force"), names...)...)
-	return err
+	return stopAll(ctx, 0, true)
 }
 
 // AllStopped is true when every instance is Stopped (an empty project counts).
@@ -330,21 +315,12 @@ func (d *Driver) Kill(ctx context.Context, member string) error {
 // IPv4 returns the first global IPv4 address of instance name in member's
 // project.
 func (d *Driver) IPv4(ctx context.Context, member, name string) (string, error) {
-	var st struct {
-		Network map[string]struct {
-			Addresses []struct {
-				Family  string `json:"family"`
-				Address string `json:"address"`
-				Scope   string `json:"scope"`
-			} `json:"addresses"`
-		} `json:"network"`
-	}
-	p := fmt.Sprintf("/1.0/instances/%s/state?project=%s", url.PathEscape(name), url.QueryEscape(d.Project(member)))
-	if err := d.query(ctx, p, &st); err != nil {
+	addrs, err := d.o.API.Addresses(ctx, d.Project(member), name)
+	if err != nil {
 		return "", err
 	}
-	ifs := make([]string, 0, len(st.Network))
-	for n := range st.Network {
+	ifs := make([]string, 0, len(addrs))
+	for n := range addrs {
 		ifs = append(ifs, n)
 	}
 	slices.Sort(ifs)
@@ -352,7 +328,7 @@ func (d *Driver) IPv4(ctx context.Context, member, name string) (string, error) 
 		if n == "lo" {
 			continue
 		}
-		for _, a := range st.Network[n].Addresses {
+		for _, a := range addrs[n] {
 			if a.Family == "inet" && a.Scope == "global" {
 				return a.Address, nil
 			}
@@ -372,4 +348,15 @@ func (d *Driver) CheckCgroup2() error {
 		return fmt.Errorf("%s is not a cgroup2 mount", d.o.CgroupRoot)
 	}
 	return nil
+}
+
+// StartInstances starts the named instances of member's project.
+func (d *Driver) StartInstances(ctx context.Context, member string, names []string) error {
+	var errs []error
+	for _, n := range names {
+		if err := d.o.API.Start(ctx, d.Project(member), n); err != nil {
+			errs = append(errs, fmt.Errorf("start %s/%s: %w", d.Project(member), n, err))
+		}
+	}
+	return errors.Join(errs...)
 }

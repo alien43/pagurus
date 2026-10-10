@@ -42,13 +42,21 @@ type fakeList []incus.Instance
 
 func (f fakeList) List(context.Context, string) ([]incus.Instance, error) { return f, nil }
 
+// started records StartInstances calls on a fakeList.
+var started [][]string
+
+func (f fakeList) StartInstances(_ context.Context, member string, names []string) error {
+	started = append(started, append([]string{member}, names...))
+	return nil
+}
+
 func inst(name, status, typ, autostart string) incus.Instance {
 	return incus.Instance{Name: name, Status: status, Type: typ, Expanded: map[string]string{"boot.autostart": autostart}}
 }
 
 func TestInstancesStartsOnlyWhatIsNotRunning(t *testing.T) {
-	bin := fencetest.FakeBin(t, t.TempDir(), "incus", "")
-	s := start.Instances{Run: incus.Run, Bin: bin.Path, Project: project, L: fakeList{
+	started = nil
+	s := start.Instances{Project: project, L: fakeList{
 		inst("web", incus.StatusStopped, "container", "false"),
 		inst("db", incus.StatusRunning, "container", "false"),
 		inst("tmp", incus.StatusStopped, "container", "false"),
@@ -59,14 +67,13 @@ func TestInstancesStartsOnlyWhatIsNotRunning(t *testing.T) {
 	if err := s.Start(context.Background(), "dell"); err != nil {
 		t.Fatal(err)
 	}
-	if got := bin.Calls(t); len(got) != 1 || got[0] != "start --project p-dell web" {
-		t.Fatalf("argv %q, want only web started (db runs, tmp not selected)", got)
+	if len(started) != 1 || strings.Join(started[0], " ") != "dell web" {
+		t.Fatalf("started %q, want only web on dell (db runs, tmp not selected)", started)
 	}
-	bin2 := fencetest.FakeBin(t, t.TempDir(), "incus", "")
-	s.Bin, s.L = bin2.Path, fakeList{inst("web", incus.StatusRunning, "container", "false")}
-	s.Names = nil
-	if err := s.Start(context.Background(), "dell"); err != nil || len(bin2.Calls(t)) != 0 {
-		t.Fatalf("all running: err %v calls %q, want nothing to do", err, bin2.Calls(t))
+	started = nil
+	s.L, s.Names = fakeList{inst("web", incus.StatusRunning, "container", "false")}, nil
+	if err := s.Start(context.Background(), "dell"); err != nil || len(started) != 0 {
+		t.Fatalf("all running: err %v started %q, want nothing to do", err, started)
 	}
 }
 
@@ -81,7 +88,7 @@ func TestInstancesCheckRefuses(t *testing.T) {
 		"unknown type":    {fakeList{inst("x", "Stopped", "potato", "false")}, nil, "containers and VMs"},
 		"autostart unset": {fakeList{inst("web", "Stopped", "container", "")}, nil, "boot.autostart"},
 	} {
-		s := start.Instances{Run: incus.Run, Project: project, L: c.l, Names: c.names}
+		s := start.Instances{Project: project, L: c.l, Names: c.names}
 		if err := s.CheckStart(context.Background(), "rpi5"); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: err %v, want %q", name, err, c.want)
 		}
@@ -89,7 +96,7 @@ func TestInstancesCheckRefuses(t *testing.T) {
 }
 
 func TestInstancesAcceptsVMs(t *testing.T) {
-	s := start.Instances{Run: incus.Run, Project: project, L: fakeList{inst("vm", "Stopped", "virtual-machine", "false")}}
+	s := start.Instances{Project: project, L: fakeList{inst("vm", "Stopped", "virtual-machine", "false")}}
 	if err := s.CheckStart(context.Background(), "asus"); err != nil {
 		t.Fatalf("a VM was refused: %v", err)
 	}

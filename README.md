@@ -158,6 +158,28 @@ With the prototype config (TTL 20 s, renew 2 s, margin 2 s, stop 6 s, kill 3 s):
 
 Failback is never automatic. Use `pagurus move`.
 
+## Reaching Incus
+
+pagurus talks to Incus through its Go client (`github.com/lxc/incus/v7/client`), not by running
+the `incus` CLI. Every call carries the caller's deadline, so a hung daemon can delay a fence by
+no more than the fence's budget. Only `incus-compose up` / `config` still shell out, because
+incus-compose has no library API.
+
+```jsonc
+"incus": {}                                         // agents on members: the local unix socket (default)
+"incus": {"socket": "/var/lib/incus/unix.socket"}   // a non-default socket
+"incus": {                                          // an operator elsewhere (status, audit, move)
+  "url": "https://10.0.1.10:8443",
+  "client_cert": "~/.config/incus/client.crt", "client_key": "~/.config/incus/client.key",
+  "server_cert": "~/.config/incus/servercerts/asus.crt"
+}
+```
+
+Permissions: the agent today uses the local socket as root, i.e. full Incus access. A restricted
+TLS client confined to the `<prefix>-*` projects has **not** been investigated yet: the
+cluster-scoped reads (`/1.0/cluster/members`, `/1.0/cluster/groups`) may need more than a
+project-restricted certificate grants.
+
 ## etcd security
 
 pagurus talks plain, unauthenticated etcd by default. TLS and etcd's user/password auth are

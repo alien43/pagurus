@@ -95,7 +95,9 @@ func main() {
 	for _, d := range cfg.Deprecations {
 		log.Warn("deprecated config", "what", d)
 	}
-	drv := incus.New(incus.Options{ProjectPrefix: cfg.ProjectPrefix})
+	api := incus.NewClient(incus.ClientOptions{Socket: cfg.Incus.Socket, URL: cfg.Incus.URL,
+		ClientCert: cfg.Incus.ClientCert, ClientKey: cfg.Incus.ClientKey, ServerCert: cfg.Incus.ServerCert})
+	drv := incus.New(incus.Options{ProjectPrefix: cfg.ProjectPrefix, API: api})
 	rt := &runtime{Driver: drv, Starter: newStarter(cfg, drv)}
 
 	switch cmd {
@@ -436,7 +438,7 @@ type runtime struct {
 func newStarter(cfg *config.Config, drv *incus.Driver) start.Starter {
 	switch cfg.Start.Kind {
 	case start.KindInstances:
-		return start.Instances{Run: incus.Run, Project: cfg.Project, L: drv, Names: cfg.Start.Names}
+		return start.Instances{Project: cfg.Project, L: drv, Names: cfg.Start.Names}
 	default:
 		return start.Compose{Run: incus.Run, Project: cfg.Project, File: cfg.Start.File, Args: cfg.Start.Args, UpArgs: cfg.Start.UpArgs}
 	}

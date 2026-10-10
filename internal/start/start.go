@@ -36,6 +36,13 @@ type Lister interface {
 	List(ctx context.Context, member string) ([]incus.Instance, error)
 }
 
+// InstanceStarter lists and starts instances of a member's project
+// (incus.Driver, over the Incus API).
+type InstanceStarter interface {
+	Lister
+	StartInstances(ctx context.Context, member string, names []string) error
+}
+
 // Compose runs `incus-compose up` in the member's project.
 type Compose struct {
 	Run     Runner
@@ -72,26 +79,17 @@ func (c Compose) Start(ctx context.Context, member string) error {
 	return err
 }
 
-// Instances starts containers that already exist in the member's project
+// Instances starts instances that already exist in the member's project
 // (created by an operator, or by `pagurus provision` later). Names selects
 // them; empty means every instance in the project.
 type Instances struct {
-	Run     Runner
-	Bin     string // default incus
 	Project func(member string) string
-	L       Lister
+	L       InstanceStarter
 	Names   []string
 }
 
 func (s Instances) Kind() string    { return KindInstances }
 func (s Instances) Types() []string { return []string{"container", "virtual-machine"} }
-
-func (s Instances) bin() string {
-	if s.Bin == "" {
-		return "incus"
-	}
-	return s.Bin
-}
 
 // selected returns the instances Start acts on, checking the names exist.
 func (s Instances) selected(ctx context.Context, member string) ([]incus.Instance, error) {
@@ -155,6 +153,5 @@ func (s Instances) Start(ctx context.Context, member string) error {
 	if len(names) == 0 {
 		return nil
 	}
-	_, err = s.Run(ctx, s.bin(), append([]string{"start", "--project", s.Project(member)}, names...)...)
-	return err
+	return s.L.StartInstances(ctx, member, names)
 }

@@ -1,0 +1,124 @@
+package incus_test
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/alien43/pagurus/internal/fence/fencetest"
+	"github.com/alien43/pagurus/internal/incus"
+)
+
+func driver(api *fencetest.FakeIncus) *incus.Driver {
+	return incus.New(incus.Options{ProjectPrefix: "p", CgroupRoot: "/nonexistent", API: api})
+}
+
+func TestIdentity(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus", "dell")
+	m, arch, err := driver(api).Identity(context.Background())
+	if err != nil || m != "asus" || arch != "x86_64" {
+		t.Fatalf("got %q %q %v", m, arch, err)
+	}
+	api.Archs = nil
+	if _, _, err := driver(api).Identity(context.Background()); err == nil {
+		t.Fatal("no architecture accepted")
+	}
+}
+
+func TestCheckProject(t *testing.T) {
+	ctx := context.Background()
+	api := fencetest.NewFakeIncus("asus", "dell")
+	api.AddInstance("p-asus", incus.Instance{Name: "web", Status: incus.StatusStopped, Location: "asus", Type: "container"})
+	d := driver(api)
+	if err := d.CheckProject(ctx, "asus"); err != nil {
+		t.Fatalf("pinned project refused: %v", err)
+	}
+	// Pinned to a group with two members: the per-member fence would be wrong.
+	api.Groups["host-asus"] = []string{"asus", "dell"}
+	if err := d.CheckProject(ctx, "asus"); err == nil || !strings.Contains(err.Error(), "want exactly") {
+		t.Fatalf("two-member group: %v", err)
+	}
+	api.Groups["host-asus"] = []string{"asus"}
+	// An instance ic-healthd could restart after a fence.
+	if err := api.SetConfig(ctx, "p-asus", "web", "user.healthcheck.restart", "always"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.CheckProject(ctx, "asus"); err == nil || !strings.Contains(err.Error(), "ic-healthd") {
+		t.Fatalf("restart policy: %v", err)
+	}
+	// Not pinned at all.
+	api.Projects["p-dell"] = map[string]string{}
+	if err := d.CheckProject(ctx, "dell"); err == nil || !strings.Contains(err.Error(), "unset") {
+		t.Fatalf("unpinned: %v", err)
+	}
+}
+
+func TestStopFallsBackToForce(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus")
+	api.AddInstance("p-asus", incus.Instance{Name: "a", Status: incus.StatusRunning, Location: "asus", Type: "container"})
+	api.AddInstance("p-asus", incus.Instance{Name: "b", Status: incus.StatusStopped, Location: "asus", Type: "container"})
+	d := driver(api)
+	if err := d.Stop(context.Background(), "asus", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	insts, _ := d.List(context.Background(), "asus")
+	if !incus.AllStopped(insts) {
+		t.Fatalf("not all stopped: %+v", insts)
+	}
+	// Already stopped: nothing to do, no error (the API errors on a stopped one).
+	if err := d.Stop(context.Background(), "asus", 0); err != nil {
+		t.Fatalf("stop of a stopped project: %v", err)
+	}
+}
+
+func TestStopHonoursContext(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus")
+	api.AddInstance("p-asus", incus.Instance{Name: "a", Status: incus.StatusRunning, Location: "asus", Type: "container"})
+	api.SetHang(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := driver(api).Stop(ctx, "asus", 0)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("hung API: err %v after %s, want the caller's deadline", err, time.Since(start))
+	}
+}
+
+func TestEnforceNoAutostartAndStart(t *testing.T) {
+	ctx := context.Background()
+	api := fencetest.NewFakeIncus("asus")
+	api.AddInstance("p-asus", incus.Instance{Name: "a", Status: incus.StatusStopped, Location: "asus", Type: "container"})
+	d := driver(api)
+	if err := d.EnforceNoAutostart(ctx, "asus"); err != nil {
+		t.Fatal(err)
+	}
+	insts, _ := d.List(ctx, "asus")
+	if insts[0].Expanded["boot.autostart"] != "false" {
+		t.Fatalf("boot.autostart = %q", insts[0].Expanded["boot.autostart"])
+	}
+	n := api.Mutations()
+	if err := d.EnforceNoAutostart(ctx, "asus"); err != nil || api.Mutations() != n {
+		t.Fatalf("second enforce changed something (err %v)", err)
+	}
+	if err := d.StartInstances(ctx, "asus", []string{"a"}); err != nil {
+		t.Fatal(err)
+	}
+	insts, _ = d.List(ctx, "asus")
+	if insts[0].Status != incus.StatusRunning {
+		t.Fatalf("status %s after start", insts[0].Status)
+	}
+}
+
+func TestIPv4PicksAGlobalNonLoopbackAddress(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus")
+	api.Addrs["p-asus/web"] = map[string][]incus.Address{
+		"lo":   {{Family: "inet", Address: "127.0.0.1", Scope: "local"}},
+		"eth0": {{Family: "inet6", Address: "fd00::1", Scope: "global"}, {Family: "inet", Address: "10.101.92.7", Scope: "global"}},
+	}
+	ip, err := driver(api).IPv4(context.Background(), "asus", "web")
+	if err != nil || ip != "10.101.92.7" {
+		t.Fatalf("got %q %v", ip, err)
+	}
+}

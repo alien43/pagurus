@@ -77,6 +77,17 @@ type Etcd struct {
 	PasswordFile string `json:"password_file,omitempty"`
 }
 
+// Incus is the connection to Incus. Agents run on cluster members and use
+// the local unix socket; an operator elsewhere (status, audit, move) can
+// point at a member's HTTPS API with a trusted client certificate.
+type Incus struct {
+	Socket     string `json:"socket,omitempty"`
+	URL        string `json:"url,omitempty"`
+	ClientCert string `json:"client_cert,omitempty"`
+	ClientKey  string `json:"client_key,omitempty"`
+	ServerCert string `json:"server_cert,omitempty"`
+}
+
 type Lease struct {
 	TTL           Duration `json:"ttl"`
 	RenewInterval Duration `json:"renew_interval"`
@@ -227,6 +238,9 @@ type Config struct {
 	// AuditInterval: how often the leader scans other members' projects for
 	// running instances it did not start (and stops them).
 	AuditInterval Duration `json:"audit_interval"`
+
+	// Incus says how to reach Incus (default: the local unix socket).
+	Incus Incus `json:"incus"`
 
 	EtcdPrefix string    `json:"etcd_prefix"`
 	Etcd       Etcd      `json:"etcd"`
@@ -420,6 +434,12 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Etcd.Endpoints) == 0 {
 		bad("etcd.endpoints: required")
+	}
+	if c.Incus.URL != "" && (c.Incus.ClientCert == "" || c.Incus.ClientKey == "") {
+		bad("incus.url needs incus.client_cert and incus.client_key")
+	}
+	if c.Incus.URL != "" && c.Incus.Socket != "" {
+		bad("set incus.socket or incus.url, not both")
 	}
 	if (c.Etcd.Cert == "") != (c.Etcd.Key == "") {
 		bad("etcd.cert and etcd.key go together")
