@@ -109,6 +109,10 @@ func (a *Agent) stopConch(reason string) {
 	}
 }
 
+// exitWithdrawn is conch's exit after a SIGTERM while still campaigning
+// (stopConch on a withdrawal): nothing ran.
+const exitWithdrawn = 143
+
 // conchExited records conch's exit. A term still running here has lost its
 // conch (and with it the lease and the fence): end it now.
 func (a *Agent) conchExited(err error) {
@@ -133,12 +137,14 @@ func (a *Agent) conchExited(err error) {
 		a.m.Inc("pagurus_conch_exits_total", "result", "ok")
 	case 71:
 		a.m.Inc("pagurus_conch_exits_total", "result", "fence_failed")
+	case exitWithdrawn:
+		a.m.Inc("pagurus_conch_exits_total", "result", "withdrawn")
 	default:
 		a.m.Inc("pagurus_conch_exits_total", "result", "other")
 	}
 	switch code {
-	case 0:
-		a.log.Info("conch exited", "member", a.member)
+	case 0, exitWithdrawn:
+		a.log.Info("conch exited", "member", a.member, "code", code)
 	case 71:
 		a.alerter.Alert("conch-fence-failed", "conch's self-fence did not confirm; the lease was left to expire", "member", a.member)
 	default:

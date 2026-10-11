@@ -441,7 +441,7 @@ Every series carries `svc` and `member` labels; no label has unbounded values.
 | `pagurus_self_chain_verified` | gauge | 1 when the self chain can confirm a stop for this project's instance types |
 | `pagurus_terms_total` | counter | terms held |
 | `pagurus_fence_runs_total{chain,kind,result}` | counter | fences run by the agent (self: `confirmed\|failed\|skipped`; peer: `confirmed\|assumed\|wait\|skipped`). `pagurus fence-self` runs inside conch and isn't counted; its failures show as `pagurus_conch_exits_total{result="fence_failed"}` |
-| `pagurus_conch_exits_total{result}` | counter | `ok`, `fence_failed`, `other` |
+| `pagurus_conch_exits_total{result}` | counter | `ok`, `fence_failed`, `withdrawn` (stopped while campaigning, e.g. by a move), `other` |
 
 `deploy/grafana/pagurus-rules.yaml` holds Grafana rules for the four conditions that need a
 human. None fires on a normal failover or move:

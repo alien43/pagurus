@@ -51,7 +51,7 @@ var Help = map[string]string{
 	"pagurus_self_chain_verified":     "1 when some fence in the self chain can confirm a stop for this project's instance types",
 	"pagurus_terms_total":             "terms this member has held",
 	"pagurus_fence_runs_total":        "fences run by this agent, by chain (self|peer), kind and result",
-	"pagurus_conch_exits_total":       "conch elect exits, by result (ok|fence_failed|other)",
+	"pagurus_conch_exits_total":       "conch elect exits, by result (ok|fence_failed|withdrawn|other)",
 }
 
 // SetMember sets the member label (known only after the agent's preflight).

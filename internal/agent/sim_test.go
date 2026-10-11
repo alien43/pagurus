@@ -849,6 +849,16 @@ func TestPlannedMove(t *testing.T) {
 	t.Logf("move took %s", took)
 	_ = co.SetPin(context.Background(), "")
 	h.holdOne("rpi5", 3*time.Second) // no automatic failback
+	// The pin made the followers stop their campaigns: withdrawals, not
+	// failures.
+	var withdrawn, other float64
+	for _, m := range []string{"asus", "dell", "rpi5"} {
+		withdrawn += h.nodes[m].agent.m.Counter("pagurus_conch_exits_total", "result", "withdrawn")
+		other += h.nodes[m].agent.m.Counter("pagurus_conch_exits_total", "result", "other")
+	}
+	if withdrawn == 0 || other != 0 {
+		t.Fatalf("conch exits: withdrawn=%v other=%v, want withdrawals only", withdrawn, other)
+	}
 }
 
 func TestUnhealthyLeaderGivesUp(t *testing.T) {
