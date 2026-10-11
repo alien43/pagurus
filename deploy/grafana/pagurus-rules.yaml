@@ -1,8 +1,12 @@
 # Grafana alert rules for pagurus: the four conditions that need a human.
-# NOT provisioned yet: move into fleet/monitoring/grafana/provisioning/alerting/
-# (or merge into rules.yaml) once the agents export metrics and Prometheus scrapes
-# them (job "pagurus"); see tasks/singleton-observability.md. The datasource UID
-# is fleet/monitoring's Prometheus.
+# Grafana file provisioning (provisioning/alerting/); the metrics come from a
+# Prometheus job scraping every agent's --metrics-addr. Set datasourceUid to
+# your Prometheus datasource and folder to yours.
+#
+# PagurusTwoRunning waits 1m: each agent samples its cgroupfs every 5s and
+# Prometheus scrapes every 15s, so during a planned move the old member can
+# still read 1 for ~20s after the new one starts. A real second copy that
+# survives the agents' local guard lasts longer than that.
 #
 # PagurusNobodyRunning waits 3m: more than 2 x (TTL 20s + grace 10s +
 # unverified_wait 40s) = 140s, the longest normal failover at the default
@@ -18,7 +22,7 @@ groups:
       - uid: pagurus-two-running
         title: PagurusTwoRunning
         condition: B
-        for: 0s
+        for: 1m
         noDataState: OK
         execErrState: Error
         labels:
