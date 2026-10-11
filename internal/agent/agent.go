@@ -44,6 +44,7 @@ type Runtime interface {
 	// CheckStart / Start are the configured starter (internal/start).
 	CheckStart(ctx context.Context, member string) error
 	Prepare(ctx context.Context, member string) error
+	Pull(ctx context.Context, member string) error
 	CheckCgroup2() error
 	MemberOnline(ctx context.Context, member string) (bool, error)
 	List(ctx context.Context, member string) ([]incus.Instance, error)
@@ -105,6 +106,7 @@ type Agent struct {
 	conch            *exec.Cmd // the running `conch elect`, nil if none
 	termActive       bool      // conch holds the office and its term runs here
 	termPID          int       // the `pagurus term` process of the active term
+	termRan          bool      // this conch's term has run: it is resigning, not campaigning
 
 	localMu sync.Mutex // serialises guardLocal against the start of a term
 	fenceMu sync.Mutex // serialises self-fences
@@ -341,12 +343,51 @@ func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 		"ttl", a.cfg.Lease.TTL.D(), "unverified_policy", a.cfg.Fence.Unverified, "office", a.co.Office())
 
 	go a.registerLoop(ctx)
+	go a.followRefreshes(ctx)
 	a.startupFence(ctx)
 	watchdog.Ready()
 	a.setRole(roleFollower)
 	a.follow(ctx)
 	watchdog.Stopping()
 	return nil
+}
+
+// followRefreshes pulls into this member's own project once the leader has
+// applied a refresh and reported it healthy, so a follower that takes over
+// later starts from the same image, while a refresh that fails on the leader
+// leaves the followers on the old one (a rollback by failover). A follower
+// never recreates or starts anything here.
+func (a *Agent) followRefreshes(ctx context.Context) {
+	seen, seeded := "", false
+	tick := time.NewTicker(a.cfg.EligibleInterval.D())
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		done, err := a.co.GetString(ctx, a.co.RefreshDoneKey())
+		if err != nil {
+			continue
+		}
+		if !seeded { // what was done before this agent started is not news
+			seen, seeded = done, true
+			continue
+		}
+		if done == seen || a.inTerm() {
+			continue
+		}
+		pctx, cancel := context.WithTimeout(ctx, UpTimeout)
+		err = a.rt.Pull(pctx, a.member)
+		cancel()
+		if err != nil {
+			a.log.Warn("pull after the leader's refresh failed; retrying", "member", a.member, "token", done, "err", err)
+			continue
+		}
+		a.log.Info("pulled after the leader's refresh", "member", a.member, "token", done)
+		seen = done
+	}
 }
 
 // registerLoop keeps reg/<member> (config hash, caps, versions) under a lease
@@ -668,6 +709,10 @@ func (a *Agent) follow(ctx context.Context) {
 			}
 		} else if a.inTerm() {
 			// conch holds the office: the term owns this member now.
+		} else if a.conchTermRan() {
+			// The term is over and conch is resigning (fence, resign, exit):
+			// not a campaign to withdraw. Signalling it here would cut that
+			// short and make a clean release exit non-zero.
 		} else if ctx.Err() != nil {
 			a.stopConch("agent shutdown")
 		} else {
@@ -707,6 +752,12 @@ func (a *Agent) follow(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (a *Agent) conchTermRan() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.conch != nil && a.termRan
 }
 
 func (a *Agent) inTerm() bool {

@@ -88,7 +88,7 @@ func (a *Agent) spawnConch(delay time.Duration) (chan error, error) {
 		return nil, err
 	}
 	a.mu.Lock()
-	a.conch = cmd
+	a.conch, a.termRan = cmd, false
 	a.mu.Unlock()
 	a.m.Bool("pagurus_conch_running", true)
 	a.log.Info("campaigning", "member", a.member, "office", a.co.Office(), "campaign_after", delay, "conch_pid", cmd.Process.Pid)
@@ -335,7 +335,7 @@ func (a *Agent) serveTerm(ctx context.Context, c net.Conn) {
 	a.mu.Lock()
 	ok := a.conch != nil && !a.termActive
 	if ok {
-		a.termActive, a.termPID = true, h.PID
+		a.termActive, a.termPID, a.termRan = true, h.PID, true
 	}
 	a.mu.Unlock()
 	a.localMu.Unlock()

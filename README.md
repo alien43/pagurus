@@ -162,8 +162,12 @@ SIGSTOP) is the classic lease hazard. **Incus has no fencing token to close it.*
 other PUTs, so a start cannot be made conditional on an `If-Match`/ETag. pagurus narrows the
 window instead (`termState.start`):
 
-1. **Prepare first.** `incus-compose up --no-start` pulls and creates, with nothing running.
-   This is the slow part, and it comes after the guarded `may-run` write.
+1. **Prepare first.** `incus-compose up --no-start --recreate --no-healthd` pulls and creates
+   this member's instances afresh, with nothing running. This is the slow part (~1 s with the
+   image cached), and it comes after the guarded `may-run` write. Recreating every term is
+   what makes a compose change (ports, labels, environment) or a newly pulled image reach the
+   instance: a plain `up` patches only missing config keys, never devices. Workloads are
+   stateless; named volumes survive a recreate.
 2. **A fresh linearizable read** that our election key still holds the office, then the
    start. The window is now the launch call alone, not a whole `up`.
 3. **Re-check after the start.** If the office moved, stop at once.
@@ -287,6 +291,26 @@ itself only fences, records `may-run`, calls `Start`, then checks location and a
   container, and has `boot.autostart=false`.
 
 The **instances** starter also runs VMs. compose runs containers only.
+
+## Updates and compose changes
+
+Every term starts from a fresh instance: Prepare is `up --no-start --recreate`, from the compose
+file and the image already in the member's project. So:
+
+- **A compose change** (ports, labels, environment) reaches each member at its next term. Use
+  `pagurus move` or `pagurus refresh` to apply it now.
+- **An image update** is `pagurus refresh -c cfg`. The leader sees the new token at its next
+  health tick. It pulls into its own project (on its own Incus, so the image matches its
+  architecture), then recreates the workload in place, in the same term. Once the workload is
+  healthy it writes `<prefix>/refresh-done`, and `refresh` returns. The followers then pull
+  into their own projects, so a later failover starts from the same image.
+- **A refresh that fails** is one where the workload stays unhealthy and the leader gives the
+  office up, as for any unhealthy workload. The next leader starts from the image already in
+  *its* project, which it never pulled, so a bad image rolls back by failover. Nobody
+  acknowledges the refresh, and `refresh` exits non-zero ("the term ended before the refresh
+  was healthy").
+- A follower never recreates on a refresh. Never pull into a member's project from another
+  member: Incus pulls for the architecture of the server it talks to.
 
 ## Fences
 
@@ -474,6 +498,7 @@ internal/provision/     `pagurus provision`: per-member cluster groups + pinned 
 go test ./...                              # needs an `etcd` binary on PATH; ~3 min. The sim
                                            # builds the conch pinned in go.mod (a tool dep)
 pagurus status -c <cfg>                    # on a member: office, records, instances
+pagurus refresh -c <cfg>                   # leader pulls, recreates in place; waits until healthy
 scripts/drill.sh move                      # live drills, audited (see below); SVC=, CTL= to adapt
 ```
 

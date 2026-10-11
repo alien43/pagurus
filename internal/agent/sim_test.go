@@ -62,6 +62,8 @@ type simMember struct {
 	slowPause time.Duration
 	paused    bool
 	prepared  bool
+	prepares  int // Prepare calls: each recreates the instance (stopped)
+	pulls     int // Pull calls
 	// launchPause pauses inside the launch itself (the residual window).
 	launchPause time.Duration
 }
@@ -210,6 +212,18 @@ func (r *simRT) Prepare(_ context.Context, m string) error {
 		return err
 	}
 	r.c.m[m].prepared = true
+	r.c.m[m].prepares++
+	r.c.m[m].running = false // `up --no-start --recreate`: a fresh, stopped instance
+	return nil
+}
+
+func (r *simRT) Pull(_ context.Context, m string) error {
+	r.c.mu.Lock()
+	defer r.c.mu.Unlock()
+	if err := r.clusterOp(); err != nil {
+		return err
+	}
+	r.c.m[m].pulls++
 	return nil
 }
 
@@ -852,12 +866,16 @@ func TestPlannedMove(t *testing.T) {
 	// The pin made the followers stop their campaigns: withdrawals, not
 	// failures.
 	var withdrawn, other float64
+	var per []string
 	for _, m := range []string{"asus", "dell", "rpi5"} {
-		withdrawn += h.nodes[m].agent.m.Counter("pagurus_conch_exits_total", "result", "withdrawn")
-		other += h.nodes[m].agent.m.Counter("pagurus_conch_exits_total", "result", "other")
+		w := h.nodes[m].agent.m.Counter("pagurus_conch_exits_total", "result", "withdrawn")
+		o := h.nodes[m].agent.m.Counter("pagurus_conch_exits_total", "result", "other")
+		ok := h.nodes[m].agent.m.Counter("pagurus_conch_exits_total", "result", "ok")
+		withdrawn, other = withdrawn+w, other+o
+		per = append(per, fmt.Sprintf("%s: ok=%v withdrawn=%v other=%v", m, ok, w, o))
 	}
 	if withdrawn == 0 || other != 0 {
-		t.Fatalf("conch exits: withdrawn=%v other=%v, want withdrawals only", withdrawn, other)
+		t.Fatalf("conch exits: withdrawn=%v other=%v, want withdrawals only (%s)", withdrawn, other, strings.Join(per, "; "))
 	}
 }
 
@@ -893,4 +911,106 @@ func TestFollowerPartitionDoesNotDisturbLeader(t *testing.T) {
 	h.partition("dell", true)
 	h.partition("rpi5", true)
 	h.holdOne("asus", 8*time.Second)
+}
+
+func (h *harness) pulls(m string) int {
+	h.sim.mu.Lock()
+	defer h.sim.mu.Unlock()
+	return h.sim.m[m].pulls
+}
+
+func (h *harness) prepares(m string) int {
+	h.sim.mu.Lock()
+	defer h.sim.mu.Unlock()
+	return h.sim.m[m].prepares
+}
+
+func waitRefreshDone(t *testing.T, co *coord.Coord, token string, within time.Duration) time.Duration {
+	t.Helper()
+	start := time.Now()
+	for time.Since(start) < within {
+		if done, err := co.GetString(context.Background(), co.RefreshDoneKey()); err == nil && done == token {
+			return time.Since(start)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("refresh %q never reported done within %s", token, within)
+	return 0
+}
+
+// TestRefreshRecreatesOnTheLeaderOnly: a refresh request makes the leader
+// recreate its workload in place (same term), and only the leader.
+func TestRefreshRecreatesOnTheLeaderOnly(t *testing.T) {
+	h := newHarness(t, nil)
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	co := coord.New(h.obs, h.cfg.EtcdPrefix, time.Second)
+	rec, _, _, _, err := co.Leader(context.Background())
+	if err != nil || rec == nil {
+		t.Fatalf("leader: %v %v", rec, err)
+	}
+	before := map[string]int{}
+	for _, m := range []string{"asus", "dell", "rpi5"} {
+		before[m] = h.prepares(m)
+	}
+	if err := co.PutString(context.Background(), co.RefreshKey(), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	took := waitRefreshDone(t, co, "t1", 20*time.Second)
+	t.Logf("refresh done after %s", took)
+	if h.prepares("asus") != before["asus"]+1 {
+		t.Errorf("asus prepared %d times for one refresh", h.prepares("asus")-before["asus"])
+	}
+	for _, m := range []string{"dell", "rpi5"} {
+		if h.prepares(m) != before[m] {
+			t.Errorf("follower %s prepared on a refresh", m)
+		}
+	}
+	after, _, _, _, _ := co.Leader(context.Background())
+	if after == nil || after.Epoch != rec.Epoch {
+		t.Errorf("refresh changed the term: %v -> %v", rec, after)
+	}
+	if h.pulls("asus") == 0 {
+		t.Error("the leader recreated without pulling first")
+	}
+	// The followers pull only after the leader reported done.
+	deadline := time.Now().Add(10 * time.Second)
+	for h.pulls("dell") == 0 || h.pulls("rpi5") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("followers never pulled after the refresh: dell=%d rpi5=%d", h.pulls("dell"), h.pulls("rpi5"))
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	h.holdOne("asus", 3*time.Second)
+	// The same token again is not a new request.
+	time.Sleep(3 * time.Second)
+	if h.prepares("asus") != before["asus"]+1 {
+		t.Error("an applied token was applied again")
+	}
+}
+
+// TestRefreshThatStaysUnhealthyFailsOver: a bad refresh makes the leader give
+// the office up as any unhealthy workload does. The next leader runs the image
+// already in its project (it never pulled): the refresh is not acknowledged,
+// and the followers do not pull the bad image either.
+func TestRefreshThatStaysUnhealthyFailsOver(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.Health.Failures, c.Health.MaxRestarts = 2, 1
+	})
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	co := coord.New(h.obs, h.cfg.EtcdPrefix, time.Second)
+	h.sim.set("asus", func(m *simMember) { m.unhealthy = true }) // the "new image" is bad on asus
+	if err := co.PutString(context.Background(), co.RefreshKey(), "bad"); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRunning("dell", 60*time.Second)
+	h.sim.set("asus", func(m *simMember) { m.unhealthy = false })
+	h.holdOne("dell", 5*time.Second)
+	if done, _ := co.GetString(context.Background(), co.RefreshDoneKey()); done == "bad" {
+		t.Error("a refresh that failed over was acknowledged")
+	}
+	if h.pulls("dell") != 0 || h.pulls("rpi5") != 0 {
+		t.Errorf("followers pulled a refresh that failed: dell=%d rpi5=%d", h.pulls("dell"), h.pulls("rpi5"))
+	}
 }

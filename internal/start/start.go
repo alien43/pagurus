@@ -26,6 +26,10 @@ type Starter interface {
 	// that the leader's last authorising check comes right before Start.
 	// It must be idempotent.
 	Prepare(ctx context.Context, member string) error
+	// Pull refreshes the member's image store from the registry, creating
+	// and starting nothing. It must run against the member's own Incus: an
+	// image is pulled for the architecture of the server it talks to.
+	Pull(ctx context.Context, member string) error
 	// Start brings member's project up. It must be idempotent, and after
 	// Prepare it should be quick: the time it takes is the window in which a
 	// deposed leader can still start a copy (Incus has no fencing token).
@@ -79,10 +83,26 @@ func (c Compose) CheckStart(ctx context.Context, member string) error {
 	return err
 }
 
-// Prepare is `incus-compose up --no-start`: pull and create, start nothing.
+// Prepare is `incus-compose up --no-start --recreate`: pull, and create this
+// member's instances afresh from the current compose file and local image,
+// starting nothing. A term starts only when nothing of ours runs here (or to
+// restart an unhealthy copy), so recreating costs ~1 s and is what makes a
+// compose change (a port, a label) or a freshly pulled image reach the
+// instance: `up` alone only patches missing config keys, never devices.
+// --no-healthd always: a recreate must not touch the project's ic-healthd.
 func (c Compose) Prepare(ctx context.Context, member string) error {
-	args := append(append(c.base(member), "up", "--no-start"), c.UpArgs...)
+	args := append(append(c.base(member), "up", "--no-start", "--recreate"), c.UpArgs...)
+	if !slices.Contains(args, "--no-healthd") {
+		args = append(args, "--no-healthd")
+	}
 	_, err := c.Run(ctx, c.bin(), args...)
+	return err
+}
+
+// Pull is `incus-compose pull --no-healthd`: new images into the project's
+// store; no instance changes until the next Prepare.
+func (c Compose) Pull(ctx context.Context, member string) error {
+	_, err := c.Run(ctx, c.bin(), append(c.base(member), "pull", "--no-healthd")...)
 	return err
 }
 
@@ -153,6 +173,9 @@ func (s Instances) CheckStart(ctx context.Context, member string) error {
 
 // Prepare has nothing to do: the instances exist already.
 func (s Instances) Prepare(context.Context, string) error { return nil }
+
+// Pull: instances are created outside pagurus; there is nothing to pull.
+func (s Instances) Pull(context.Context, string) error { return nil }
 
 // Start starts every selected instance that is not running.
 func (s Instances) Start(ctx context.Context, member string) error {

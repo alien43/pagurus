@@ -473,6 +473,12 @@ func (t *termState) supervise() {
 		t.log.Info("workload started")
 		return true
 	}
+	// A request older than this term is not this term's to apply: the term
+	// starts from the image already in this member's project (a refresh that
+	// failed over must leave the new leader on the old image), and it is not
+	// acknowledged, so `pagurus refresh` reports the failure.
+	applied, _ := a.co.GetString(t.op, a.co.RefreshKey())
+	ackPending := ""
 	if !startOnce() {
 		return
 	}
@@ -498,6 +504,25 @@ func (t *termState) supervise() {
 			t.giveUp("deposed", 0)
 			return
 		}
+		if tok, err := a.co.GetString(t.op, a.co.RefreshKey()); err == nil && tok != "" && tok != applied {
+			applied = tok
+			pctx, cancel := context.WithTimeout(t.op, UpTimeout)
+			err := a.rt.Pull(pctx, a.member)
+			cancel()
+			if err != nil {
+				// Not acknowledged: `pagurus refresh` times out and says so.
+				t.log.Warn("refresh: pull failed; keeping the running workload", "token", tok, "err", err)
+				continue
+			}
+			t.log.Info("refresh requested: pulled; recreating the workload in place", "token", tok)
+			ackPending = tok
+			healthy, failures = false, 0
+			if !startOnce() {
+				return
+			}
+			startedAt = a.now()
+			continue
+		}
 		err := t.health()
 		if t.op.Err() != nil {
 			return
@@ -511,6 +536,12 @@ func (t *termState) supervise() {
 				t.log.Info("workload healthy")
 			}
 			healthy, failures = true, 0
+			if ackPending != "" {
+				if perr := a.co.PutString(t.op, a.co.RefreshDoneKey(), ackPending); perr == nil {
+					t.log.Info("refresh done", "token", ackPending)
+					ackPending = ""
+				}
+			}
 		case a.now().Sub(startedAt) < hc.StartPeriod.D():
 			// still starting
 		default:

@@ -45,6 +45,9 @@ commands:
   validate    check the config, this member's Incus project and the compose file
   status      show the office, member states and every member's instances
   move        planned move: pagurus move -c cfg --to <member>
+  refresh     the leader recreates its workload in place from the current
+              compose file and the image in its project (after a pull):
+              pagurus refresh -c cfg [--timeout 5m]; waits until healthy
   fence-ack   operator override: record that a member is verified down
               pagurus fence-ack -c cfg --member <member>
   fence-check read-only: run Confirm of every fence in this member's self
@@ -87,7 +90,7 @@ func main() {
 	every := fs.Duration("every", time.Second, "audit: poll interval")
 	dur := fs.Duration("for", 0, "audit: stop after this long (0 = until interrupted)")
 	jsonLog := fs.Bool("json", false, "run: log as JSON")
-	timeout := fs.Duration("timeout", 3*time.Minute, "move: how long to wait for the new holder")
+	timeout := fs.Duration("timeout", 3*time.Minute, "move, refresh: how long to wait")
 	self := fs.String("self", "", "run: this host's cluster member name; lets the agent fence locally even when the local Incus is down at startup")
 	fenceIdx := fs.Int("fence", 0, "fence-run: 1-based index into the member's self chain")
 	dryRun := fs.Bool("dry-run", false, "provision: print the incus commands, change nothing")
@@ -136,6 +139,8 @@ func main() {
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdStatus(ctx, cfg, drv, cli) })
 	case "move":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdMove(ctx, cfg, cli, *to, *timeout) })
+	case "refresh":
+		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdRefresh(ctx, cfg, cli, *timeout) })
 	case "fence-ack":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdFenceAck(ctx, cfg, cli, *member) })
 	case "audit":
@@ -377,6 +382,48 @@ func cmdMove(ctx context.Context, cfg *config.Config, cli *clientv3.Client, to s
 		}
 	}
 	return fmt.Errorf("timed out after %s; pin cleared, normal election resumes", timeout)
+}
+
+// cmdRefresh asks the leader to recreate its workload in place and waits for
+// it to report the workload healthy again. With no leader, there is nothing
+// to refresh: the next term recreates anyway.
+func cmdRefresh(ctx context.Context, cfg *config.Config, cli *clientv3.Client, timeout time.Duration) error {
+	co := coord.New(cli, cfg.EtcdPrefix, cfg.Etcd.OpTimeout.D())
+	rec, _, _, _, err := co.Leader(ctx)
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		fmt.Println("no leader: nothing runs; the next term starts from a fresh instance")
+		return nil
+	}
+	host, _ := os.Hostname()
+	token := fmt.Sprintf("%s/%s", time.Now().UTC().Format(time.RFC3339Nano), host)
+	if err := co.PutString(ctx, co.RefreshKey(), token); err != nil {
+		return err
+	}
+	fmt.Printf("asked %s (epoch %d) to refresh (token %s); waiting for it to be healthy\n", rec.Member, rec.Epoch, token)
+	start, deadline := time.Now(), time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if done, err := co.GetString(ctx, co.RefreshDoneKey()); err == nil && done == token {
+			fmt.Printf("refreshed and healthy on %s after %s\n", rec.Member, time.Since(start).Round(time.Second))
+			return nil
+		}
+		if now, _, _, _, err := co.Leader(ctx); err == nil && (now == nil || now.Epoch != rec.Epoch) {
+			who := "nobody"
+			if now != nil {
+				who = now.Member
+			}
+			return fmt.Errorf("the term ended before the refresh was healthy (now held by %s): not updated; "+
+				"the new leader runs the image already in its own project", who)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return fmt.Errorf("timed out after %s waiting for the refresh to be healthy (the leader may have given up the office; check pagurus status)", timeout)
 }
 
 func cmdFenceAck(ctx context.Context, cfg *config.Config, cli *clientv3.Client, member string) error {

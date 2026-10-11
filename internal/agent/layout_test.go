@@ -26,6 +26,7 @@ func (r *layoutRT) List(context.Context, string) ([]incus.Instance, error) {
 }
 func (r *layoutRT) Start(context.Context, string) error                  { return nil }
 func (r *layoutRT) Prepare(context.Context, string) error                { return nil }
+func (r *layoutRT) Pull(context.Context, string) error                   { return nil }
 func (r *layoutRT) EnforceNoAutostart(context.Context, string) error     { return nil }
 func (r *layoutRT) Stop(context.Context, string, time.Duration) error    { return nil }
 func (r *layoutRT) LocalRunning(string) ([]string, error)                { return r.local, nil }

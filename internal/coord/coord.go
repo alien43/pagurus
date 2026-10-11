@@ -18,6 +18,11 @@
 //	<prefix>/reg/<member>   Registration, attached to the agent's lease.
 //	<prefix>/endpoint       Endpoint, attached to the leader's lease.
 //	<prefix>/pin            plain member name: only it may campaign (planned move).
+//	<prefix>/refresh        plain token: the leader recreates its workload in
+//	                        place (fresh instance from the current compose file
+//	                        and the image in its project), once per new token.
+//	<prefix>/refresh-done   the last token the leader applied, written once the
+//	                        workload is healthy again.
 //
 // The may-run/stopped record is what makes fencing complete: a new leader
 // fences every member whose record says may-run, not just the last leader, so
@@ -124,6 +129,8 @@ func (c *Coord) ElectionKey(lease clientv3.LeaseID) string {
 	return fmt.Sprintf("%s%x", c.ElectionPrefix(), int64(lease))
 }
 func (c *Coord) PinKey() string              { return c.prefix + "/pin" }
+func (c *Coord) RefreshKey() string          { return c.prefix + "/refresh" }
+func (c *Coord) RefreshDoneKey() string      { return c.prefix + "/refresh-done" }
 func (c *Coord) EndpointKey() string         { return c.prefix + "/endpoint" }
 func (c *Coord) MSKey(member string) string  { return c.prefix + "/ms/" + member }
 func (c *Coord) RegKey(member string) string { return c.prefix + "/reg/" + member }
@@ -336,6 +343,25 @@ func (c *Coord) SetPin(ctx context.Context, member string) error {
 	} else {
 		_, err = c.cli.Put(cctx, c.PinKey(), member)
 	}
+	return err
+}
+
+// GetString reads a plain-text key ("" when absent).
+func (c *Coord) GetString(ctx context.Context, key string) (string, error) {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.cli.Get(cctx, key)
+	if err != nil || len(resp.Kvs) == 0 {
+		return "", err
+	}
+	return string(resp.Kvs[0].Value), nil
+}
+
+// PutString writes a plain-text key.
+func (c *Coord) PutString(ctx context.Context, key, value string) error {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	_, err := c.cli.Put(cctx, key, value)
 	return err
 }
 

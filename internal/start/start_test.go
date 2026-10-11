@@ -26,7 +26,7 @@ func TestComposeArgv(t *testing.T) {
 	}
 	want := []string{
 		"-p p-asus -f /x/compose.yaml --env-file /x/.env config",
-		"-p p-asus -f /x/compose.yaml --env-file /x/.env up --no-start --detach --no-healthd",
+		"-p p-asus -f /x/compose.yaml --env-file /x/.env up --no-start --recreate --detach --no-healthd",
 		"-p p-asus -f /x/compose.yaml --env-file /x/.env up --detach --no-healthd",
 	}
 	if got := bin.Calls(t); strings.Join(got, "|") != strings.Join(want, "|") {
@@ -103,5 +103,18 @@ func TestInstancesAcceptsVMs(t *testing.T) {
 	s := start.Instances{Project: project, L: fakeList{inst("vm", "Stopped", "virtual-machine", "false")}}
 	if err := s.CheckStart(context.Background(), "asus"); err != nil {
 		t.Fatalf("a VM was refused: %v", err)
+	}
+}
+
+// A recreate never runs without --no-healthd, whatever up_args say.
+func TestComposePrepareAlwaysNoHealthd(t *testing.T) {
+	bin := fencetest.FakeBin(t, t.TempDir(), "incus-compose", "")
+	c := start.Compose{Run: incus.Run, Bin: bin.Path, Project: project, File: "/x/compose.yaml", UpArgs: []string{"--detach"}}
+	if err := c.Prepare(context.Background(), "asus"); err != nil {
+		t.Fatal(err)
+	}
+	want := "-p p-asus -f /x/compose.yaml up --no-start --recreate --detach --no-healthd"
+	if got := bin.Calls(t); len(got) != 1 || got[0] != want {
+		t.Fatalf("argv %q, want %q", got, want)
 	}
 }
