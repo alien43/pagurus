@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -196,5 +198,35 @@ func TestSafetyHashCoversSafetyFieldsOnly(t *testing.T) {
 		if c.SafetyHash() != h {
 			t.Errorf("%s: per-host setting changed the hash", name)
 		}
+	}
+}
+
+// A compose file counts by content: the same file at two paths is no skew,
+// another file at the same path is.
+func TestSafetyHashUsesComposeContent(t *testing.T) {
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a.yaml"), filepath.Join(dir, "b.yaml")
+	for _, f := range []string{a, b} {
+		if err := os.WriteFile(f, []byte("services: {web: {image: x}}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hash := func(file string) string {
+		c, err := Parse([]byte(strings.Replace(strings.Replace(base, `"compose": "/x/compose.yaml"`,
+			`"start": {"kind": "compose", "file": "`+file+`"}`, 1), "%s", "", 1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.SafetyHash()
+	}
+	ha := hash(a)
+	if hb := hash(b); hb != ha {
+		t.Errorf("same content at two paths: %s vs %s", ha, hb)
+	}
+	if err := os.WriteFile(b, []byte("services: {web: {image: y}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if hb := hash(b); hb == ha {
+		t.Error("different content: hash unchanged")
 	}
 }

@@ -3,19 +3,13 @@
 A hermit crab lives in one shell at a time and moves when it has to. `pagurus` keeps a workload
 running on exactly one member of an Incus cluster, and moves it when that member fails.
 
-> **Naming.** The project was prototyped as `singleton`. The live prototype keeps its old unit
-> and path names: transient units `singleton-<svc>`, binaries in `/run/singleton-proto` and
-> `/var/lib/singleton-proto`. `scripts/` drive that prototype, so they use those names too. etcd
-> keys are `/pagurus/v2/<svc>` everywhere (v2: the office became a conch election), and the
-> default state dir is `/run/pagurus`.
+> **Naming.** The project was prototyped as `singleton`; task names still say so. etcd keys are
+> `/pagurus/v2/<svc>` (v2: the office became a conch election), and the default state dir is
+> `/run/pagurus`.
 
-> **Status: EXPERIMENTAL PROTOTYPE (2026-10-06).** Not wired into any NixOS module, timer or
-> `fleet/` stack. When it runs on the live cluster it does so only as *transient* systemd units
-> started by `scripts/proto-up.sh`. On asus and dell the binaries sit on tmpfs
-> (`/run/singleton-proto`). On rpi5, whose `/run` is `noexec`, they sit in
-> `/var/lib/singleton-proto`. A reboot stops the agents, and `scripts/proto-down.sh --purge`
-> removes every trace. Promotion out of `experimental/` is a task, not a commit
-> (`experimental/README.md`).
+> **Status: in production on the author's cluster since 2026-10-11** as a canary (a stateless
+> `whoami`), one `pagurus@<svc>` systemd unit per member: a NixOS module on two members, a setup
+> script on a Debian one. Not yet released; interfaces may still change.
 
 ## What it does
 
@@ -470,8 +464,7 @@ internal/agent/         agent.go: the daemon (ground truth, campaigning); conch.
                         the watchdog relay, the term socket; lead.go: a term
 examples/whoami/        a generic compose example (placeholder addresses, 192.0.2.0/24)
 examples/whoami-instances/  the same with the instances starter
-examples/landos/        the live prototype's config (this author's cluster)
-scripts/                proto-up.sh, proto-down.sh, drill.sh (the live prototype)
+scripts/drill.sh        live drills against pagurus@<svc> units, refereed by `audit`
 internal/provision/     `pagurus provision`: per-member cluster groups + pinned projects
 ```
 
@@ -480,10 +473,8 @@ internal/provision/     `pagurus provision`: per-member cluster groups + pinned 
 ```fish
 go test ./...                              # needs an `etcd` binary on PATH; ~3 min. The sim
                                            # builds the conch pinned in go.mod (a tool dep)
-scripts/proto-up.sh --drill-proxy          # live prototype, from rpi5 (build + copy + transient units)
-/var/lib/singleton-proto/singleton status -c /run/singleton-proto/whoami/singleton.json
-scripts/drill.sh                           # live drills, audited (see below)
-scripts/proto-down.sh --purge              # remove everything
+pagurus status -c <cfg>                    # on a member: office, records, instances
+scripts/drill.sh move                      # live drills, audited (see below); SVC=, CTL= to adapt
 ```
 
 `pagurus audit -c <cfg> --for 10m` is the independent referee during drills. It polls every

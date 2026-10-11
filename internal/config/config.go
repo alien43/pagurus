@@ -579,7 +579,17 @@ func (c *Config) ConchEtcdArgs() []string {
 // to campaign while a live peer's differs (a peer with another TTL or chain
 // would be fenced on the wrong assumptions). Per-host settings (etcd and
 // Incus connection, state_dir, alert_url, health, preference) are left out.
+// A compose file counts by its content, not its path: members install it
+// where they can (a Nix store path, /etc/pagurus/...), and a different file
+// behind the same path is a skew.
 func (c *Config) SafetyHash() string {
+	start := c.Start
+	if start.Kind == "compose" {
+		if b, err := os.ReadFile(start.File); err == nil {
+			sum := sha256.Sum256(b)
+			start.File = "sha256:" + hex.EncodeToString(sum[:])
+		}
+	}
 	b, _ := json.Marshal(struct {
 		Members       []string
 		ProjectPrefix string
@@ -588,7 +598,7 @@ func (c *Config) SafetyHash() string {
 		Self, Peer    []fence.Spec
 		Fence         Fence
 		Start         Start
-	}{c.Members, c.ProjectPrefix, c.EtcdPrefix, c.Lease, c.SelfFences(), c.PeerFences(), c.Fence, c.Start})
+	}{c.Members, c.ProjectPrefix, c.EtcdPrefix, c.Lease, c.SelfFences(), c.PeerFences(), c.Fence, start})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:8])
 }
