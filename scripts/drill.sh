@@ -6,12 +6,14 @@
 # itself (move, audit) runs on $CTL, a member with the binary and config.
 #
 #   drill.sh [move|graceful|restart|crash|pause]...   (default: all, in that order)
+#   SVC=<service> HEALTH_PATH=<path> CTL=<member> select the service, its probe path, the control member.
 #
 # Exit status is non-zero if any drill misses its expectation or the audit
 # ever saw two members running at once. Partition drills need an etcd proxy in
 # front of an agent; production has none, so they live in the sim.
 set -uo pipefail
 svc=${SVC:-whoami}
+health_path=${HEALTH_PATH:-/health} # an HTTP path the workload answers 200 on
 unit=pagurus@$svc
 declare -A ssh=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
 CTL=${CTL:-asus}
@@ -49,7 +51,7 @@ endpoint_ip() { etcdctl --endpoints=$eps get "$kprefix/endpoint" --print-value-o
 # M: the instance sits on M's own incusbr0)
 healthy_on() {
   local ip; ip=$(endpoint_ip)
-  [ "$(leader)" = "$1" ] && [ "$(running_on)" = "$1" ] && [ -n "$ip" ] && on "$1" "curl -fsS -m 3 http://$ip:80/health" >/dev/null 2>&1
+  [ "$(leader)" = "$1" ] && [ "$(running_on)" = "$1" ] && [ -n "$ip" ] && on "$1" "curl -fsS -m 3 http://$ip:80$health_path" >/dev/null 2>&1
 }
 some_other_healthy() { local l; l=$(leader); [ -n "$l" ] && [ "$l" != "$1" ] && healthy_on "$l"; }
 settled() { local l; l=$(leader); [ -n "$l" ] && healthy_on "$l"; }
@@ -93,6 +95,9 @@ drill_restart() {
   if t=$(wait_for 120 new_term); then log "   $(leader) serving a new term (epoch $(epoch)) ${t}s after the kill"; else miss "restart (leader=$(leader) epoch=$(epoch) running=$(running_on))"; fi
 }
 
+# On a member armed with FailureAction=reboot-force this REBOOTS the host: the
+# `systemctl stop` after the kill leaves the unit failed instead of restarting
+# (a bare crash only restarts it). Seen on dell 2026-10-12.
 drill_crash() {
   local l; l=$(leader); log "== crash: SIGKILL the agent on $l and keep it down (workload left running)"
   on "$l" "sudo systemctl kill -s KILL --kill-whom=main $unit; sudo systemctl stop $unit"
