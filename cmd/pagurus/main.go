@@ -357,7 +357,8 @@ func cmdMove(ctx context.Context, cfg *config.Config, cli *clientv3.Client, to s
 		return fmt.Errorf("--to %q is not a member", to)
 	}
 	co := coord.New(cli, cfg.EtcdPrefix, cfg.Etcd.OpTimeout.D())
-	if err := co.SetPin(ctx, to); err != nil {
+	// The pin outlives this command by at most a minute if it is killed.
+	if err := co.PinFor(ctx, to, timeout+time.Minute); err != nil {
 		return err
 	}
 	defer func() {

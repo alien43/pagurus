@@ -228,15 +228,22 @@ func (a *Agent) setLocalStopped(ok bool) {
 func (a *Agent) Fit() (bool, string) {
 	a.mu.Lock()
 	running := a.conch != nil
+	// conch's pets matter only while it holds a term here: the term runs,
+	// or it ended without our workload confirmed stopped. A conch that is
+	// merely campaigning (or withdrawing, which can take as long as etcd is
+	// unreachable) guards nothing, and its silence must not starve the
+	// watchdog: on a reboot-armed member that would reset a healthy follower
+	// on every etcd outage longer than the watchdog timeout.
+	holding := running && (a.termActive || (a.termRan && !a.localStopped))
 	stopped, until := a.localStopped, a.unfitAfter
 	a.mu.Unlock()
-	if running && a.relay != nil {
+	if holding && a.relay != nil {
 		return a.relay.Fresh()
 	}
-	if running || stopped || a.now().Before(until) {
+	if (running && a.relay == nil) || stopped || a.now().Before(until) {
 		return true, ""
 	}
-	return false, "conch is not running, and local instances are not confirmed stopped"
+	return false, "local instances are not confirmed stopped and no term guards them"
 }
 
 // relayFreshness is how stale conch's last pet may be: conch pets every

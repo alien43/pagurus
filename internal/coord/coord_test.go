@@ -213,3 +213,25 @@ func TestRegistrationsPinEndpoint(t *testing.T) {
 		t.Fatalf("%+v %v", ep, err)
 	}
 }
+
+// TestPinForExpires: a pin set by a `move` that dies expires with its lease.
+func TestPinForExpires(t *testing.T) {
+	ctx := context.Background()
+	_, co := setup(t)
+	if err := co.PinFor(ctx, "rpi5", 2*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := co.Pin(ctx); p != "rpi5" {
+		t.Fatalf("pin %q, want rpi5", p)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if p, _ := co.Pin(ctx); p == "" {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("pin still set 10s after its 2s lease")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}

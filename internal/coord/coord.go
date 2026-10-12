@@ -334,6 +334,20 @@ func (c *Coord) Pin(ctx context.Context) (string, error) {
 	return string(resp.Kvs[0].Value), nil
 }
 
+// PinFor pins the office to member under a lease of ttl, so a pin whose
+// setter dies (a killed `pagurus move`) expires instead of leaving only that
+// member allowed to campaign, forever.
+func (c *Coord) PinFor(ctx context.Context, member string, ttl time.Duration) error {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	lease, err := c.cli.Grant(cctx, int64(max(ttl/time.Second, 1)))
+	if err != nil {
+		return err
+	}
+	_, err = c.cli.Put(cctx, c.PinKey(), member, clientv3.WithLease(lease.ID))
+	return err
+}
+
 func (c *Coord) SetPin(ctx context.Context, member string) error {
 	cctx, cancel := c.ctx(ctx)
 	defer cancel()

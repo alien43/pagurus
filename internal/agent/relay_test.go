@@ -35,6 +35,9 @@ func TestRelayFollowsConch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { a.KillProcs(); a.conchExited(<-done) }()
+	a.mu.Lock()
+	a.termActive = true // conch holds a term: its pets are what count
+	a.mu.Unlock()
 
 	// Petting every 100ms for 1s: fit throughout.
 	for end := time.Now().Add(800 * time.Millisecond); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
@@ -62,5 +65,49 @@ func TestRelayFollowsConch(t *testing.T) {
 		if ok, _ := a.Fit(); ok {
 			t.Fatal("fit again although conch never petted again")
 		}
+	}
+}
+
+// TestCampaigningConchSilenceIsNotUnfit: a conch that only campaigns (or is
+// slowly withdrawing while etcd is unreachable) guards nothing. While our
+// local instances are confirmed stopped, its silence must not starve the
+// watchdog; on a reboot-armed member that would reset a healthy follower on
+// every etcd outage longer than the watchdog timeout (seen live 2026-10-12).
+func TestCampaigningConchSilenceIsNotUnfit(t *testing.T) {
+	cfg := testConfig(t, nil)
+	dir, err := os.MkdirTemp("/tmp", "pg-relay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	cfg.StateDir = dir
+	self, _ := os.Executable()
+	a := New(Options{Config: cfg, Runtime: &simRT{c: newSim(t, "asus"), me: "asus"}, Member: "asus",
+		Conch: []string{self, "sim-pet", "0"}, FenceCmd: []string{"true"}, TermCmd: []string{"true"}, ProcOutput: procOutput()})
+	a.wd = &simDog{timeout: time.Second} // freshness: 500ms
+	r, err := listenNotify(filepath.Join(dir, "svc.notify"), a.relayFreshness)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	a.relay = r
+	a.setLocalStopped(true)
+
+	done, err := a.spawnConch(0) // never pets, never holds a term
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { a.KillProcs(); a.conchExited(<-done) }()
+	for end := time.Now().Add(1500 * time.Millisecond); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		if ok, why := a.Fit(); !ok {
+			t.Fatalf("unfit while only campaigning with nothing running: %s", why)
+		}
+	}
+	// The same silence while it holds a term is unfit.
+	a.mu.Lock()
+	a.termActive = true
+	a.mu.Unlock()
+	if ok, _ := a.Fit(); ok {
+		t.Fatal("fit while holding a term with a silent conch")
 	}
 }
