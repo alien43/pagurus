@@ -37,6 +37,7 @@ PART_MEMBER=${PART_MEMBER:-dell}
 CUT=${CUT:-180}
 etcd_ips=10.0.1.3,10.0.1.6,10.0.1.8
 declare -A incus_ip=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
+HOLD=${HOLD:-}
 read -ra hold <<<"${HOLD//,/ }"
 
 cfg=$(on "$CTL" "systemctl cat $unit" | grep -o '/nix/store/[^ ]*\.json' | head -1)
