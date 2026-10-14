@@ -967,6 +967,39 @@ func TestStartErrorButRunningPublishesEndpoint(t *testing.T) {
 	}
 }
 
+// A start that fails is retried at once and given up after max_restarts,
+// without waiting out start_period and the failure count first: those exist
+// for a workload that started and is slow to get healthy, not for a create
+// that failed ("In use", "address already in use"). 2026-10-14: a failed
+// term cost ~135 s in production, every time.
+func TestFailedStartGivesUpWithoutWaitingOutTheStartPeriod(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Health.StartPeriod = config.Duration(3 * time.Second) })
+	h.sim.set("asus", func(m *simMember) { m.prepareFail = true })
+	h.startAll()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		h.sim.mu.Lock()
+		n := h.sim.m["asus"].prepares
+		h.sim.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("asus never tried to start")
+		}
+	}
+	took := h.waitRunning("dell", 20*time.Second)
+	t.Logf("dell serving %s after asus's first failed start", took.Round(100*time.Millisecond))
+	if took > 3*time.Second {
+		t.Fatalf("dell took %s: asus waited out its start period on a start that had failed", took.Round(100*time.Millisecond))
+	}
+	h.sim.mu.Lock()
+	n := h.sim.m["asus"].prepares
+	h.sim.mu.Unlock()
+	if want := h.cfg.Health.MaxRestarts + 1; n != want {
+		t.Fatalf("asus tried %d starts, want %d (1 + max_restarts)", n, want)
+	}
+}
+
 func TestStrayInstanceOnFollowerIsStopped(t *testing.T) {
 	h := newHarness(t, nil)
 	h.startAll()
