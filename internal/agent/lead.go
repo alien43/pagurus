@@ -474,8 +474,21 @@ func (t *termState) supervise() {
 	a := t.a
 	hc := a.cfg.Health
 	restarts, failures := 0, 0
+	healthy, everHealthy := false, false
+	// startOnce starts the workload; false means the term is over. A start
+	// that fails is retried one health interval later, within the same
+	// max_restarts budget as unhealthy restarts, and then the office is
+	// given up. start_period and the failure count are for a workload that
+	// started and is slow to answer; waiting them out after a create or
+	// start that failed ("In use", "address already in use") only delayed
+	// the handover (~135 s per failed term on 2026-10-14).
 	startOnce := func() bool {
-		if err := t.start(); err != nil {
+		for {
+			err := t.start()
+			if err == nil {
+				t.log.Info("workload started")
+				return true
+			}
 			if t.op.Err() != nil {
 				return false
 			}
@@ -490,10 +503,19 @@ func (t *termState) supervise() {
 				t.giveUp(err.Error(), 0)
 				return false
 			}
-			return true // counted as unhealthy below
+			if restarts >= hc.MaxRestarts {
+				backoff, streak := a.releaseBackoff(everHealthy)
+				a.alerter.Alert("unhealthy", "workload does not start; giving the office up", "member", a.member, "err", err.Error(),
+					"backoff", backoff, "failed_terms", streak)
+				t.giveUp("start failed: "+err.Error(), backoff)
+				return false
+			}
+			restarts++
+			t.log.Warn("retrying the start", "attempt", restarts)
+			if !sleep(t.op, hc.Interval.D()) {
+				return false
+			}
 		}
-		t.log.Info("workload started")
-		return true
 	}
 	// A request older than this term is not this term's to apply: the term
 	// starts from the image already in this member's project (a refresh that
@@ -507,7 +529,6 @@ func (t *termState) supervise() {
 	startedAt, lastAudit := a.now(), time.Time{}
 	tick := time.NewTicker(hc.Interval.D())
 	defer tick.Stop()
-	healthy, everHealthy := false, false
 	for {
 		a.beat(hc.Interval.D() + 2*a.cfg.Fence.APITimeout.D())
 		select {
