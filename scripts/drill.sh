@@ -32,7 +32,9 @@ fail=0
 miss() { log "MISS: $*"; fail=1; }
 
 PART_MEMBER=${PART_MEMBER:-dell}
-CUT=${CUT:-60}
+# The stop hook incusd runs after the kill retries the cluster database for
+# ~45-100 s; the leak needs the cut to outlast that (60 s did not, 2026-10-14).
+CUT=${CUT:-180}
 etcd_ips=10.0.1.3,10.0.1.6,10.0.1.8
 declare -A incus_ip=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
 read -ra hold <<<"${HOLD//,/ }"
