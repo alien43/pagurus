@@ -53,6 +53,10 @@ type simMember struct {
 	stopFail  bool // `incus stop` does nothing
 	killFail  bool // cgroup.kill does not empty the cgroup
 	upFail    bool
+	// upErrRuns: `up` exits non-zero although the instance did start (seen
+	// 2026-10-14: "DNSWatcher: updating dnsmasq records ... peer node is
+	// down" while another member was offline).
+	upErrRuns bool
 	// prepareFail: `up --no-start --recreate` deletes the instance and the
 	// create fails "In use" (an incusd that leaked the volume's mount
 	// refcount after a cgroup-kill fence), until incusd restarts.
@@ -250,6 +254,11 @@ func (r *simRT) Start(_ context.Context, m string) error {
 	}
 	if r.c.m[m].upFail {
 		return errors.New("up failed")
+	}
+	if r.c.m[m].upErrRuns {
+		r.c.m[m].running = true
+		r.c.check("up (with an error) on " + m)
+		return errors.New("DNSWatcher: instance(svc-1): updating dnsmasq records: peer node is down")
 	}
 	r.c.m[m].running = true
 	r.c.check("up on " + m)
@@ -927,6 +936,34 @@ func TestPoisonedPairStarvesTheThirdWithFixedBackoff(t *testing.T) {
 		if on := h.sim.runningOn(); len(on) > 0 {
 			t.Fatalf("running on %v: with a fixed backoff the poisoned pair should have starved rpi5", on)
 		}
+	}
+}
+
+// An `up` that exits non-zero although the instance runs must not cost the
+// term its endpoint (2026-10-14: rpi5 served whoami for a whole term with no
+// endpoint published) nor an in-place restart.
+func TestStartErrorButRunningPublishesEndpoint(t *testing.T) {
+	h := newHarness(t, nil)
+	h.sim.set("asus", func(m *simMember) { m.upErrRuns = true })
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ep, err := h.coord().GetEndpoint(context.Background())
+		if err == nil && ep != nil && ep.Member == "asus" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no endpoint published by asus within 5s (ep=%+v err=%v)", ep, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	h.holdOne("asus", 2*time.Second)
+	h.sim.mu.Lock()
+	prepares := h.sim.m["asus"].prepares
+	h.sim.mu.Unlock()
+	if prepares != 1 {
+		t.Fatalf("asus prepared %d times: a running instance was restarted in place", prepares)
 	}
 }
 
