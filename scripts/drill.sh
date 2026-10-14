@@ -159,7 +159,16 @@ drill_partition() {
   t0=$SECONDS
   sleep 1
   on "$m" "sudo nft list table inet drillcut" >/dev/null 2>&1 || { miss "partition: the drillcut table is not on $m (cut did not apply)"; return; }
-  if t=$(wait_for 180 some_other_healthy "$m"); then log "   $(leader) serving ${t}s after the cut (failover gap)"; else miss "partition: no failover within 180s (leader=$(leader) running=$(running_on))"; fi
+  # While m is offline Incus keeps its last state (RUNNING: the stop hook never
+  # ran), so the failover gap is judged on the new leader alone; the audit
+  # still referees overlap from the cgroup ground truth.
+  serving_elsewhere() {
+    local l ip; l=$(leader); ip=$(endpoint_ip)
+    [ -n "$l" ] && [ "$l" != "$m" ] && [ -n "$ip" ] \
+      && [ "$(incus list --project "$prefix-$l" -c s --format csv 2>/dev/null | grep -c RUNNING)" -gt 0 ] \
+      && on "$l" "curl -fsS -m 3 http://$ip:80$health_path" >/dev/null 2>&1
+  }
+  if t=$(wait_for 240 serving_elsewhere); then log "   $(leader) serving ${t}s after the cut (failover gap)"; else miss "partition: no failover within 240s (leader=$(leader) running=$(running_on))"; fi
   wait_for $((CUT + 90)) online_in_incus "$m" >/dev/null || miss "partition: $m not ONLINE again"
   on "$m" "sudo nft list table inet drillcut" >/dev/null 2>&1 && miss "partition: drillcut table still on $m"
   log "   cut lifted, $m ONLINE $((SECONDS - t0))s after the cut"
