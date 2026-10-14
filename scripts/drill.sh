@@ -152,9 +152,11 @@ drill_partition() {
 }"
   on "$m" "sudo tee /run/pagurus-drillcut.nft" <<<"$rules" >/dev/null || { miss "partition: could not stage the rules on $m"; return; }
   since=$(on "$m" "date '+%F %T'")
-  on "$m" "sudo systemd-run --unit=pagurus-drill-cut --collect -p RuntimeMaxSec=$((CUT + 30)) -p 'ExecStopPost=-/run/current-system/sw/bin/nft delete table inet drillcut' /run/current-system/sw/bin/bash -c 'nft -f /run/pagurus-drillcut.nft && sleep $CUT; nft delete table inet drillcut'" >/dev/null 2>&1 \
+  on "$m" "sudo systemd-run --unit=pagurus-drill-cut --collect -p RuntimeMaxSec=$((CUT + 30)) -p 'ExecStopPost=-/run/current-system/sw/bin/nft delete table inet drillcut' /run/current-system/sw/bin/bash -c 'PATH=/run/current-system/sw/bin; nft -f /run/pagurus-drillcut.nft && sleep $CUT; nft delete table inet drillcut'" >/dev/null 2>&1 \
     || { miss "partition: could not start the cut on $m"; return; }
   t0=$SECONDS
+  sleep 1
+  on "$m" "sudo nft list table inet drillcut" >/dev/null 2>&1 || { miss "partition: the drillcut table is not on $m (cut did not apply)"; return; }
   if t=$(wait_for 180 some_other_healthy "$m"); then log "   $(leader) serving ${t}s after the cut (failover gap)"; else miss "partition: no failover within 180s (leader=$(leader) running=$(running_on))"; fi
   wait_for $((CUT + 90)) online_in_incus "$m" >/dev/null || miss "partition: $m not ONLINE again"
   on "$m" "sudo nft list table inet drillcut" >/dev/null 2>&1 && miss "partition: drillcut table still on $m"
