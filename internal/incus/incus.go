@@ -13,10 +13,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -41,6 +43,11 @@ type Options struct {
 	ProjectPrefix string
 	// CgroupRoot is the cgroup2 mount (default /sys/fs/cgroup).
 	CgroupRoot string
+	// ProcRoot is procfs (default /proc), where Kill finds the proxy-device
+	// processes of the containers it killed.
+	ProcRoot string
+	// KillPID kills one process (default SIGKILL). Tests replace it.
+	KillPID func(pid int) error
 	// API reaches Incus (default: NewClient over the local unix socket).
 	API API
 }
@@ -52,6 +59,12 @@ type Driver struct {
 func New(o Options) *Driver {
 	if o.CgroupRoot == "" {
 		o.CgroupRoot = "/sys/fs/cgroup"
+	}
+	if o.ProcRoot == "" {
+		o.ProcRoot = "/proc"
+	}
+	if o.KillPID == nil {
+		o.KillPID = func(pid int) error { return syscall.Kill(pid, syscall.SIGKILL) }
 	}
 	if o.API == nil {
 		o.API = NewClient(ClientOptions{})
@@ -303,15 +316,20 @@ func (d *Driver) Kill(ctx context.Context, member string) error {
 	}
 	pfx := d.payloadPrefix(member)
 	var errs []error
+	killed := map[int]bool{}
 	for _, n := range names {
-		f := filepath.Join(d.o.CgroupRoot, pfx+n, "cgroup.kill")
-		if err := os.WriteFile(f, []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
+		dir := filepath.Join(d.o.CgroupRoot, pfx+n)
+		for _, pid := range cgroupPIDs(dir) {
+			killed[pid] = true
+		}
+		if err := os.WriteFile(filepath.Join(dir, "cgroup.kill"), []byte("1"), 0); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, err)
 		}
 	}
 	for {
 		left, err := d.LocalRunning(member)
 		if err == nil && len(left) == 0 {
+			d.killProxies(killed)
 			return nil
 		}
 		select {
@@ -374,4 +392,63 @@ func (d *Driver) StartInstances(ctx context.Context, member string, names []stri
 // ServerVersion is the Incus server's version.
 func (d *Driver) ServerVersion(ctx context.Context) (string, error) {
 	return d.o.API.ServerVersion(ctx)
+}
+
+// cgroupPIDs lists the processes of a cgroup and its descendants.
+func cgroupPIDs(dir string) []int {
+	var pids []int
+	_ = filepath.WalkDir(dir, func(p string, e fs.DirEntry, err error) error {
+		if err != nil || !e.IsDir() {
+			return nil
+		}
+		b, err := os.ReadFile(filepath.Join(p, "cgroup.procs"))
+		if err != nil {
+			return nil
+		}
+		for _, f := range strings.Fields(string(b)) {
+			if pid, err := strconv.Atoi(f); err == nil {
+				pids = append(pids, pid)
+			}
+		}
+		return nil
+	})
+	return pids
+}
+
+// killProxies kills the proxy devices of containers killed outside Incus.
+// A proxy device is an `incusd forkproxy -- <listen pid> <fd> <addr>
+// <connect pid> <fd> <addr> ...` process on the host, outside the
+// container's cgroup: cgroup.kill does not reach it, and without incusd's
+// stop hook (which a member cut off the cluster database cannot run) it keeps
+// the published port bound, forwarding to a dead process, until killed. That
+// broke routing to the port and the next start on the member ("bind: address
+// already in use", 2026-10-14). Best effort: the workload is already stopped,
+// so nothing here can fail the fence.
+func (d *Driver) killProxies(killed map[int]bool) {
+	if len(killed) == 0 {
+		return
+	}
+	ents, err := os.ReadDir(d.o.ProcRoot)
+	if err != nil {
+		return
+	}
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(d.o.ProcRoot, e.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		argv := strings.Split(strings.TrimRight(string(b), "\x00"), "\x00")
+		if len(argv) < 7 || argv[1] != "forkproxy" || argv[2] != "--" {
+			continue
+		}
+		listen, _ := strconv.Atoi(argv[3])
+		connect, _ := strconv.Atoi(argv[6])
+		if killed[listen] || killed[connect] {
+			_ = d.o.KillPID(pid)
+		}
+	}
 }

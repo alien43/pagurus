@@ -91,6 +91,18 @@ func (c *CgroupFS) Run(t testing.TB, project, name string) {
 	c.SetPopulated(t, project, name, true)
 }
 
+// SetProcs writes the container's cgroup.procs.
+func (c *CgroupFS) SetProcs(t testing.TB, project, name string, pids ...int) {
+	t.Helper()
+	var b strings.Builder
+	for _, p := range pids {
+		fmt.Fprintln(&b, p)
+	}
+	if err := os.WriteFile(filepath.Join(c.dir(project, name), "cgroup.procs"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // SetPopulated flips a container's cgroup.events, as a real stop would.
 func (c *CgroupFS) SetPopulated(t testing.TB, project, name string, on bool) {
 	t.Helper()

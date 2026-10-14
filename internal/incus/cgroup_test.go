@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -122,5 +124,66 @@ func TestRunKillsTheGroupAtTheDeadline(t *testing.T) {
 	}
 	if took := time.Since(start); took > 3*time.Second {
 		t.Fatalf("Run returned %v after a 300ms deadline: the group was not killed", took)
+	}
+}
+
+// fakeProc writes /proc/<pid>/cmdline under root.
+func fakeProc(t *testing.T, root string, pid int, argv ...string) {
+	t.Helper()
+	d := filepath.Join(root, strconv.Itoa(pid))
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(d, "cmdline"), []byte(strings.Join(argv, "\x00")+"\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A cgroup-kill leaves the containers' proxy devices (incusd forkproxy, on
+// the host) holding the published ports; Kill must take them down too, and
+// nothing else: not another container's proxy, not other incusd processes.
+func TestKillTakesDownTheKilledContainersProxyDevices(t *testing.T) {
+	cg := fencetest.FakeCgroupFS(t)
+	cg.Run(t, "p-asus", "web")
+	cg.SetProcs(t, "p-asus", "web", 4100, 4101)
+	cg.Run(t, "p-dell", "web") // not ours: its proxy must live
+	cg.SetProcs(t, "p-dell", "web", 5100)
+	proc := t.TempDir()
+	fakeProc(t, proc, 900, "incusd", "forkproxy", "--", "1056", "4", "tcp:0.0.0.0:8150", "4100", "3", "tcp:127.0.0.1:80", "", "", "0644")
+	fakeProc(t, proc, 901, "incusd", "forkproxy", "--", "4101", "4", "tcp:127.0.0.1:9000", "1056", "3", "tcp:0.0.0.0:9000", "", "", "0644") // bind=instance
+	fakeProc(t, proc, 902, "incusd", "forkproxy", "--", "1056", "4", "tcp:0.0.0.0:8151", "5100", "3", "tcp:127.0.0.1:80", "", "", "0644")
+	fakeProc(t, proc, 903, "incusd", "--group", "incus-admin")
+	fakeProc(t, proc, 904, "sleep", "4100", "x", "y", "z", "4100", "4100")
+	if err := os.WriteFile(filepath.Join(proc, "self"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	d := incus.New(incus.Options{ProjectPrefix: "p", CgroupRoot: cg.Root, ProcRoot: proc, API: fencetest.NewFakeIncus("asus"),
+		KillPID: func(pid int) error { got = append(got, pid); return nil }})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Kill(ctx, "asus"); err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []int{900, 901}) {
+		t.Fatalf("killed %v, want the two proxies of p-asus_web [900 901]", got)
+	}
+}
+
+// A proxy that will not die (or a procfs that cannot be read) never fails
+// the fence: the workload itself is stopped.
+func TestKillSucceedsWhenProxyCleanupFails(t *testing.T) {
+	cg := fencetest.FakeCgroupFS(t)
+	cg.Run(t, "p-asus", "web")
+	cg.SetProcs(t, "p-asus", "web", 4100)
+	proc := t.TempDir()
+	fakeProc(t, proc, 900, "incusd", "forkproxy", "--", "1056", "4", "tcp:0.0.0.0:8150", "4100", "3", "tcp:127.0.0.1:80")
+	d := incus.New(incus.Options{ProjectPrefix: "p", CgroupRoot: cg.Root, ProcRoot: proc, API: fencetest.NewFakeIncus("asus"),
+		KillPID: func(int) error { return errors.New("EPERM") }})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Kill(ctx, "asus"); err != nil {
+		t.Fatalf("Kill = %v: a failed proxy cleanup failed the fence", err)
 	}
 }
