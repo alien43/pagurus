@@ -912,6 +912,24 @@ func TestPoisonedPairDoesNotStarveTheThird(t *testing.T) {
 	h.holdOne("rpi5", 2*time.Second)
 }
 
+// The control: the same pair with a fixed backoff (max = base) never lets
+// rpi5 in, which is what made the escalation necessary.
+func TestPoisonedPairStarvesTheThirdWithFixedBackoff(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) {
+		c.Health.ReleaseBackoff = config.Duration(1500 * time.Millisecond)
+		c.Health.ReleaseBackoffMax = c.Health.ReleaseBackoff
+	})
+	for _, m := range []string{"asus", "dell"} {
+		h.sim.set(m, func(m *simMember) { m.prepareFail = true })
+	}
+	h.startAll()
+	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		if on := h.sim.runningOn(); len(on) > 0 {
+			t.Fatalf("running on %v: with a fixed backoff the poisoned pair should have starved rpi5", on)
+		}
+	}
+}
+
 func TestStrayInstanceOnFollowerIsStopped(t *testing.T) {
 	h := newHarness(t, nil)
 	h.startAll()

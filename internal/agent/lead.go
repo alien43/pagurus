@@ -103,7 +103,7 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 // be confirmed the member state stays may-run: conch's fence tries again, and
 // failing that the next leader must fence us.
 func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, backoff time.Duration, log *slog.Logger) bool {
-	log.Info("releasing the office", "reason", reason)
+	log.Info("releasing the office", "reason", reason, "backoff", backoff)
 	bg := context.Background()
 	sctx, cancel := context.WithTimeout(bg, a.cfg.SelfFence.StopBudget.D()+5*time.Second)
 	err := a.rt.Stop(sctx, a.member, 5*time.Second)
@@ -485,7 +485,7 @@ func (t *termState) supervise() {
 	startedAt, lastAudit := a.now(), time.Time{}
 	tick := time.NewTicker(hc.Interval.D())
 	defer tick.Stop()
-	healthy := false
+	healthy, everHealthy := false, false
 	for {
 		a.beat(hc.Interval.D() + 2*a.cfg.Fence.APITimeout.D())
 		select {
@@ -535,7 +535,12 @@ func (t *termState) supervise() {
 			if !healthy {
 				t.log.Info("workload healthy")
 			}
-			healthy, failures = true, 0
+			if !everHealthy {
+				a.mu.Lock()
+				a.failedTerms = 0
+				a.mu.Unlock()
+			}
+			healthy, everHealthy, failures = true, true, 0
 			if ackPending != "" {
 				if perr := a.co.PutString(t.op, a.co.RefreshDoneKey(), ackPending); perr == nil {
 					t.log.Info("refresh done", "token", ackPending)
@@ -552,8 +557,10 @@ func (t *termState) supervise() {
 				break
 			}
 			if restarts >= hc.MaxRestarts {
-				a.alerter.Alert("unhealthy", "workload stays unhealthy; giving the office up", "member", a.member, "err", err.Error())
-				t.giveUp("unhealthy: "+err.Error(), hc.ReleaseBackoff.D())
+				backoff, streak := a.releaseBackoff(everHealthy)
+				a.alerter.Alert("unhealthy", "workload stays unhealthy; giving the office up", "member", a.member, "err", err.Error(),
+					"backoff", backoff, "failed_terms", streak)
+				t.giveUp("unhealthy: "+err.Error(), backoff)
 				return
 			}
 			restarts++
@@ -572,4 +579,27 @@ func (t *termState) supervise() {
 			t.audit()
 		}
 	}
+}
+
+// releaseBackoff is how long to stay out of the campaign after giving the
+// office up unhealthy: health.release_backoff, doubled for every earlier
+// consecutive term that never got healthy, capped at release_backoff_max. A
+// fixed backoff about as long as a failed term let two members that cannot
+// start the workload take turns for ever, starving a third that could
+// (2026-10-14). It returns the backoff and the new streak.
+func (a *Agent) releaseBackoff(everHealthy bool) (time.Duration, int) {
+	hc := a.cfg.Health
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if everHealthy {
+		a.failedTerms = 0
+	}
+	d := hc.ReleaseBackoff.D()
+	for i := 0; i < a.failedTerms && d < hc.ReleaseBackoffMax.D(); i++ {
+		d *= 2
+	}
+	if !everHealthy {
+		a.failedTerms++
+	}
+	return min(d, hc.ReleaseBackoffMax.D()), a.failedTerms
 }

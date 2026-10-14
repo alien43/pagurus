@@ -212,8 +212,13 @@ type Health struct {
 	Instance string   `json:"instance"`
 	Timeout  Duration `json:"timeout"`
 	// ReleaseBackoff: after giving the office up for being unhealthy, do not
-	// campaign again for this long (lets a healthier member take over).
-	ReleaseBackoff Duration `json:"release_backoff"`
+	// campaign again for this long (lets a healthier member take over). It
+	// doubles with each consecutive term that gave up without ever being
+	// healthy, up to ReleaseBackoffMax, and resets once a term is healthy:
+	// a member that cannot start the workload at all (an Incus that leaked
+	// the volume's mount, 2026-10-14) falls behind the members that can.
+	ReleaseBackoff    Duration `json:"release_backoff"`
+	ReleaseBackoffMax Duration `json:"release_backoff_max"`
 }
 
 type Watchdog struct {
@@ -378,6 +383,7 @@ func (c *Config) applyDefaults() {
 	def(&c.Health.StartPeriod, 30*time.Second)
 	def(&c.Health.Timeout, 3*time.Second)
 	def(&c.Health.ReleaseBackoff, 2*time.Minute)
+	def(&c.Health.ReleaseBackoffMax, 30*time.Minute)
 	if c.Health.Failures == 0 {
 		c.Health.Failures = 3
 	}
@@ -530,6 +536,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Health.Failures < 1 || c.Health.MaxRestarts < 0 {
 		bad("health.failures must be >= 1 and health.max_restarts >= 0")
+	}
+	if c.Health.ReleaseBackoffMax.D() < c.Health.ReleaseBackoff.D() {
+		bad("health.release_backoff_max %s: must be >= health.release_backoff %s", c.Health.ReleaseBackoffMax.D(), c.Health.ReleaseBackoff.D())
 	}
 	return errors.Join(errs...)
 }

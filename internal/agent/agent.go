@@ -103,6 +103,7 @@ type Agent struct {
 	unfitAfter       time.Time // while conch is not running and not localStopped, fit until then
 	progressDeadline time.Time // a term's loop must report progress before this (heartbeat)
 	backoffUntil     time.Time
+	failedTerms      int       // consecutive terms given up unhealthy without ever being healthy
 	conch            *exec.Cmd // the running `conch elect`, nil if none
 	termActive       bool      // conch holds the office and its term runs here
 	termPID          int       // the `pagurus term` process of the active term
