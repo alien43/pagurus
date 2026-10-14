@@ -5,12 +5,20 @@
 # workstation that reaches every member over ssh and etcd directly; pagurus
 # itself (move, audit) runs on $CTL, a member with the binary and config.
 #
-#   drill.sh [move|graceful|restart|crash|pause]...   (default: all, in that order)
+#   drill.sh [move|graceful|restart|crash|pause|partition]...   (default: all but partition, in that order)
 #   SVC=<service> HEALTH_PATH=<path> CTL=<member> select the service, its probe path, the control member.
 #
 # Exit status is non-zero if any drill misses its expectation or the audit
-# ever saw two members running at once. Partition drills need an etcd proxy in
-# front of an agent; production has none, so they live in the sim.
+# ever saw two members running at once.
+#
+# partition (attended, never in the default set): cuts PART_MEMBER's HOST off
+# etcd (TCP 2379) and the Incus cluster (TCP 8443) with an nft table in a
+# transient unit that removes itself after CUT seconds. Port 22 and container
+# traffic are never matched. The member self-fences by cgroup.kill, which on
+# Incus 7.5 leaks the instance volume's mount refcount in its incusd
+# (tasks/pagurus-fenced-member-recovery.md); the drill then moves the service
+# back to it and reports whether it can host. HOLD=<members> keeps those
+# members' agents stopped for the drill (e.g. a member already poisoned).
 set -uo pipefail
 svc=${SVC:-whoami}
 health_path=${HEALTH_PATH:-/health} # an HTTP path the workload answers 200 on
@@ -22,6 +30,12 @@ on() { local m=$1; shift; ssh -o BatchMode=yes "${ssh[$m]}" "$*"; }
 log() { printf '%s  %s\n' "$(date +%T)" "$*"; }
 fail=0
 miss() { log "MISS: $*"; fail=1; }
+
+PART_MEMBER=${PART_MEMBER:-dell}
+CUT=${CUT:-60}
+etcd_ips=10.0.1.3,10.0.1.6,10.0.1.8
+declare -A incus_ip=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
+read -ra hold <<<"${HOLD//,/ }"
 
 cfg=$(on "$CTL" "systemctl cat $unit" | grep -o '/nix/store/[^ ]*\.json' | head -1)
 [ -n "$cfg" ] || { echo "no $unit config on $CTL" >&2; exit 2; }
@@ -65,7 +79,9 @@ on "$CTL" "pagurus audit -c $cfg --every 500ms" >"$audit_log" 2>&1 </dev/null &
 audit_pid=$!
 # SIGINT ends the remote audit with its summary line.
 stop_audit() { on "$CTL" "pkill -INT -f 'pagurus audit -c $cfg'" 2>/dev/null; wait $audit_pid 2>/dev/null; }
-trap stop_audit EXIT
+# a held agent must not stay stopped if the drill dies
+unhold() { for p in "${hold[@]}"; do on "$p" "sudo systemctl start $unit"; done; }
+trap 'stop_audit; unhold' EXIT
 sleep 3
 
 drill_move() {
@@ -118,11 +134,63 @@ drill_pause() {
   [ "$(running_on)" = "$(leader)" ] || miss "after SIGCONT: running on $(running_on), leader $(leader)"
 }
 
+online_in_incus() { incus cluster list --format csv -c ns 2>/dev/null | grep -qx "$1,ONLINE"; }
+agent_log() { on "$1" "journalctl -u $unit --since '$2' --no-pager -q -o cat"; }
+
+drill_partition() {
+  local m=$PART_MEMBER peers=() p t0 since t ips rules
+  for p in "${!incus_ip[@]}"; do [ "$p" = "$m" ] || peers+=("${incus_ip[$p]}"); done
+  ips="$etcd_ips,$(IFS=,; echo "${peers[*]}")"
+  log "== partition: cut $m's host from etcd + Incus (TCP 2379/8443 <-> $ips) for ${CUT}s"
+  for p in "${hold[@]}"; do log "   holding $p out: systemctl stop $unit"; on "$p" "sudo systemctl stop $unit"; done
+  t=$( { time -p P move -c "$cfg" --to "$m" >/dev/null; } 2>&1 | awk '/real/{print $2}')
+  healthy_on "$m" || { miss "partition: could not move the service to $m first"; return; }
+  log "   $m serving (move ${t}s)"
+  rules="table inet drillcut {
+  chain in  { type filter hook input  priority -10; ip saddr { $ips } tcp sport { 2379, 8443 } drop; ip saddr { $ips } tcp dport { 2379, 8443 } drop; }
+  chain out { type filter hook output priority -10; ip daddr { $ips } tcp dport { 2379, 8443 } drop; ip daddr { $ips } tcp sport { 2379, 8443 } drop; }
+}"
+  on "$m" "sudo tee /run/pagurus-drillcut.nft" <<<"$rules" >/dev/null || { miss "partition: could not stage the rules on $m"; return; }
+  since=$(on "$m" "date '+%F %T'")
+  on "$m" "sudo systemd-run --unit=pagurus-drill-cut --collect -p RuntimeMaxSec=$((CUT + 30)) -p 'ExecStopPost=-/run/current-system/sw/bin/nft delete table inet drillcut' /run/current-system/sw/bin/bash -c 'nft -f /run/pagurus-drillcut.nft && sleep $CUT; nft delete table inet drillcut'" >/dev/null 2>&1 \
+    || { miss "partition: could not start the cut on $m"; return; }
+  t0=$SECONDS
+  if t=$(wait_for 180 some_other_healthy "$m"); then log "   $(leader) serving ${t}s after the cut (failover gap)"; else miss "partition: no failover within 180s (leader=$(leader) running=$(running_on))"; fi
+  wait_for $((CUT + 90)) online_in_incus "$m" >/dev/null || miss "partition: $m not ONLINE again"
+  on "$m" "sudo nft list table inet drillcut" >/dev/null 2>&1 && miss "partition: drillcut table still on $m"
+  log "   cut lifted, $m ONLINE $((SECONDS - t0))s after the cut"
+  agent_log "$m" "$since" | grep -m1 'kind=cgroup-kill' | sed 's/^/   /' || log "   (no cgroup-kill fence step on $m)"
+  agent_log "$m" "$since" | grep -q 'fence-self confirmed' || miss "partition: $m's self-fence not confirmed"
+  on "$m" "journalctl -u incus --since '$since' --no-pager -q" | grep -m1 'The stop hook failed to load' | sed 's/^.*level=/   incusd: level=/'
+
+  log "   move back to $m"
+  since=$(on "$m" "date '+%F %T'"); t0=$SECONDS
+  on "$CTL" "timeout 60 pagurus move -c $cfg --to $m" >/dev/null 2>&1
+  if healthy_on "$m"; then
+    log "   $m hosts the service again ($((SECONDS - t0))s): no leak"
+  else
+    start_failed() { agent_log "$m" "$since" | grep -q 'start failed'; }
+    wait_for 90 start_failed >/dev/null
+    agent_log "$m" "$since" | grep -m1 'start failed' | grep -q 'In use' && log "   $m: start failed: In use (leaked mount)" \
+      || agent_log "$m" "$since" | grep -m1 'start failed' | sed 's/^/   /'
+    if t=$(wait_for 300 some_other_healthy "$m"); then
+      log "   $(leader) serving again, $((SECONDS - t0))s after the move to $m (the move's outage)"
+    else
+      miss "partition: nobody healthy 300s after the failed move to $m"
+    fi
+    agent_log "$m" "$since" | grep -m1 'releasing the office' | sed 's/^/   /'
+    agent_log "$m" "$since" | grep -m1 'backing off after giving up' | sed 's/^/   /'
+    log "   $m unable to host (incusd leak: clear with an incus restart on $m, runbook §6)"
+  fi
+  for p in "${hold[@]}"; do log "   restarting $unit on $p"; restart_agent "$p"; done
+}
+
 drills=("$@"); [ ${#drills[@]} -gt 0 ] || drills=(move graceful restart crash pause)
 for d in "${drills[@]}"; do settle; "drill_$d"; done
 settle
 stop_audit
 trap - EXIT
+unhold
 log "== audit timeline"; sed 's/^/   /' "$audit_log"
 grep -q "^audit: .* 0 violations" "$audit_log" && ! grep -q VIOLATION "$audit_log" \
   || { log "AUDIT FAILED: two members ran at once (or the audit did not finish)"; fail=1; }
