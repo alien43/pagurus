@@ -53,6 +53,10 @@ type simMember struct {
 	stopFail  bool // `incus stop` does nothing
 	killFail  bool // cgroup.kill does not empty the cgroup
 	upFail    bool
+	// prepareFail: `up --no-start --recreate` deletes the instance and the
+	// create fails "In use" (an incusd that leaked the volume's mount
+	// refcount after a cgroup-kill fence), until incusd restarts.
+	prepareFail bool
 	// hideCgroup: cgroupfs shows no payload cgroup although Incus says it
 	// runs (a liblxc that names payload cgroups differently).
 	hideCgroup bool
@@ -211,9 +215,12 @@ func (r *simRT) Prepare(_ context.Context, m string) error {
 	if err := r.clusterOp(); err != nil {
 		return err
 	}
-	r.c.m[m].prepared = true
 	r.c.m[m].prepares++
 	r.c.m[m].running = false // `up --no-start --recreate`: a fresh, stopped instance
+	if r.c.m[m].prepareFail {
+		return errors.New("Creating instance: In use")
+	}
+	r.c.m[m].prepared = true
 	return nil
 }
 
@@ -887,6 +894,22 @@ func TestUnhealthyLeaderGivesUp(t *testing.T) {
 	h.waitRunning("dell", 20*time.Second)
 	h.sim.set("asus", func(m *simMember) { m.unhealthy = false })
 	h.holdOne("dell", 2*time.Second)
+}
+
+// Two members whose Incus cannot create the workload (2026-10-14: both
+// cgroup-kill fenced, both leaking the volume's mount refcount) must not
+// starve the third. With a fixed backoff shorter than a failed tenure the
+// poisoned pair took turns for ever: whenever one released, the other was
+// already back and ranked ahead of rpi5.
+func TestPoisonedPairDoesNotStarveTheThird(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Health.ReleaseBackoff = config.Duration(1500 * time.Millisecond) })
+	for _, m := range []string{"asus", "dell"} {
+		h.sim.set(m, func(m *simMember) { m.prepareFail = true })
+	}
+	h.startAll()
+	took := h.waitRunning("rpi5", 60*time.Second)
+	t.Logf("rpi5 serving %s after start", took.Round(100*time.Millisecond))
+	h.holdOne("rpi5", 2*time.Second)
 }
 
 func TestStrayInstanceOnFollowerIsStopped(t *testing.T) {
