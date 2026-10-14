@@ -319,7 +319,14 @@ func (t *termState) start() error {
 		return err
 	}
 	if err := a.rt.Start(uctx, a.member); err != nil {
-		return fmt.Errorf("start: %w", err)
+		// `up` can fail after the instance started (incus-compose's DNS
+		// records step, when another member is offline). If everything runs,
+		// the term goes on: returning here skipped the checks below and the
+		// endpoint, for a workload that was in fact serving.
+		if !t.allRunning(uctx) {
+			return fmt.Errorf("start: %w", err)
+		}
+		t.log.Warn("start reported an error, but every instance runs; carrying on", "err", err)
 	}
 	if still, err := a.co.StillLeader(context.WithoutCancel(uctx), t.epoch, t.lease); err == nil && !still {
 		a.alerter.Alert("deposed-at-start", "the office moved while starting; stopping at once", "member", a.member, "epoch", t.epoch)
@@ -347,6 +354,21 @@ func (t *termState) start() error {
 	}
 	t.publish()
 	return nil
+}
+
+// allRunning reports whether this member's project has instances and all of
+// them are Running.
+func (t *termState) allRunning(ctx context.Context) bool {
+	insts, err := t.a.rt.List(ctx, t.a.member)
+	if err != nil || len(insts) == 0 {
+		return false
+	}
+	for _, in := range insts {
+		if in.Status != incus.StatusRunning {
+			return false
+		}
+	}
+	return true
 }
 
 var (
