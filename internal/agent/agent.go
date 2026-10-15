@@ -113,9 +113,8 @@ type Agent struct {
 	fenceMu sync.Mutex // serialises self-fences
 
 	// Replication (replica.go); vols is nil without a replicate block.
-	vols       Volumes
-	pullMu     sync.Mutex         // held by a follower pull into this member's volumes
-	pullCancel context.CancelFunc // cancels that pull (under mu)
+	vols   Volumes
+	pullMu sync.Mutex // held by a follower pull into this member's volumes
 }
 
 type Options struct {

@@ -80,39 +80,29 @@ func (a *Agent) preflightReplica(ctx context.Context) error {
 
 // beginPull reserves this member's volumes for a pull. It refuses while a
 // term runs here or our workload is not confirmed stopped; a term that
-// begins later cancels the pull (stopPulls) and waits for it.
+// begins later waits for the pull to end (waitPulls).
 func (a *Agent) beginPull(ctx context.Context) (context.Context, func(), bool) {
 	if !a.pullMu.TryLock() {
 		return nil, nil, false
 	}
 	a.mu.Lock()
-	if a.termActive || !a.localStopped {
-		a.mu.Unlock()
+	ok := !a.termActive && a.localStopped
+	a.mu.Unlock()
+	if !ok {
 		a.pullMu.Unlock()
 		return nil, nil, false
 	}
-	pctx, cancel := context.WithCancel(ctx)
-	a.pullCancel = cancel
-	a.mu.Unlock()
-	return pctx, func() {
-		cancel()
-		a.mu.Lock()
-		a.pullCancel = nil
-		a.mu.Unlock()
-		a.pullMu.Unlock()
-	}, true
+	return ctx, a.pullMu.Unlock, true
 }
 
-// stopPulls cancels a follower pull in flight and waits until it has
-// returned, so nothing writes into our volumes once the term goes on. The
-// term is already active, so no new pull begins.
-func (a *Agent) stopPulls(ctx context.Context, within time.Duration) error {
-	a.mu.Lock()
-	cancel := a.pullCancel
-	a.mu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
+// waitPulls waits until a follower pull in flight has ended, so nothing
+// writes into our volumes once the term goes on. The term is already
+// active, so no new pull begins. It waits rather than cancels: killing the
+// incus client does not stop the copy server-side (the replica spike), so a
+// cancelled pull could go on receiving into a volume the workload is about
+// to use. A refresh lands whole or not at all, and fails quickly when its
+// source is gone, so waiting is safe and usually short.
+func (a *Agent) waitPulls(ctx context.Context, within time.Duration) error {
 	deadline := a.now().Add(within)
 	for !a.pullMu.TryLock() {
 		if a.now().After(deadline) {
@@ -300,7 +290,7 @@ func (t *termState) replicaTakeover() bool {
 	}
 	r := a.cfg.Replicate
 	a.beat(2*r.CatchupTimeout.D() + time.Minute)
-	if err := a.stopPulls(t.op, r.CatchupTimeout.D()); err != nil {
+	if err := a.waitPulls(t.op, r.CatchupTimeout.D()); err != nil {
 		t.giveUp("replicate: "+err.Error(), a.cfg.EligibleInterval.D())
 		return false
 	}

@@ -344,7 +344,9 @@ pre-hook, if any) and publishes the round (`<prefix>/replica/source`, a guarded 
 **A follower** pulls the current leader's published snapshot with `incus storage volume copy
 --refresh`. It reads the leader's epoch before and after, and a copy made while the office moved
 is not published. It never pulls while a term runs on it or its own workload isn't confirmed
-stopped (rule 1): a new term cancels an in-flight pull and waits for it before going on.
+stopped (rule 1). A new term waits for an in-flight pull to end, up to `catchup_timeout`, and gives
+up the office past that. It waits rather than cancels, because killing the `incus` client doesn't stop
+the copy server-side.
 
 **Rule 4: never destroy the loser's data.** Before a pull overwrites its volume, the member checks
 whether the volume holds writes the source lacks. It does when any of these holds:

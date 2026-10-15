@@ -107,6 +107,14 @@ func (c *simCluster) check(what string) {
 	}
 	slices.Sort(on)
 	c.maxRunning = max(c.maxRunning, n)
+	if c.vol != nil { // replication sims: each member's counter when it stopped
+		for name, m := range c.m {
+			if !m.running && slices.Contains(c.vol.wasRunning, name) {
+				c.vol.stopHead[name] = c.volume(name, "data").head
+			}
+		}
+		c.vol.wasRunning = on
+	}
 	switch {
 	case n > 1 && c.tolerate:
 		if c.overlapSince.IsZero() {

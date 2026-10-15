@@ -52,21 +52,23 @@ func (v *simVol) clone() *simVol {
 }
 
 type simRepl struct {
-	vols      map[string]map[string]*simVol // member -> volume -> data
-	pullDelay map[string]time.Duration      // per pulling member
-	pulling   map[string]bool
-	startHead map[string]int64 // the data volume's counter at the last start, per member
-	pulled    map[string]int64 // the counter the last complete refresh left, per member
-	refreshes map[string]int   // complete refreshes into a member
-	failed    map[string]int   // failed or cancelled refreshes into a member
-	hooks     map[string]int
-	calls     int // every volume call, any member
+	vols       map[string]map[string]*simVol // member -> volume -> data
+	pullDelay  map[string]time.Duration      // per pulling member
+	pulling    map[string]bool
+	startHead  map[string]int64 // the data volume's counter at the last start, per member
+	stopHead   map[string]int64 // ... and at the last stop
+	wasRunning []string
+	pulled     map[string]int64 // the counter the last complete refresh left, per member
+	refreshes  map[string]int   // complete refreshes into a member
+	failed     map[string]int   // failed or cancelled refreshes into a member
+	hooks      map[string]int
+	calls      int // every volume call, any member
 }
 
 func (c *simCluster) repl() *simRepl {
 	if c.vol == nil {
 		c.vol = &simRepl{vols: map[string]map[string]*simVol{}, pullDelay: map[string]time.Duration{}, pulling: map[string]bool{},
-			startHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}}
+			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}}
 	}
 	return c.vol
 }
@@ -274,6 +276,12 @@ func (h *harness) head(m string) int64 {
 	return h.sim.volume(m, "data").head
 }
 
+func (h *harness) stopHead(m string) int64 {
+	h.sim.mu.Lock()
+	defer h.sim.mu.Unlock()
+	return h.sim.repl().stopHead[m]
+}
+
 func (h *harness) startHead(m string) int64 {
 	h.sim.mu.Lock()
 	defer h.sim.mu.Unlock()
@@ -350,7 +358,7 @@ func TestReplicaCleanMove(t *testing.T) {
 	}
 	h.waitRunning("rpi5", 15*time.Second)
 	_ = h.coord().SetPin(context.Background(), "")
-	if old, got := h.head("asus"), h.startHead("rpi5"); got != old {
+	if old, got := h.stopHead("asus"), h.startHead("rpi5"); got != old {
 		t.Fatalf("rpi5 started from %d, asus stopped at %d: a clean move lost %d writes", got, old, old-got)
 	}
 	h.waitFor("asus pulled from the new leader", 10*time.Second, func() bool { return h.pulledFromLeader("asus") })
@@ -371,7 +379,7 @@ func TestReplicaAgentCrashLosesNothing(t *testing.T) {
 	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
 	h.nodes["asus"].crash()
 	h.waitRunning("dell", 20*time.Second)
-	if old, got := h.head("asus"), h.startHead("dell"); got != old {
+	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
 		t.Fatalf("dell started from %d, asus was fenced at %d: lost %d writes", got, old, old-got)
 	}
 }
@@ -521,7 +529,7 @@ func TestReplicaPartitionedLeaderWritesBecomeOrphan(t *testing.T) {
 	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
 	h.partition("asus", true)
 	h.waitRunning("dell", 30*time.Second)
-	fenced := h.head("asus")
+	fenced := h.stopHead("asus")
 	if fenced <= h.startHead("dell") {
 		t.Fatalf("asus stopped at %d, dell started from %d: the partition wrote nothing past the last copy?", fenced, h.startHead("dell"))
 	}
