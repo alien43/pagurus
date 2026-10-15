@@ -469,6 +469,19 @@ func (t *termState) audit() {
 	}
 }
 
+// notRetryable reports a start error that another attempt on this member,
+// one health interval later, would hit again, so the office goes to another
+// member at once instead of after max_restarts attempts (~15 s each through
+// incus-compose: 42 s in the 2026-10-15 move drill).
+//   - "address already in use": something outside this term holds the
+//     workload's host port (the drill's hold, a leaked forkproxy).
+//   - Incus's "In use": incusd leaked the volume's mount refcount after a
+//     cgroup-kill fence and refuses the create until it restarts (2026-10-14).
+func notRetryable(err error) bool {
+	s := err.Error()
+	return strings.Contains(s, "address already in use") || strings.Contains(s, ": In use")
+}
+
 // supervise starts the workload and keeps it healthy for the rest of the term.
 func (t *termState) supervise() {
 	a := t.a
@@ -478,7 +491,7 @@ func (t *termState) supervise() {
 	// startOnce starts the workload; false means the term is over. A start
 	// that fails is retried one health interval later, within the same
 	// max_restarts budget as unhealthy restarts, and then the office is
-	// given up. start_period and the failure count are for a workload that
+	// given up (at once if notRetryable). start_period and the failure count are for a workload that
 	// started and is slow to answer; waiting them out after a create or
 	// start that failed ("In use", "address already in use") only delayed
 	// the handover (~135 s per failed term on 2026-10-14).
@@ -503,7 +516,7 @@ func (t *termState) supervise() {
 				t.giveUp(err.Error(), 0)
 				return false
 			}
-			if restarts >= hc.MaxRestarts {
+			if restarts >= hc.MaxRestarts || notRetryable(err) {
 				backoff, streak := a.releaseBackoff(everHealthy)
 				a.alerter.Alert("unhealthy", "workload does not start; giving the office up", "member", a.member, "err", err.Error(),
 					"backoff", backoff, "failed_terms", streak)
