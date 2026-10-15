@@ -37,7 +37,7 @@ jobs:
           CGO_ENABLED=0 go build ./...
 
       - name: Test (race)
-        run: go test -race -count=1 -v ./... 2>&1 | tee test.log; test ${PIPESTATUS[0]} -eq 0
+        run: go test -race -count=1 -timeout 25m -v ./... 2>&1 | tee test.log; test ${PIPESTATUS[0]} -eq 0
 
       # testutil.Etcd / EtcdTLS skip when no etcd binary is found; in CI that
       # would turn every integration test into a silent pass. Other skips are

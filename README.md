@@ -572,7 +572,7 @@ internal/agent/replica.go  replication: the leader's rounds, the follower's pull
 ## Running it
 
 ```fish
-go test ./...                              # needs an `etcd` binary on PATH; ~3 min. The sim
+go test ./...                              # needs an `etcd` binary on PATH; ~6 min (~13 under -race). The sim
                                            # builds the conch pinned in go.mod (a tool dep)
 pagurus status -c <cfg>                    # on a member: office, records, instances
 pagurus refresh -c <cfg>                   # leader pulls, recreates in place; waits until healthy
