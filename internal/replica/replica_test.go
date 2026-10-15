@@ -52,7 +52,9 @@ func TestNewestAndPrune(t *testing.T) {
 // Diverged is rule 4: does this member's volume hold writes the source does
 // not have? Snapshot epochs and the last epoch the member led decide it.
 func TestDiverged(t *testing.T) {
-	s := func(e int64, min int, final bool) string { return Name(e, t0.Add(time.Duration(min)*time.Minute), final) }
+	s := func(e int64, min int, final bool) string {
+		return Name(e, t0.Add(time.Duration(min)*time.Minute), final)
+	}
 	cases := []struct {
 		name          string
 		local, source []string
