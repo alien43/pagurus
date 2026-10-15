@@ -408,3 +408,154 @@ func (c *Coord) GetEndpoint(ctx context.Context) (*Endpoint, error) {
 	ep := &Endpoint{}
 	return ep, json.Unmarshal(resp.Kvs[0].Value, ep)
 }
+
+// ------------------------------------------------------------- replication -
+//
+//	<prefix>/replica/source        ReplicaSource: the leader's newest snapshot,
+//	                               a guarded write after every round.
+//	<prefix>/replica/led/<member>  the last epoch <member> led with replication
+//	                               (decimal), a guarded write before its
+//	                               workload starts. Rule 4 reads it.
+//	<prefix>/replica/m/<member>    ReplicaCopy: <member>'s last complete pull.
+//	<prefix>/replica/accept-stale  AcceptStale: one term may start past the
+//	                               staleness gate (`pagurus accept-stale`).
+
+// ReplicaSource is what the leader published after its last snapshot round.
+type ReplicaSource struct {
+	Member   string    `json:"member"`
+	Epoch    int64     `json:"epoch"`
+	Snapshot string    `json:"snapshot"`
+	At       time.Time `json:"at"`
+}
+
+// ReplicaCopy is a follower's record of its last complete pull.
+type ReplicaCopy struct {
+	Snapshot    string    `json:"snapshot"`
+	SourceEpoch int64     `json:"source_epoch"`
+	At          time.Time `json:"at"`
+	// Orphaned is the key (replica.Divergence.Key) of the last divergence
+	// this member preserved, so the same one is not preserved twice.
+	Orphaned string `json:"orphaned,omitempty"`
+}
+
+// AcceptStale lets one term start past the staleness gate. Member "" means
+// any member's next term.
+type AcceptStale struct {
+	Member string    `json:"member,omitempty"`
+	By     string    `json:"by"`
+	At     time.Time `json:"at"`
+	// ModRev is filled on read (not stored).
+	ModRev int64 `json:"-"`
+}
+
+func (c *Coord) ReplicaSourceKey() string            { return c.prefix + "/replica/source" }
+func (c *Coord) ReplicaLedKey(member string) string  { return c.prefix + "/replica/led/" + member }
+func (c *Coord) ReplicaCopyKey(member string) string { return c.prefix + "/replica/m/" + member }
+func (c *Coord) AcceptStaleKey() string              { return c.prefix + "/replica/accept-stale" }
+
+func (c *Coord) OpPutReplicaSource(s ReplicaSource) clientv3.Op {
+	return clientv3.OpPut(c.ReplicaSourceKey(), mustJSON(s))
+}
+
+func (c *Coord) OpPutReplicaLed(member string, epoch int64) clientv3.Op {
+	return clientv3.OpPut(c.ReplicaLedKey(member), fmt.Sprint(epoch))
+}
+
+// ReplicaSource returns the leader's last published round, or nil.
+func (c *Coord) ReplicaSource(ctx context.Context) (*ReplicaSource, error) {
+	var s ReplicaSource
+	ok, err := c.getJSON(ctx, c.ReplicaSourceKey(), &s)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return &s, nil
+}
+
+// ReplicaLed returns every member's last replicated term epoch.
+func (c *Coord) ReplicaLed(ctx context.Context) (map[string]int64, error) {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	pfx := c.prefix + "/replica/led/"
+	resp, err := c.cli.Get(cctx, pfx, clientv3.WithPrefix())
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]int64{}
+	for _, kv := range resp.Kvs {
+		var e int64
+		if _, err := fmt.Sscan(string(kv.Value), &e); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", kv.Key, err)
+		}
+		out[strings.TrimPrefix(string(kv.Key), pfx)] = e
+	}
+	return out, nil
+}
+
+// ReplicaCopy returns member's last complete pull, or nil.
+func (c *Coord) ReplicaCopy(ctx context.Context, member string) (*ReplicaCopy, error) {
+	var r ReplicaCopy
+	ok, err := c.getJSON(ctx, c.ReplicaCopyKey(member), &r)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return &r, nil
+}
+
+// PutReplicaCopy records member's pull. Only member writes its own record.
+func (c *Coord) PutReplicaCopy(ctx context.Context, member string, r ReplicaCopy) error {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	_, err := c.cli.Put(cctx, c.ReplicaCopyKey(member), mustJSON(r))
+	return err
+}
+
+// SetAcceptStale is the operator override of the staleness gate.
+func (c *Coord) SetAcceptStale(ctx context.Context, a AcceptStale) error {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	_, err := c.cli.Put(cctx, c.AcceptStaleKey(), mustJSON(a))
+	return err
+}
+
+// GetAcceptStale returns the pending override, or nil.
+func (c *Coord) GetAcceptStale(ctx context.Context) (*AcceptStale, error) {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.cli.Get(cctx, c.AcceptStaleKey())
+	if err != nil || len(resp.Kvs) == 0 {
+		return nil, err
+	}
+	var a AcceptStale
+	if err := json.Unmarshal(resp.Kvs[0].Value, &a); err != nil {
+		return nil, err
+	}
+	a.ModRev = resp.Kvs[0].ModRevision
+	return &a, nil
+}
+
+// ConsumeAcceptStale deletes the override read at modRev, only while (epoch,
+// lease) holds the office: one override starts one term.
+func (c *Coord) ConsumeAcceptStale(ctx context.Context, epoch int64, lease clientv3.LeaseID, modRev int64) error {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	cmps := append(c.leaderGuard(epoch, lease), clientv3.Compare(clientv3.ModRevision(c.AcceptStaleKey()), "=", modRev))
+	resp, err := c.cli.Txn(cctx).If(cmps...).Then(clientv3.OpDelete(c.AcceptStaleKey())).Commit()
+	if err != nil {
+		return err
+	}
+	if !resp.Succeeded {
+		return errors.New("accept-stale changed, or the office moved, while consuming it")
+	}
+	return nil
+}
+
+// getJSON reads key into v; ok is false when it is absent.
+func (c *Coord) getJSON(ctx context.Context, key string, v any) (bool, error) {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.cli.Get(cctx, key)
+	if err != nil || len(resp.Kvs) == 0 {
+		return false, err
+	}
+	return true, json.Unmarshal(resp.Kvs[0].Value, v)
+}

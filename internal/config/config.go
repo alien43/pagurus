@@ -233,6 +233,35 @@ type Watchdog struct {
 	Arm bool `json:"arm"`
 }
 
+// Replicate makes a stateful service's custom volumes follow the office
+// (README "Replication"). Opt-in: a service without it replicates nothing.
+type Replicate struct {
+	// Pool is the Incus storage pool the volumes live on, on every member.
+	Pool string `json:"pool"`
+	// Volumes are custom volumes of the same name in every member's project.
+	Volumes []string `json:"volumes"`
+	// Interval: the leader snapshots every volume this often; it bounds the
+	// data lost when the leader dies unreachable (plus one copy time).
+	Interval Duration `json:"interval"`
+	// MaxStaleness: a new leader whose newest snapshot is older than this
+	// does not start (unless `pagurus accept-stale`).
+	MaxStaleness Duration `json:"max_staleness"`
+	// Keep is how many pagurus snapshots each volume keeps.
+	Keep int `json:"keep"`
+	// CatchupTimeout bounds a new leader's pull of the previous holder's
+	// final state at takeover.
+	CatchupTimeout Duration `json:"catchup_timeout"`
+	// PreHook, if set, runs in an instance of the leader's project just
+	// before each snapshot (an application-consistent point).
+	PreHook *Hook `json:"pre_hook,omitempty"`
+}
+
+// Hook is a command run inside an instance.
+type Hook struct {
+	Instance string   `json:"instance"`
+	Command  []string `json:"command"`
+}
+
 // Start configures the starter.
 type Start struct {
 	// Kind is "compose" (incus-compose up) or "instances" (start
@@ -284,6 +313,8 @@ type Config struct {
 	Fence      Fence     `json:"fence"`
 	Health     Health    `json:"health"`
 	Watchdog   Watchdog  `json:"watchdog"`
+	// Replicate, if set, replicates the service's volumes (opt-in).
+	Replicate *Replicate `json:"replicate,omitempty"`
 
 	// Conch says which conch runs the office (`conch elect`).
 	Conch Conch `json:"conch"`
@@ -398,6 +429,17 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Watchdog.Mode == WatchdogDevice || c.Watchdog.Mode == WatchdogDryRun {
 		def(&c.Watchdog.Timeout, 60*time.Second)
+	}
+	if r := c.Replicate; r != nil {
+		if r.Pool == "" {
+			r.Pool = "default"
+		}
+		def(&r.Interval, 15*time.Minute)
+		def(&r.MaxStaleness, 2*time.Hour)
+		def(&r.CatchupTimeout, 10*time.Minute)
+		if r.Keep == 0 {
+			r.Keep = 4
+		}
 	}
 }
 
@@ -540,6 +582,36 @@ func (c *Config) Validate() error {
 	if c.Health.ReleaseBackoffMax.D() < c.Health.ReleaseBackoff.D() {
 		bad("health.release_backoff_max %s: must be >= health.release_backoff %s", c.Health.ReleaseBackoffMax.D(), c.Health.ReleaseBackoff.D())
 	}
+	if r := c.Replicate; r != nil {
+		if r.Pool == "" {
+			bad("replicate.pool: required")
+		}
+		if len(r.Volumes) == 0 {
+			bad("replicate.volumes: at least one volume (omit the replicate block to replicate nothing)")
+		}
+		vs := map[string]bool{}
+		for _, v := range r.Volumes {
+			if !nameRE.MatchString(v) {
+				bad("replicate.volumes: %q must match %s", v, nameRE)
+			}
+			if vs[v] {
+				bad("replicate.volumes: %q listed twice", v)
+			}
+			vs[v] = true
+		}
+		if r.Interval <= 0 || r.CatchupTimeout <= 0 {
+			bad("replicate.interval and replicate.catchup_timeout must be > 0")
+		}
+		if r.MaxStaleness.D() <= r.Interval.D() {
+			bad("replicate.max_staleness %s must be > replicate.interval %s, or every failover is refused", r.MaxStaleness.D(), r.Interval.D())
+		}
+		if r.Keep < 2 {
+			bad("replicate.keep %d: must be >= 2 (a follower increments from a snapshot both sides still have)", r.Keep)
+		}
+		if h := r.PreHook; h != nil && (h.Instance == "" || len(h.Command) == 0) {
+			bad("replicate.pre_hook: needs instance and command")
+		}
+	}
 	return errors.Join(errs...)
 }
 
@@ -607,7 +679,9 @@ func (c *Config) SafetyHash() string {
 		Self, Peer    []fence.Spec
 		Fence         Fence
 		Start         Start
-	}{c.Members, c.ProjectPrefix, c.EtcdPrefix, c.Lease, c.SelfFences(), c.PeerFences(), c.Fence, start})
+		// Only when set, so a config without it hashes as before.
+		Replicate *Replicate `json:",omitempty"`
+	}{c.Members, c.ProjectPrefix, c.EtcdPrefix, c.Lease, c.SelfFences(), c.PeerFences(), c.Fence, start, c.Replicate})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:8])
 }

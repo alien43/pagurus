@@ -264,3 +264,61 @@ func TestClearPinIf(t *testing.T) {
 		t.Fatalf("pin %q after clearing", p)
 	}
 }
+
+func TestReplicaKeys(t *testing.T) {
+	cli, co := setup(t)
+	ctx := context.Background()
+	if s, err := co.ReplicaSource(ctx); err != nil || s != nil {
+		t.Fatalf("ReplicaSource on an empty store = %v, %v", s, err)
+	}
+	_, epoch, lease := campaign(t, cli, co)
+	src := coord.ReplicaSource{Member: "asus", Epoch: epoch, Snapshot: "pagurus-1-20261015T220000000Z", At: time.Now().UTC()}
+	if err := co.Guarded(ctx, epoch, lease, co.OpPutReplicaSource(src), co.OpPutReplicaLed("asus", epoch)); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.Guarded(ctx, epoch+1000, lease, co.OpPutReplicaLed("dell", epoch+1000)); !errors.Is(err, coord.ErrNotLeader) {
+		t.Fatalf("a superseded term wrote replica/led: %v", err)
+	}
+	got, err := co.ReplicaSource(ctx)
+	if err != nil || got == nil || got.Snapshot != src.Snapshot || got.Epoch != epoch {
+		t.Fatalf("ReplicaSource = %+v, %v", got, err)
+	}
+	led, err := co.ReplicaLed(ctx)
+	if err != nil || len(led) != 1 || led["asus"] != epoch {
+		t.Fatalf("ReplicaLed = %v, %v", led, err)
+	}
+	if err := co.PutReplicaCopy(ctx, "dell", coord.ReplicaCopy{Snapshot: src.Snapshot, SourceEpoch: epoch, Orphaned: "k"}); err != nil {
+		t.Fatal(err)
+	}
+	if rc, err := co.ReplicaCopy(ctx, "dell"); err != nil || rc == nil || rc.Orphaned != "k" {
+		t.Fatalf("ReplicaCopy = %+v, %v", rc, err)
+	}
+	if ms, err := co.MemberStates(ctx); err != nil || len(ms) != 0 {
+		t.Fatalf("replica keys leaked into member states: %v, %v", ms, err)
+	}
+}
+
+func TestAcceptStaleIsConsumedOnceByTheLeader(t *testing.T) {
+	cli, co := setup(t)
+	ctx := context.Background()
+	if err := co.SetAcceptStale(ctx, coord.AcceptStale{Member: "dell", By: "op", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	a, err := co.GetAcceptStale(ctx)
+	if err != nil || a == nil || a.Member != "dell" || a.ModRev == 0 {
+		t.Fatalf("GetAcceptStale = %+v, %v", a, err)
+	}
+	_, epoch, lease := campaign(t, cli, co)
+	if err := co.ConsumeAcceptStale(ctx, epoch+1, lease, a.ModRev); err == nil {
+		t.Fatal("a superseded term consumed accept-stale")
+	}
+	if err := co.ConsumeAcceptStale(ctx, epoch, lease, a.ModRev); err != nil {
+		t.Fatal(err)
+	}
+	if err := co.ConsumeAcceptStale(ctx, epoch, lease, a.ModRev); err == nil {
+		t.Fatal("accept-stale consumed twice")
+	}
+	if a, _ := co.GetAcceptStale(ctx); a != nil {
+		t.Fatalf("accept-stale still there: %+v", a)
+	}
+}
