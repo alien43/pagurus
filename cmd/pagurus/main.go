@@ -358,17 +358,31 @@ func cmdMove(ctx context.Context, cfg *config.Config, cli *clientv3.Client, to s
 	}
 	co := coord.New(cli, cfg.EtcdPrefix, cfg.Etcd.OpTimeout.D())
 	// The pin outlives this command by at most a minute if it is killed.
-	if err := co.PinFor(ctx, to, timeout+time.Minute); err != nil {
+	pinRev, err := co.PinFor(ctx, to, timeout+time.Minute)
+	if err != nil {
 		return err
 	}
+	// However move ends (success, give-up, timeout, Ctrl-C), it drops its own
+	// pin, and only its own: one another move wrote since stays.
 	defer func() {
-		if err := co.SetPin(context.Background(), ""); err != nil {
+		if cleared, err := co.ClearPinIf(context.Background(), pinRev); err != nil {
 			fmt.Fprintln(os.Stderr, "WARNING: could not clear the pin:", err)
+		} else if !cleared {
+			fmt.Fprintln(os.Stderr, "the pin changed since this move wrote it (or expired); left as it is")
 		}
 	}()
 	fmt.Printf("pinned office to %s; waiting for it to take over\n", to)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
+		// A release by the target written after the pin means it won and
+		// could not host: stop holding everyone else out of the campaign.
+		// Mod revisions, not timestamps: no clock skew, and an older record
+		// from before this move never counts.
+		if states, err := co.MemberStates(ctx); err == nil {
+			if s, ok := states[to]; ok && s.State == coord.Stopped && s.ModRev > pinRev && strings.HasPrefix(s.Reason, "released: ") {
+				return fmt.Errorf("%s gave up: %s; pin cleared, normal election resumes", to, strings.TrimPrefix(s.Reason, "released: "))
+			}
+		}
 		rec, _, _, _, err := co.Leader(ctx)
 		if err == nil && rec != nil && rec.Member == to {
 			if ep, _ := co.GetEndpoint(ctx); ep != nil && ep.Member == to {

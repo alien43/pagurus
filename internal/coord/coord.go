@@ -336,16 +336,35 @@ func (c *Coord) Pin(ctx context.Context) (string, error) {
 
 // PinFor pins the office to member under a lease of ttl, so a pin whose
 // setter dies (a killed `pagurus move`) expires instead of leaving only that
-// member allowed to campaign, forever.
-func (c *Coord) PinFor(ctx context.Context, member string, ttl time.Duration) error {
+// member allowed to campaign, forever. It returns the pin's mod revision, for
+// ClearPinIf and for telling records written since the pin from older ones.
+func (c *Coord) PinFor(ctx context.Context, member string, ttl time.Duration) (int64, error) {
 	cctx, cancel := c.ctx(ctx)
 	defer cancel()
 	lease, err := c.cli.Grant(cctx, int64(max(ttl/time.Second, 1)))
 	if err != nil {
-		return err
+		return 0, err
 	}
-	_, err = c.cli.Put(cctx, c.PinKey(), member, clientv3.WithLease(lease.ID))
-	return err
+	resp, err := c.cli.Put(cctx, c.PinKey(), member, clientv3.WithLease(lease.ID))
+	if err != nil {
+		return 0, err
+	}
+	return resp.Header.Revision, nil
+}
+
+// ClearPinIf deletes the pin only while it is still the one written at rev,
+// so a move never clears a pin another move wrote since. cleared is false if
+// the pin had changed or was gone.
+func (c *Coord) ClearPinIf(ctx context.Context, rev int64) (cleared bool, err error) {
+	cctx, cancel := c.ctx(ctx)
+	defer cancel()
+	resp, err := c.cli.Txn(cctx).
+		If(clientv3.Compare(clientv3.ModRevision(c.PinKey()), "=", rev)).
+		Then(clientv3.OpDelete(c.PinKey())).Commit()
+	if err != nil {
+		return false, err
+	}
+	return resp.Succeeded, nil
 }
 
 func (c *Coord) SetPin(ctx context.Context, member string) error {

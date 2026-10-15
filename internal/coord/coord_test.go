@@ -218,7 +218,7 @@ func TestRegistrationsPinEndpoint(t *testing.T) {
 func TestPinForExpires(t *testing.T) {
 	ctx := context.Background()
 	_, co := setup(t)
-	if err := co.PinFor(ctx, "rpi5", 2*time.Second); err != nil {
+	if _, err := co.PinFor(ctx, "rpi5", 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if p, _ := co.Pin(ctx); p != "rpi5" {
@@ -233,5 +233,34 @@ func TestPinForExpires(t *testing.T) {
 			t.Fatal("pin still set 10s after its 2s lease")
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// TestClearPinIf: only the pin written at rev is cleared.
+func TestClearPinIf(t *testing.T) {
+	ctx := context.Background()
+	_, co := setup(t)
+	rev, err := co.PinFor(ctx, "dell", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := co.SetPin(ctx, "rpi5"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := co.ClearPinIf(ctx, rev); err != nil || ok {
+		t.Fatalf("cleared a newer pin: %v %v", ok, err)
+	}
+	if p, _ := co.Pin(ctx); p != "rpi5" {
+		t.Fatalf("pin %q, want rpi5", p)
+	}
+	rev, err = co.PinFor(ctx, "dell", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := co.ClearPinIf(ctx, rev); err != nil || !ok {
+		t.Fatalf("own pin not cleared: %v %v", ok, err)
+	}
+	if p, _ := co.Pin(ctx); p != "" {
+		t.Fatalf("pin %q after clearing", p)
 	}
 }
