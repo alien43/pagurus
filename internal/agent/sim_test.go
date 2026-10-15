@@ -43,6 +43,8 @@ type simCluster struct {
 	tolerate     bool
 	overlapSince time.Time
 	maxOverlap   time.Duration
+
+	vol *simRepl // volumes (replica_sim_test.go), made on first use
 }
 
 type simMember struct {
@@ -267,6 +269,7 @@ func (r *simRT) Start(_ context.Context, m string) error {
 		return errors.New("DNSWatcher: instance(svc-1): updating dnsmasq records: peer node is down")
 	}
 	r.c.m[m].running = true
+	r.c.repl().startHead[m] = r.c.volume(m, "data").head
 	r.c.check("up on " + m)
 	return nil
 }
