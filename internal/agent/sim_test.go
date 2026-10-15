@@ -61,6 +61,9 @@ type simMember struct {
 	// create fails "In use" (an incusd that leaked the volume's mount
 	// refcount after a cgroup-kill fence), until incusd restarts.
 	prepareFail bool
+	// prepareErr overrides prepareFail's error text ("Creating instance:
+	// In use" when empty), e.g. with one a retry could fix.
+	prepareErr string
 	// hideCgroup: cgroupfs shows no payload cgroup although Incus says it
 	// runs (a liblxc that names payload cgroups differently).
 	hideCgroup bool
@@ -222,6 +225,9 @@ func (r *simRT) Prepare(_ context.Context, m string) error {
 	r.c.m[m].prepares++
 	r.c.m[m].running = false // `up --no-start --recreate`: a fresh, stopped instance
 	if r.c.m[m].prepareFail {
+		if e := r.c.m[m].prepareErr; e != "" {
+			return errors.New(e)
+		}
 		return errors.New("Creating instance: In use")
 	}
 	r.c.m[m].prepared = true
@@ -928,8 +934,10 @@ func TestPoisonedPairStarvesTheThirdWithFixedBackoff(t *testing.T) {
 		c.Health.ReleaseBackoff = config.Duration(1500 * time.Millisecond)
 		c.Health.ReleaseBackoffMax = c.Health.ReleaseBackoff
 	})
+	// A retryable error: each failed tenure spends its max_restarts, the
+	// tenure length this control was written against.
 	for _, m := range []string{"asus", "dell"} {
-		h.sim.set(m, func(m *simMember) { m.prepareFail = true })
+		h.sim.set(m, func(m *simMember) { m.prepareFail, m.prepareErr = true, retryableStartErr })
 	}
 	h.startAll()
 	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
@@ -977,7 +985,7 @@ func TestFailedStartGivesUpWithoutWaitingOutTheStartPeriod(t *testing.T) {
 	// runner a correct give-up still takes ~3.4 s (1.3 s on nucbox), and a
 	// 3 s period with a 3 s threshold failed there on 2026-10-14.
 	h := newHarness(t, func(c *config.Config) { c.Health.StartPeriod = config.Duration(10 * time.Second) })
-	h.sim.set("asus", func(m *simMember) { m.prepareFail = true })
+	h.sim.set("asus", func(m *simMember) { m.prepareFail, m.prepareErr = true, retryableStartErr })
 	h.startAll()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
 		h.sim.mu.Lock()
@@ -1000,6 +1008,30 @@ func TestFailedStartGivesUpWithoutWaitingOutTheStartPeriod(t *testing.T) {
 	h.sim.mu.Unlock()
 	if want := h.cfg.Health.MaxRestarts + 1; n != want {
 		t.Fatalf("asus tried %d starts, want %d (1 + max_restarts)", n, want)
+	}
+}
+
+// retryableStartErr is a start failure a retry might fix (not matched by
+// notRetryable), for tests about the retry budget itself.
+const retryableStartErr = "Creating instance: Failed to create mount directory: context deadline exceeded"
+
+// A start that fails on something a retry on this member can't fix gives the
+// office up at once, without spending max_restarts (2026-10-15 drill: rpi5
+// spent 42 s on three "address already in use" attempts before releasing).
+func TestNotRetryableStartGivesUpAtOnce(t *testing.T) {
+	for _, e := range []string{
+		"Creating instance: In use",
+		"Error occurred when starting proxy device: Error: Failed to listen on 0.0.0.0:8150: listen tcp 0.0.0.0:8150: bind: address already in use",
+	} {
+		t.Run(e[len(e)-20:], func(t *testing.T) {
+			h := newHarness(t, func(c *config.Config) { c.Health.MaxRestarts = 3 })
+			h.sim.set("asus", func(m *simMember) { m.prepareFail, m.prepareErr = true, e })
+			h.startAll()
+			h.waitRunning("dell", 20*time.Second)
+			if n := h.prepares("asus"); n != 1 {
+				t.Fatalf("asus tried %d starts on %q, want 1 (no retries)", n, e)
+			}
+		})
 	}
 }
 
