@@ -31,6 +31,7 @@ import (
 	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/metrics"
 	"github.com/alien43/pagurus/internal/provision"
+	"github.com/alien43/pagurus/internal/replica"
 	"github.com/alien43/pagurus/internal/start"
 	"github.com/alien43/pagurus/internal/versions"
 	"github.com/alien43/pagurus/internal/watchdog"
@@ -50,13 +51,17 @@ commands:
               pagurus refresh -c cfg [--timeout 5m]; waits until healthy
   fence-ack   operator override: record that a member is verified down
               pagurus fence-ack -c cfg --member <member>
+  accept-stale operator override (replicate): let the next term start from
+              a copy older than replicate.max_staleness, once:
+              pagurus accept-stale -c cfg [--member <member>]
   fence-check read-only: run Confirm of every fence in this member's self
               chain and print what each would do (safe on production)
               pagurus fence-check -c cfg --member <member>
               Run it ON that member: incus-stop and cgroup-kill confirm
               from the local cgroupfs.
-  provision   create the per-member cluster groups (host-<member>) and pinned
-              projects: pagurus provision -c cfg [--dry-run] [--yes]
+  provision   create the per-member cluster groups (host-<member>), pinned
+              projects and (replicate) each member's replicated volumes:
+              pagurus provision -c cfg [--dry-run] [--yes]
               (group changes need --yes or an interactive "y")
   fence-run   run ONE fence of this member's self chain for real (drills on
               scratch projects): pagurus fence-run -c cfg --member <m>
@@ -86,7 +91,7 @@ func main() {
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	cfgPath := fs.String("c", "", "config file")
 	to := fs.String("to", "", "move: target member")
-	member := fs.String("member", "", "fence-ack: member to acknowledge; fence-check: member whose chain to check")
+	member := fs.String("member", "", "fence-ack: member to acknowledge; fence-check: member whose chain to check; accept-stale: the member that may start (default any)")
 	every := fs.Duration("every", time.Second, "audit: poll interval")
 	dur := fs.Duration("for", 0, "audit: stop after this long (0 = until interrupted)")
 	jsonLog := fs.Bool("json", false, "run: log as JSON")
@@ -125,7 +130,11 @@ func main() {
 	}
 	api := incus.NewClient(incus.ClientOptions{Socket: cfg.Incus.Socket, URL: cfg.Incus.URL,
 		ClientCert: cfg.Incus.ClientCert, ClientKey: cfg.Incus.ClientKey, ServerCert: cfg.Incus.ServerCert})
-	drv := incus.New(incus.Options{ProjectPrefix: cfg.ProjectPrefix, API: api})
+	dopts := incus.Options{ProjectPrefix: cfg.ProjectPrefix, API: api}
+	if cfg.Replicate != nil {
+		dopts.Pool = cfg.Replicate.Pool
+	}
+	drv := incus.New(dopts)
 	rt := &runtime{Driver: drv, Starter: newStarter(cfg, drv)}
 
 	switch cmd {
@@ -143,6 +152,8 @@ func main() {
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdRefresh(ctx, cfg, cli, *timeout) })
 	case "fence-ack":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdFenceAck(ctx, cfg, cli, *member) })
+	case "accept-stale":
+		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdAcceptStale(ctx, cfg, cli, *member) })
 	case "audit":
 		err = cmdAudit(ctx, cfg, drv, *every, *dur)
 	case "fence-check":
@@ -349,6 +360,52 @@ func cmdStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, cli *c
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", m, online, ag, wd, st, strings.Join(insts, ","))
 	}
+	if err := tw.Flush(); err != nil || cfg.Replicate == nil {
+		return err
+	}
+	return replicaStatus(ctx, cfg, rt, co)
+}
+
+// replicaStatus prints the replication view: the leader's last round, and
+// per member its last pull, its newest snapshot and its orphans.
+func replicaStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, co *coord.Coord) error {
+	if src, _ := co.ReplicaSource(ctx); src != nil {
+		fmt.Printf("\nreplica source: %s epoch=%d %s (%s ago)\n", src.Member, src.Epoch, src.Snapshot, time.Since(src.At).Round(time.Second))
+	} else {
+		fmt.Println("\nreplica source: none published yet")
+	}
+	if a, _ := co.GetAcceptStale(ctx); a != nil {
+		fmt.Printf("accept-stale pending: member=%q by %s\n", a.Member, a.By)
+	}
+	led, _ := co.ReplicaLed(ctx)
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "MEMBER\tLED\tLAST PULL\tNEWEST SNAPSHOT\tORPHANS")
+	for _, m := range cfg.Members {
+		pull := "-"
+		if rc, _ := co.ReplicaCopy(ctx, m); rc != nil {
+			pull = fmt.Sprintf("%s from epoch %d, %s ago", rc.Snapshot, rc.SourceEpoch, time.Since(rc.At).Round(time.Second))
+		}
+		var newest, orphans []string
+		for _, v := range cfg.Replicate.Volumes {
+			names, err := rt.VolumeSnapshots(ctx, m, v)
+			switch n, ok := replica.Newest(names); {
+			case err != nil:
+				newest = append(newest, v+": error")
+			case ok:
+				newest = append(newest, fmt.Sprintf("%s: %s ago", v, time.Since(n.At).Round(time.Second)))
+			default:
+				newest = append(newest, v+": none")
+			}
+		}
+		if vs, err := rt.ListVolumes(ctx, m); err == nil {
+			for _, v := range vs {
+				if strings.Contains(v, "-orphaned-") {
+					orphans = append(orphans, v)
+				}
+			}
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", m, led[m], pull, strings.Join(newest, ", "), strings.Join(orphans, ","))
+	}
 	return tw.Flush()
 }
 
@@ -454,6 +511,31 @@ func cmdFenceAck(ctx context.Context, cfg *config.Config, cli *clientv3.Client, 
 		return err
 	}
 	fmt.Printf("recorded %s as stopped (operator acknowledgement); a blocked leader will proceed\n", member)
+	return nil
+}
+
+// cmdAcceptStale lets the next term (on member, or any member) start from a
+// replica older than replicate.max_staleness. One term consumes it.
+func cmdAcceptStale(ctx context.Context, cfg *config.Config, cli *clientv3.Client, member string) error {
+	if cfg.Replicate == nil {
+		return errors.New("this service has no replicate block")
+	}
+	if member != "" && !slices.Contains(cfg.Members, member) {
+		return fmt.Errorf("--member %q is not a member", member)
+	}
+	user := os.Getenv("SUDO_USER")
+	if user == "" {
+		user = os.Getenv("USER")
+	}
+	co := coord.New(cli, cfg.EtcdPrefix, cfg.Etcd.OpTimeout.D())
+	if err := co.SetAcceptStale(ctx, coord.AcceptStale{Member: member, By: "operator:" + user, At: time.Now().UTC()}); err != nil {
+		return err
+	}
+	who := member
+	if who == "" {
+		who = "any member"
+	}
+	fmt.Printf("the next term on %s may start from a stale copy (once); its data since that copy is lost there, and kept as an orphan where it was written\n", who)
 	return nil
 }
 
@@ -637,7 +719,11 @@ func targetFor(ctx context.Context, cfg *config.Config, rt *incus.Driver, member
 // applies it unless --dry-run. Cluster group changes need --yes or a "y" on
 // an interactive terminal.
 func cmdProvision(ctx context.Context, cfg *config.Config, api incus.API, dryRun, yes bool) error {
-	plan, err := provision.Make(ctx, api, cfg.ProjectPrefix, cfg.Members)
+	var vols provision.Volumes
+	if r := cfg.Replicate; r != nil {
+		vols = provision.Volumes{Pool: r.Pool, Names: r.Volumes}
+	}
+	plan, err := provision.Make(ctx, api, cfg.ProjectPrefix, cfg.Members, vols)
 	if err != nil {
 		return err
 	}

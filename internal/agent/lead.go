@@ -88,6 +88,9 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 	if err := t.fenceOthers(); err != nil {
 		return finish()
 	}
+	if !t.replicaTakeover() {
+		return finish()
+	}
 	if err := a.co.Guarded(op, epoch, lease, a.co.OpPutMS(a.member, coord.MemberState{
 		State: coord.MayRun, Epoch: epoch, By: a.member, Reason: "starting", At: a.now().UTC(), Caps: a.caps(),
 	})); err != nil {
@@ -539,6 +542,11 @@ func (t *termState) supervise() {
 	if !startOnce() {
 		return
 	}
+	var nextRound time.Time // replication: the next snapshot round
+	if a.replicating() {
+		t.snapshotRound()
+		nextRound = a.now().Add(a.cfg.Replicate.Interval.D())
+	}
 	startedAt, lastAudit := a.now(), time.Time{}
 	tick := time.NewTicker(hc.Interval.D())
 	defer tick.Stop()
@@ -578,6 +586,10 @@ func (t *termState) supervise() {
 			}
 			startedAt = a.now()
 			continue
+		}
+		if a.replicating() && !a.now().Before(nextRound) {
+			t.snapshotRound()
+			nextRound = a.now().Add(a.cfg.Replicate.Interval.D())
 		}
 		err := t.health()
 		if t.op.Err() != nil {

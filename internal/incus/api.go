@@ -39,6 +39,14 @@ type API interface {
 	CreateClusterGroup(ctx context.Context, group string, members []string) error
 	SetClusterGroupMembers(ctx context.Context, group string, members []string) error
 	CreateProject(ctx context.Context, project string, config map[string]string) error
+
+	// Custom volumes on a member-local pool (replication): member is where
+	// the volume lives. A missing pool or volume is reported with IsNotFound.
+	Volumes(ctx context.Context, project, pool, member string) ([]string, error)
+	CreateVolume(ctx context.Context, project, pool, member, name string) error
+	VolumeSnapshots(ctx context.Context, project, pool, member, vol string) ([]string, error)
+	CreateVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error
+	DeleteVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error
 }
 
 // Address is one address of an instance interface.
@@ -298,4 +306,73 @@ func (c *Client) CreateProject(ctx context.Context, project string, config map[s
 		return err
 	}
 	return s.CreateProject(api.ProjectsPost{Name: project, ProjectPut: api.ProjectPut{Config: config, Description: "pagurus"}})
+}
+
+// volumes is a client for project on member (member-local pools need the
+// target).
+func (c *Client) volumes(ctx context.Context, project, member string) (incusclient.InstanceServer, error) {
+	s, err := c.project(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	return s.UseTarget(member), nil
+}
+
+func (c *Client) Volumes(ctx context.Context, project, pool, member string) ([]string, error) {
+	s, err := c.volumes(ctx, project, member)
+	if err != nil {
+		return nil, err
+	}
+	vs, err := s.GetStoragePoolVolumes(pool)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, v := range vs {
+		if v.Type == "custom" && (v.Location == "" || v.Location == member) {
+			out = append(out, v.Name)
+		}
+	}
+	return out, nil
+}
+
+func (c *Client) CreateVolume(ctx context.Context, project, pool, member, name string) error {
+	s, err := c.volumes(ctx, project, member)
+	if err != nil {
+		return err
+	}
+	return s.CreateStoragePoolVolume(pool, api.StorageVolumesPost{Name: name, Type: "custom",
+		StorageVolumePut: api.StorageVolumePut{Description: "pagurus: replicated volume"}})
+}
+
+func (c *Client) VolumeSnapshots(ctx context.Context, project, pool, member, vol string) ([]string, error) {
+	s, err := c.volumes(ctx, project, member)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetStoragePoolVolumeSnapshotNames(pool, "custom", vol)
+}
+
+func (c *Client) CreateVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error {
+	s, err := c.volumes(ctx, project, member)
+	if err != nil {
+		return err
+	}
+	op, err := s.CreateStoragePoolVolumeSnapshot(pool, "custom", vol, api.StorageVolumeSnapshotsPost{Name: snap})
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
+}
+
+func (c *Client) DeleteVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error {
+	s, err := c.volumes(ctx, project, member)
+	if err != nil {
+		return err
+	}
+	op, err := s.DeleteStoragePoolVolumeSnapshot(pool, "custom", vol, snap)
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
 }

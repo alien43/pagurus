@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +25,10 @@ type FakeIncus struct {
 	Projects   map[string]map[string]string // project -> config
 	Insts      map[string][]incus.Instance  // project -> instances
 	Addrs      map[string]map[string][]incus.Address
+	// Pools that exist; Vols holds custom volumes by "<project>/<pool>/<member>/<volume>",
+	// each with its snapshot names.
+	Pools map[string]bool
+	Vols  map[string][]string
 
 	// Hang makes every call block until its context ends.
 	Hang bool
@@ -45,7 +51,8 @@ type FakeIncus struct {
 // single-member group host-<member>.
 func NewFakeIncus(members ...string) *FakeIncus {
 	f := &FakeIncus{ServerName: members[0], Archs: []string{"x86_64"}, Members: map[string]string{}, Groups: map[string][]string{},
-		Projects: map[string]map[string]string{}, Insts: map[string][]incus.Instance{}, Addrs: map[string]map[string][]incus.Address{}}
+		Projects: map[string]map[string]string{}, Insts: map[string][]incus.Instance{}, Addrs: map[string]map[string][]incus.Address{},
+		Pools: map[string]bool{"default": true}, Vols: map[string][]string{}}
 	for _, m := range members {
 		f.Members[m] = "Online"
 		f.Groups["host-"+m] = []string{m}
@@ -297,6 +304,103 @@ func (f *FakeIncus) CreateProject(ctx context.Context, project string, config ma
 		cfg[k] = v
 	}
 	f.Projects[project] = cfg
+	return nil
+}
+
+func volKey(project, pool, member, vol string) string {
+	return project + "/" + pool + "/" + member + "/" + vol
+}
+
+func (f *FakeIncus) Volumes(ctx context.Context, project, pool, member string) ([]string, error) {
+	if err := f.gate(ctx); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Pools[pool] {
+		return nil, notFound("storage pool " + pool)
+	}
+	if _, ok := f.Projects[project]; !ok {
+		return nil, notFound("project " + project)
+	}
+	pfx := volKey(project, pool, member, "")
+	var out []string
+	for k := range f.Vols {
+		if strings.HasPrefix(k, pfx) {
+			out = append(out, strings.TrimPrefix(k, pfx))
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+func (f *FakeIncus) CreateVolume(ctx context.Context, project, pool, member, name string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if !f.Pools[pool] {
+		return notFound("storage pool " + pool)
+	}
+	k := volKey(project, pool, member, name)
+	if _, ok := f.Vols[k]; ok {
+		return fmt.Errorf("volume %s already exists", name)
+	}
+	f.mutations++
+	f.Vols[k] = []string{}
+	return nil
+}
+
+func (f *FakeIncus) volume(project, pool, member, vol string) ([]string, string, error) {
+	k := volKey(project, pool, member, vol)
+	snaps, ok := f.Vols[k]
+	if !ok {
+		return nil, k, notFound("storage volume " + vol)
+	}
+	return snaps, k, nil
+}
+
+func (f *FakeIncus) VolumeSnapshots(ctx context.Context, project, pool, member, vol string) ([]string, error) {
+	if err := f.gate(ctx); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	snaps, _, err := f.volume(project, pool, member, vol)
+	return slices.Clone(snaps), err
+}
+
+func (f *FakeIncus) CreateVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	snaps, k, err := f.volume(project, pool, member, vol)
+	if err != nil {
+		return err
+	}
+	f.mutations++
+	f.Vols[k] = append(snaps, snap)
+	return nil
+}
+
+func (f *FakeIncus) DeleteVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	snaps, k, err := f.volume(project, pool, member, vol)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(snaps, snap) {
+		return notFound("snapshot " + snap)
+	}
+	f.mutations++
+	f.Vols[k] = slices.DeleteFunc(snaps, func(s string) bool { return s == snap })
 	return nil
 }
 

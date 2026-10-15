@@ -122,7 +122,10 @@ type Divergence struct {
 //   - it led a term after the base was taken (led > base epoch);
 //   - it took the base itself (led = base epoch) and the base is not final:
 //     the term may have written after it;
-//   - there is no common base and it ever led.
+//   - with no common base, the same two rules against its own newest
+//     snapshot (a member finalized at a clean handover and away for longer
+//     than the source keeps snapshots is not diverged), or it led and has no
+//     snapshot at all.
 func Diverged(local, source []string, led int64) Divergence {
 	src := map[string]bool{}
 	for _, n := range source {
@@ -161,13 +164,20 @@ func Diverged(local, source []string, led int64) Divergence {
 			return d
 		}
 	}
+	// The epoch rules apply to the common base or, with none, to this
+	// volume's own newest snapshot: what it last agreed on with anyone.
+	ref := base
+	if ref == nil && len(mine) > 0 {
+		ref = &mine[len(mine)-1]
+	}
 	switch {
-	case base == nil && led > 0:
-		d.Diverged, d.Why = true, fmt.Sprintf("led epoch %d and shares no snapshot with the source", led)
-	case base != nil && led > base.Epoch:
-		d.Diverged, d.Why = true, fmt.Sprintf("led epoch %d after the common snapshot %s", led, base.Name)
-	case base != nil && led == base.Epoch && !base.Final:
-		d.Diverged, d.Why = true, fmt.Sprintf("led epoch %d and may have written after its last snapshot %s", led, base.Name)
+	case led == 0:
+	case ref == nil:
+		d.Diverged, d.Why = true, fmt.Sprintf("led epoch %d and has no snapshot at all", led)
+	case led > ref.Epoch:
+		d.Diverged, d.Why = true, fmt.Sprintf("led epoch %d after snapshot %s", led, ref.Name)
+	case led == ref.Epoch && !ref.Final:
+		d.Diverged, d.Why = true, fmt.Sprintf("led epoch %d and may have written after its snapshot %s", led, ref.Name)
 	}
 	return d
 }

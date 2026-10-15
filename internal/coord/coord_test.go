@@ -287,10 +287,10 @@ func TestReplicaKeys(t *testing.T) {
 	if err != nil || len(led) != 1 || led["asus"] != epoch {
 		t.Fatalf("ReplicaLed = %v, %v", led, err)
 	}
-	if err := co.PutReplicaCopy(ctx, "dell", coord.ReplicaCopy{Snapshot: src.Snapshot, SourceEpoch: epoch, Orphaned: "k"}); err != nil {
+	if err := co.PutReplicaCopy(ctx, "dell", coord.ReplicaCopy{Snapshot: src.Snapshot, SourceEpoch: epoch, Orphaned: map[string]string{"data": "k"}}); err != nil {
 		t.Fatal(err)
 	}
-	if rc, err := co.ReplicaCopy(ctx, "dell"); err != nil || rc == nil || rc.Orphaned != "k" {
+	if rc, err := co.ReplicaCopy(ctx, "dell"); err != nil || rc == nil || rc.Orphaned["data"] != "k" {
 		t.Fatalf("ReplicaCopy = %+v, %v", rc, err)
 	}
 	if ms, err := co.MemberStates(ctx); err != nil || len(ms) != 0 {

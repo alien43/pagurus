@@ -111,6 +111,11 @@ type Agent struct {
 
 	localMu sync.Mutex // serialises guardLocal against the start of a term
 	fenceMu sync.Mutex // serialises self-fences
+
+	// Replication (replica.go); vols is nil without a replicate block.
+	vols       Volumes
+	pullMu     sync.Mutex         // held by a follower pull into this member's volumes
+	pullCancel context.CancelFunc // cancels that pull (under mu)
 }
 
 type Options struct {
@@ -303,7 +308,10 @@ func (a *Agent) Preflight(ctx context.Context) error {
 		a.log.Warn("no fence in the self chain applies to this project's instances: no verified self-fence (advertised; peers will not trust it under proceed)",
 			"types", t.Types, "chain", a.cfg.SelfFences())
 	}
-	return a.rt.CheckStart(cctx, m)
+	if err := a.rt.CheckStart(cctx, m); err != nil {
+		return err
+	}
+	return a.preflightReplica(cctx)
 }
 
 // Run is the agent's lifetime. It returns when ctx ends, after a held term
@@ -352,6 +360,7 @@ func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 
 	go a.registerLoop(ctx)
 	go a.followRefreshes(ctx)
+	go a.followReplica(ctx)
 	a.startupFence(ctx)
 	watchdog.Ready()
 	a.setRole(roleFollower)
@@ -665,7 +674,8 @@ func (a *Agent) desired(ctx context.Context) campaign {
 	a.mu.Lock()
 	backoff := a.backoffUntil
 	a.mu.Unlock()
-	if d := backoff.Sub(a.now()); d > 0 {
+	// An operator's accept-stale is for a member that backed off as stale.
+	if d := backoff.Sub(a.now()); d > 0 && !a.acceptStaleFor(ctx) {
 		return campaign{why: fmt.Sprintf("backing off after giving up the office (%s left)", d.Round(time.Second))}
 	}
 	if err := a.eligible(ctx); err != nil {

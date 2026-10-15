@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +27,13 @@ type fakeIncusREST struct {
 	insts     map[string]map[string]*fakeInst // project -> name -> instance
 	stateCall []string                        // "project/name action force"
 	created   []string
+	vols      map[string]*fakeVol // "project/pool/name"
+	targets   []string            // ?target= of every storage call
+}
+
+type fakeVol struct {
+	Location string
+	Snaps    []string
 }
 
 type fakeInst struct {
@@ -158,6 +166,61 @@ func (f *fakeIncusREST) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		default:
 			fail(w, 404, "not found")
 		}
+	case parts[0] == "storage-pools" && len(parts) >= 3 && parts[2] == "volumes":
+		f.storage(w, r, proj, parts)
+	default:
+		fail(w, 404, "not found: "+r.URL.Path)
+	}
+}
+
+// storage serves /1.0/storage-pools/<pool>/volumes[/custom[/<vol>[/snapshots[/<snap>]]]].
+func (f *fakeIncusREST) storage(w http.ResponseWriter, r *http.Request, proj string, parts []string) {
+	pool, target := parts[1], r.URL.Query().Get("target")
+	f.targets = append(f.targets, target)
+	key := func(v string) string { return proj + "/" + pool + "/" + v }
+	switch {
+	case len(parts) == 3 && r.Method == http.MethodGet:
+		var list []map[string]any
+		for k, v := range f.vols {
+			if strings.HasPrefix(k, key("")) {
+				list = append(list, map[string]any{"name": strings.TrimPrefix(k, key("")), "type": "custom", "location": v.Location})
+			}
+		}
+		list = append(list, map[string]any{"name": "c1", "type": "container", "location": "asus"})
+		ok(w, list)
+	case len(parts) == 4 && r.Method == http.MethodPost:
+		var body struct {
+			Name string `json:"name"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.vols[key(body.Name)] = &fakeVol{Location: target}
+		ok(w, nil)
+	case len(parts) >= 6 && parts[5] == "snapshots":
+		v, found := f.vols[key(parts[4])]
+		if !found {
+			fail(w, 404, "Storage volume not found")
+			return
+		}
+		switch {
+		case len(parts) == 6 && r.Method == http.MethodPost:
+			var body struct {
+				Name string `json:"name"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			v.Snaps = append(v.Snaps, body.Name)
+			opDone(w)
+		case len(parts) == 6:
+			var urls []string
+			for _, n := range v.Snaps {
+				urls = append(urls, "/1.0/storage-pools/"+pool+"/volumes/custom/"+parts[4]+"/snapshots/"+n)
+			}
+			ok(w, urls)
+		case len(parts) == 7 && r.Method == http.MethodDelete:
+			v.Snaps = slices.DeleteFunc(v.Snaps, func(n string) bool { return n == parts[6] })
+			opDone(w)
+		default:
+			fail(w, 404, "not found")
+		}
 	default:
 		fail(w, 404, "not found: "+r.URL.Path)
 	}
@@ -181,6 +244,7 @@ func serveFakeIncus(t *testing.T) (*fakeIncusREST, *incus.Client) {
 		insts: map[string]map[string]*fakeInst{"p-asus": {
 			"web": {Status: "Stopped", Location: "asus", Type: "container", Config: map[string]string{}},
 		}},
+		vols: map[string]*fakeVol{"p-asus/zp/other": {Location: "dell"}},
 	}
 	srv := &http.Server{Handler: f, ReadHeaderTimeout: 5 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
@@ -269,5 +333,39 @@ func TestClientUnreachable(t *testing.T) {
 	c := incus.NewClient(incus.ClientOptions{Socket: filepath.Join(t.TempDir(), "absent.socket")})
 	if _, err := c.ProjectConfig(context.Background(), "p"); err == nil {
 		t.Fatal("no Incus, no error")
+	}
+}
+
+func TestClientVolumes(t *testing.T) {
+	f, c := serveFakeIncus(t)
+	ctx := context.Background()
+	if err := c.CreateVolume(ctx, "p-asus", "zp", "asus", "data"); err != nil {
+		t.Fatalf("CreateVolume: %v", err)
+	}
+	vs, err := c.Volumes(ctx, "p-asus", "zp", "asus")
+	if err != nil || len(vs) != 1 || vs[0] != "data" {
+		t.Fatalf("Volumes = %v, %v: want only asus's custom volume", vs, err)
+	}
+	for _, s := range []string{"pagurus-1-20261015T220000000Z", "pagurus-1-20261015T220100000Z"} {
+		if err := c.CreateVolumeSnapshot(ctx, "p-asus", "zp", "asus", "data", s); err != nil {
+			t.Fatalf("CreateVolumeSnapshot: %v", err)
+		}
+	}
+	if err := c.DeleteVolumeSnapshot(ctx, "p-asus", "zp", "asus", "data", "pagurus-1-20261015T220000000Z"); err != nil {
+		t.Fatalf("DeleteVolumeSnapshot: %v", err)
+	}
+	snaps, err := c.VolumeSnapshots(ctx, "p-asus", "zp", "asus", "data")
+	if err != nil || len(snaps) != 1 || snaps[0] != "pagurus-1-20261015T220100000Z" {
+		t.Fatalf("VolumeSnapshots = %v, %v", snaps, err)
+	}
+	if _, err := c.VolumeSnapshots(ctx, "p-asus", "zp", "asus", "absent"); !incus.IsNotFound(err) {
+		t.Fatalf("a missing volume: %v, want not found", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, tg := range f.targets {
+		if tg != "asus" {
+			t.Fatalf("a storage call without ?target=asus (%q): member-local pools need it", tg)
+		}
 	}
 }

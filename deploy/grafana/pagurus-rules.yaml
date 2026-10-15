@@ -1,4 +1,8 @@
-# Grafana alert rules for pagurus: the four conditions that need a human.
+# Grafana alert rules for pagurus: the four conditions that need a human, and
+# two more for replicating services (README "Replication"): a stale replica,
+# and preserved orphan data. Their metrics exist only where replicate is set.
+# PagurusReplicaStale's 1h is for the default replicate.interval 15m (4 rounds
+# missed); keep it under the service's max_staleness.
 # Grafana file provisioning (provisioning/alerting/); the metrics come from a
 # Prometheus job scraping every agent's --metrics-addr. Set datasourceUid to
 # your Prometheus datasource and folder to yours.
@@ -176,6 +180,98 @@ groups:
             model:
               editorMode: code
               expr: (count by (svc) (pagurus_local_running > 0) or on (svc) (0 * count by (svc) (pagurus_fit))) == bool 0 and on (svc) count by (svc) (pagurus_fit) >= 2
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold
+
+      - uid: pagurus-replica-stale
+        title: PagurusReplicaStale
+        condition: B
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "pagurus {{ $labels.svc }}: {{ $labels.member }}'s replica is over an hour old — a failover to it would lose that much, or be refused by max_staleness; check the leader's snapshot rounds and this member's pulls ('pagurus status')"
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: derpa48qhefpcf
+            model:
+              editorMode: code
+              expr: max by (svc, member) (pagurus_replica_age_seconds) > bool 3600
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold
+
+      - uid: pagurus-orphaned-data
+        title: PagurusOrphanedData
+        condition: B
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "pagurus {{ $labels.svc }}: {{ $labels.member }} preserved writes the leader never had as a <volume>-orphaned-* volume (rule 4) — decide whether anything in it matters, then delete it by hand; pagurus never merges or prunes it"
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: derpa48qhefpcf
+            model:
+              editorMode: code
+              expr: max by (svc, member) (pagurus_orphaned_volumes) > bool 0
               instant: true
               refId: A
           - refId: B

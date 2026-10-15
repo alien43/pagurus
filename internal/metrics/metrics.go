@@ -52,6 +52,11 @@ var Help = map[string]string{
 	"pagurus_terms_total":             "terms this member has held",
 	"pagurus_fence_runs_total":        "fences run by this agent, by chain (self|peer), kind and result",
 	"pagurus_conch_exits_total":       "conch elect exits, by result (ok|fence_failed|withdrawn|other)",
+	"pagurus_replica_age_seconds":     "age of this member's newest replica snapshot (replicating services only)",
+	"pagurus_replica_pulls_total":     "pulls into this member's volumes, by result (ok|failed|discarded)",
+	"pagurus_replica_snapshots_total": "snapshot rounds this member took as leader, by result (ok|failed)",
+	"pagurus_orphaned_volumes":        "volumes this member preserved under rule 4 (<vol>-orphaned-*), never pruned automatically",
+	"pagurus_replica_stale_blocked":   "1 while this member's last term refused to start on a stale replica",
 }
 
 // SetMember sets the member label (known only after the agent's preflight).

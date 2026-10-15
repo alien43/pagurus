@@ -72,6 +72,7 @@ func TestDiverged(t *testing.T) {
 		{"no common base, never led", []string{s(3, 1, false)}, []string{s(20, 5, false)}, 0, false},
 		{"no common base, led", []string{s(3, 1, false)}, []string{s(20, 5, false)}, 3, true},
 		{"led but never snapshotted", nil, []string{s(20, 5, false)}, 4, true},
+		{"no common base, finalized at a handover long ago", []string{s(3, 1, false), s(3, 2, true)}, []string{s(20, 50, false)}, 3, false},
 		{"identical", []string{s(10, 1, false)}, []string{s(10, 1, false)}, 0, false},
 	}
 	for _, c := range cases {

@@ -433,9 +433,9 @@ type ReplicaCopy struct {
 	Snapshot    string    `json:"snapshot"`
 	SourceEpoch int64     `json:"source_epoch"`
 	At          time.Time `json:"at"`
-	// Orphaned is the key (replica.Divergence.Key) of the last divergence
-	// this member preserved, so the same one is not preserved twice.
-	Orphaned string `json:"orphaned,omitempty"`
+	// Orphaned is, per volume, the key of the last divergence this member
+	// preserved (replica.Divergence), so the same one is not preserved twice.
+	Orphaned map[string]string `json:"orphaned,omitempty"`
 }
 
 // AcceptStale lets one term start past the staleness gate. Member "" means

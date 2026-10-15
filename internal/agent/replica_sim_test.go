@@ -578,7 +578,7 @@ func TestReplicaTwoFailoversBeforeAnyCopy(t *testing.T) {
 
 // §5 "Bandwidth: a full first copy of a big volume": until a follower's
 // first copy completes it is not ready; the gate keeps it from starting with
-// no data, and the old leader, back, resumes from its own volume.
+// no data. Once the old leader is back, the service resumes from its data.
 func TestReplicaSlowFirstCopyIsGatedByStaleness(t *testing.T) {
 	h := newReplHarness(t, both(proceed, replicated(time.Minute)))
 	h.sim.mu.Lock()
@@ -594,9 +594,12 @@ func TestReplicaSlowFirstCopyIsGatedByStaleness(t *testing.T) {
 	h.sim.repl().pullDelay["dell"], h.sim.repl().pullDelay["rpi5"] = 0, 0
 	h.sim.mu.Unlock()
 	h.powerOn("asus")
-	h.waitRunning("asus", 40*time.Second)
-	if got := h.startHead("asus"); got != dead {
-		t.Fatalf("asus resumed from %d, it died at %d", got, dead)
+	// Whoever wins now starts from asus's data: asus itself, or a follower
+	// that pulls asus's final state first.
+	var on []string
+	h.waitFor("someone runs", 40*time.Second, func() bool { on = h.sim.runningOn(); return len(on) == 1 })
+	if got := h.startHead(on[0]); got != dead {
+		t.Fatalf("%s started from %d, asus died at %d", on[0], got, dead)
 	}
 }
 

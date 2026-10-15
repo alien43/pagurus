@@ -1,7 +1,8 @@
 // Package provision prepares the Incus side of a pagurus service: one cluster
 // group per member holding exactly that member (host-<member>), and one
-// project per member pinned to it (restricted.cluster.groups). It replaces
-// scripts/provision.sh.
+// project per member pinned to it (restricted.cluster.groups), and, for a
+// service with a replicate block, each replicated custom volume in every
+// member's project on that member. It replaces scripts/provision.sh.
 //
 // It plans first and applies second, so --dry-run shows exactly what would
 // happen. It only ever creates things or fills an empty group; it never
@@ -46,10 +47,17 @@ type Plan struct {
 	OK      []string
 }
 
+// Volumes are the replicated custom volumes to create, on Pool (none for a
+// service without replication).
+type Volumes struct {
+	Pool  string
+	Names []string
+}
+
 // Make plans provisioning of projectPrefix-<member> for members. It returns an
 // error for anything it will not fix: a group with other members in it, or a
-// project pinned elsewhere.
-func Make(ctx context.Context, api incus.API, projectPrefix string, members []string) (*Plan, error) {
+// project pinned elsewhere, or a volume pool that does not exist.
+func Make(ctx context.Context, api incus.API, projectPrefix string, members []string, vols Volumes) (*Plan, error) {
 	p := &Plan{}
 	for _, m := range members {
 		group := GroupPrefix + m
@@ -79,6 +87,7 @@ func Make(ctx context.Context, api incus.API, projectPrefix string, members []st
 
 		project := projectPrefix + "-" + m
 		cfg, err := api.ProjectConfig(ctx, project)
+		newProject := incus.IsNotFound(err)
 		switch {
 		case incus.IsNotFound(err):
 			pc := map[string]string{"restricted.cluster.groups": group}
@@ -106,8 +115,39 @@ func Make(ctx context.Context, api incus.API, projectPrefix string, members []st
 		default:
 			p.OK = append(p.OK, fmt.Sprintf("project %s pinned to %s", project, group))
 		}
+		if err := planVolumes(ctx, api, p, project, m, newProject, vols); err != nil {
+			return nil, err
+		}
 	}
 	return p, nil
+}
+
+// planVolumes adds each missing replicated volume of member's project. An
+// existing volume is never touched: its data may be the only copy.
+func planVolumes(ctx context.Context, api incus.API, p *Plan, project, member string, newProject bool, vols Volumes) error {
+	if len(vols.Names) == 0 {
+		return nil
+	}
+	var have []string
+	if !newProject {
+		var err error
+		if have, err = api.Volumes(ctx, project, vols.Pool, member); err != nil {
+			return fmt.Errorf("volumes of %s on pool %s (%s): %w", project, vols.Pool, member, err)
+		}
+	}
+	for _, v := range vols.Names {
+		if slices.Contains(have, v) {
+			p.OK = append(p.OK, fmt.Sprintf("volume %s/%s in %s on %s", vols.Pool, v, project, member))
+			continue
+		}
+		pool, name := vols.Pool, v
+		p.Actions = append(p.Actions, Action{
+			Command: fmt.Sprintf("incus storage volume create %s %s --project %s --target %s", pool, name, project, member),
+			apply: func(ctx context.Context, api incus.API) error {
+				return api.CreateVolume(ctx, project, pool, member, name)
+			}})
+	}
+	return nil
 }
 
 // NeedsConfirmation reports whether any action changes cluster groups.

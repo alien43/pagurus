@@ -50,6 +50,11 @@ type Options struct {
 	KillPID func(pid int) error
 	// API reaches Incus (default: NewClient over the local unix socket).
 	API API
+	// Pool is the storage pool of replicated volumes (replicate.pool).
+	Pool string
+	// RunCLI runs the incus CLI where there is no API call for it: volume
+	// copies and exec (default Run).
+	RunCLI func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
 type Driver struct {
@@ -68,6 +73,9 @@ func New(o Options) *Driver {
 	}
 	if o.API == nil {
 		o.API = NewClient(ClientOptions{})
+	}
+	if o.RunCLI == nil {
+		o.RunCLI = Run
 	}
 	return &Driver{o: o}
 }

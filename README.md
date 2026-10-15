@@ -214,6 +214,9 @@ Failback is never automatic. Use `pagurus move`.
   project pinned elsewhere, is reported and **left alone**.
 - Cluster group changes are cluster-wide, so they need `--yes` or a "y" on a terminal.
   Creating projects doesn't.
+- With a `replicate` block, it also creates each replicated volume in every member's project, on
+  that member (`incus storage volume create <pool> <vol> --project <p> --target <m>`). An
+  existing volume is left alone, and a missing pool is refused.
 
 ## Reaching Incus
 
@@ -311,6 +314,72 @@ file and the image already in the member's project. So:
   was healthy").
 - A follower never recreates on a refresh. Never pull into a member's project from another
   member: Incus pulls for the architecture of the server it talks to.
+
+## Replication (stateful services)
+
+A service whose state is a local custom volume can have it follow the office. It's **opt-in**:
+only a config with a `replicate` block replicates anything, and without one the agent makes no
+volume call at all (`TestReplicaOffMeansNoVolumeCalls`). The design and its reasoning are in
+the configs repo's `proposals/pagurus_stateful.md`. The Incus facts it rests on (an interrupted
+refresh is atomic per snapshot; `--refresh` silently destroys a diverged target) are in
+`tasks/results/pagurus-replica-spike.md`.
+
+```json
+"replicate": {"pool": "zfs-pool", "volumes": ["data"], "interval": "15m", "max_staleness": "2h",
+              "keep": 4, "catchup_timeout": "10m",
+              "pre_hook": {"instance": "app-1", "command": ["sqlite3", "/data/app.db", ".backup /data/snap.db"]}}
+```
+
+The volumes have the same names in every member's project; `pagurus provision` creates the missing
+ones and never touches an existing one. The block is part of the config hash, so every member must
+agree on it. A config without it hashes as before.
+
+**Snapshots** are named `pagurus-<epoch>-<YYYYMMDDTHHMMSSmmmZ>`, by the term that wrote the data.
+`-final` is appended when the term's workload was confirmed stopped first, so nothing can have been
+written after it. Only names of exactly that form are pruned (to `keep`).
+
+**The leader**, once its workload runs, snapshots every volume each `interval` (after the
+pre-hook, if any) and publishes the round (`<prefix>/replica/source`, a guarded write).
+
+**A follower** pulls the current leader's published snapshot with `incus storage volume copy
+--refresh`. It reads the leader's epoch before and after, and a copy made while the office moved
+is not published. It never pulls while a term runs on it or its own workload isn't confirmed
+stopped (rule 1): a new term cancels an in-flight pull and waits for it before going on.
+
+**Rule 4: never destroy the loser's data.** Before a pull overwrites its volume, the member checks
+whether the volume holds writes the source lacks. It does when any of these holds:
+- it has a snapshot newer than their common snapshot that the source doesn't have;
+- it led a term (`<prefix>/replica/led/<member>`) after the common snapshot;
+- it took the common snapshot itself and that snapshot isn't `-final`.
+
+If so, it copies the volume to `<vol>-orphaned-<epoch>-<UTC>` first, alerts (`orphaned-data`), and
+only then resyncs. Orphans are never merged or pruned; a human decides.
+
+**A new leader**, after fencing and before anything starts:
+1. If no member has led with replication yet, or it led last itself, it starts from its own volumes.
+2. Otherwise it tries to **catch up**. If the previous holder is Online in Incus and nothing runs
+   in its project (it has just been fenced), it snapshots that holder's volumes `-final` and pulls
+   them. **Nothing is lost**: a move, an agent crash, an unhealthy give-up.
+3. If the previous holder is unreachable (host down, partition), it starts from its own newest
+   copy. The **staleness gate** applies: if that copy is older than `max_staleness`, or there is
+   none, the member doesn't start. It alerts (`replica-stale`) and gives the office up with the
+   release backoff. `pagurus accept-stale -c cfg [--member m]` lets one term start anyway, and
+   that member skips its backoff. The loss is then everything after its copy; the writes stay on
+   the previous holder and become its orphan when it returns.
+
+Not built from the proposal: the rollback of a new leader's volume to its newest snapshot. A
+half-applied copy can't exist (the spike), and the rollback would destroy that member's own
+uncopied writes. Not built yet: a byte counter for pulls (neither the CLI nor the API reports
+bytes), and preferring the freshest follower at failover.
+
+`pagurus status` shows, for a replicating service:
+- the last published round;
+- a pending `accept-stale`;
+- per member: the last epoch it led, its last pull, its newest snapshot's age, and its orphans.
+
+**Bandwidth.** A pull is a ZFS send from the leader's member. Uncapped, it fills the link that etcd
+shares, so every member that can lead needs an egress cap toward the others. That is outside
+pagurus (the configs repo's `standby-sync-shaper` on asus is the model).
 
 ## Fences
 
@@ -460,9 +529,15 @@ Every series carries `svc` and `member` labels; no label has unbounded values.
 | `pagurus_terms_total` | counter | terms held |
 | `pagurus_fence_runs_total{chain,kind,result}` | counter | fences run by the agent (self: `confirmed\|failed\|skipped`; peer: `confirmed\|assumed\|wait\|skipped`). `pagurus fence-self` runs inside conch and isn't counted; its failures show as `pagurus_conch_exits_total{result="fence_failed"}` |
 | `pagurus_conch_exits_total{result}` | counter | `ok`, `fence_failed`, `withdrawn` (stopped while campaigning, e.g. by a move), `other` |
+| `pagurus_replica_age_seconds` | gauge | replicate only: age of this member's newest snapshot |
+| `pagurus_replica_pulls_total{result}` | counter | replicate only: pulls into this member, `ok\|failed\|discarded` (the office moved during it) |
+| `pagurus_replica_snapshots_total{result}` | counter | replicate only: the leader's snapshot rounds, `ok\|failed` |
+| `pagurus_orphaned_volumes` | gauge | replicate only: `<vol>-orphaned-*` volumes on this member (rule 4) |
+| `pagurus_replica_stale_blocked` | gauge | replicate only: 1 while this member's last term refused to start on a stale copy |
 
 `deploy/grafana/pagurus-rules.yaml` holds Grafana rules for the four conditions that need a
-human. None fires on a normal failover or move:
+human, and two for replicating services: `PagurusReplicaStale` (a member's copy is over an hour old,
+for 10 min) and `PagurusOrphanedData` (rule 4 preserved something). None fires on a normal failover or move:
 - **two running:** `count by (svc) (pagurus_local_running > 0) > 1`, at once;
 - **fence blocked:** for 2 min;
 - **unfit:** per member, for 1 min;
@@ -489,7 +564,9 @@ internal/agent/         agent.go: the daemon (ground truth, campaigning); conch.
 examples/whoami/        a generic compose example (placeholder addresses, 192.0.2.0/24)
 examples/whoami-instances/  the same with the instances starter
 scripts/drill.sh        live drills against pagurus@<svc> units, refereed by `audit`
-internal/provision/     `pagurus provision`: per-member cluster groups + pinned projects
+internal/provision/     `pagurus provision`: per-member cluster groups + pinned projects (+ replicated volumes)
+internal/replica/       replication's pure rules: snapshot names, pruning, rule 4 (divergence)
+internal/agent/replica.go  replication: the leader's rounds, the follower's pull, the takeover
 ```
 
 ## Running it
