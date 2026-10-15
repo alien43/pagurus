@@ -973,7 +973,10 @@ func TestStartErrorButRunningPublishesEndpoint(t *testing.T) {
 // that failed ("In use", "address already in use"). 2026-10-14: a failed
 // term cost ~135 s in production, every time.
 func TestFailedStartGivesUpWithoutWaitingOutTheStartPeriod(t *testing.T) {
-	h := newHarness(t, func(c *config.Config) { c.Health.StartPeriod = config.Duration(3 * time.Second) })
+	// The start period is far above the threshold: under -race on the CI
+	// runner a correct give-up still takes ~3.4 s (1.3 s on nucbox), and a
+	// 3 s period with a 3 s threshold failed there on 2026-10-14.
+	h := newHarness(t, func(c *config.Config) { c.Health.StartPeriod = config.Duration(10 * time.Second) })
 	h.sim.set("asus", func(m *simMember) { m.prepareFail = true })
 	h.startAll()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(20 * time.Millisecond) {
@@ -989,7 +992,7 @@ func TestFailedStartGivesUpWithoutWaitingOutTheStartPeriod(t *testing.T) {
 	}
 	took := h.waitRunning("dell", 20*time.Second)
 	t.Logf("dell serving %s after asus's first failed start", took.Round(100*time.Millisecond))
-	if took > 3*time.Second {
+	if took > 6*time.Second {
 		t.Fatalf("dell took %s: asus waited out its start period on a start that had failed", took.Round(100*time.Millisecond))
 	}
 	h.sim.mu.Lock()
