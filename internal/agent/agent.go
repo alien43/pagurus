@@ -673,8 +673,10 @@ func (a *Agent) desired(ctx context.Context) campaign {
 	a.mu.Lock()
 	backoff := a.backoffUntil
 	a.mu.Unlock()
-	// An operator's accept-stale is for a member that backed off as stale.
-	if d := backoff.Sub(a.now()); d > 0 && !a.acceptStaleFor(ctx) {
+	// An operator's accept-stale is for a member that backed off as stale,
+	// and a pin to this member is an operator asking it to lead now (a
+	// `move` to a member still backing off otherwise left nobody running).
+	if d := backoff.Sub(a.now()); d > 0 && pin != a.member && !a.acceptStaleFor(ctx) {
 		return campaign{why: fmt.Sprintf("backing off after giving up the office (%s left)", d.Round(time.Second))}
 	}
 	if err := a.eligible(ctx); err != nil {
