@@ -22,14 +22,23 @@ import (
 // GroupPrefix names the per-member cluster groups: host-<member>.
 const GroupPrefix = "host-"
 
-// ProjectConfig is what a new per-member project gets, besides its pin.
+// ProjectConfig is what a new per-member project gets, besides its pin and
+// ServiceKey.
 var ProjectConfig = map[string]string{
 	"features.images":          "true",
 	"features.profiles":        "true",
 	"features.storage.volumes": "true",
 	"features.storage.buckets": "true",
-	"user.pagurus.managed":     "true",
 }
+
+// ServiceKey marks a project as the home of one pagurus service on one
+// member; its value is the service. Other tools key off it (standby-sync
+// skips these projects: pagurus moves their data itself, if at all).
+const ServiceKey = "user.pagurus.service"
+
+// oldMarker is what projects were marked with before ServiceKey. Nothing
+// read it; provision replaces it.
+const oldMarker = "user.pagurus.managed"
 
 // Action is one change, with the equivalent incus command for --dry-run.
 type Action struct {
@@ -57,7 +66,7 @@ type Volumes struct {
 // Make plans provisioning of projectPrefix-<member> for members. It returns an
 // error for anything it will not fix: a group with other members in it, or a
 // project pinned elsewhere, or a volume pool that does not exist.
-func Make(ctx context.Context, api incus.API, projectPrefix string, members []string, vols Volumes) (*Plan, error) {
+func Make(ctx context.Context, api incus.API, service, projectPrefix string, members []string, vols Volumes) (*Plan, error) {
 	p := &Plan{}
 	for _, m := range members {
 		group := GroupPrefix + m
@@ -90,7 +99,7 @@ func Make(ctx context.Context, api incus.API, projectPrefix string, members []st
 		newProject := incus.IsNotFound(err)
 		switch {
 		case incus.IsNotFound(err):
-			pc := map[string]string{"restricted.cluster.groups": group}
+			pc := map[string]string{"restricted.cluster.groups": group, ServiceKey: service}
 			for k, v := range ProjectConfig {
 				pc[k] = v
 			}
@@ -112,14 +121,37 @@ func Make(ctx context.Context, api incus.API, projectPrefix string, members []st
 			return nil, fmt.Errorf("project %s: %w", project, err)
 		case cfg["restricted.cluster.groups"] != group:
 			return nil, fmt.Errorf("project %s exists with restricted.cluster.groups=%q, want %q. Not changing it", project, cfg["restricted.cluster.groups"], group)
+		case cfg[ServiceKey] != "" && cfg[ServiceKey] != service:
+			return nil, fmt.Errorf("project %s belongs to service %q (%s), not %q. Not changing it", project, cfg[ServiceKey], ServiceKey, service)
 		default:
 			p.OK = append(p.OK, fmt.Sprintf("project %s pinned to %s", project, group))
+			planMarker(p, project, service, cfg)
 		}
 		if err := planVolumes(ctx, api, p, project, m, newProject, vols); err != nil {
 			return nil, err
 		}
 	}
 	return p, nil
+}
+
+// planMarker marks an existing project with ServiceKey and drops oldMarker.
+func planMarker(p *Plan, project, service string, cfg map[string]string) {
+	if cfg[ServiceKey] == service {
+		p.OK = append(p.OK, fmt.Sprintf("project %s marked %s=%s", project, ServiceKey, service))
+	} else {
+		p.Actions = append(p.Actions, Action{
+			Command: fmt.Sprintf("incus project set %s %s=%s", project, ServiceKey, service),
+			apply: func(ctx context.Context, api incus.API) error {
+				return api.SetProjectConfig(ctx, project, ServiceKey, service)
+			}})
+	}
+	if _, ok := cfg[oldMarker]; ok {
+		p.Actions = append(p.Actions, Action{
+			Command: fmt.Sprintf("incus project unset %s %s", project, oldMarker),
+			apply: func(ctx context.Context, api incus.API) error {
+				return api.SetProjectConfig(ctx, project, oldMarker, "")
+			}})
+	}
 }
 
 // planVolumes adds each missing replicated volume of member's project. An

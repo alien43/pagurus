@@ -39,6 +39,8 @@ type API interface {
 	CreateClusterGroup(ctx context.Context, group string, members []string) error
 	SetClusterGroupMembers(ctx context.Context, group string, members []string) error
 	CreateProject(ctx context.Context, project string, config map[string]string) error
+	// SetProjectConfig sets one key of an existing project; "" unsets it.
+	SetProjectConfig(ctx context.Context, project, key, value string) error
 
 	// Custom volumes on a member-local pool (replication): member is where
 	// the volume lives. A missing pool or volume is reported with IsNotFound.
@@ -306,6 +308,27 @@ func (c *Client) CreateProject(ctx context.Context, project string, config map[s
 		return err
 	}
 	return s.CreateProject(api.ProjectsPost{Name: project, ProjectPut: api.ProjectPut{Config: config, Description: "pagurus"}})
+}
+
+func (c *Client) SetProjectConfig(ctx context.Context, project, key, value string) error {
+	s, err := c.server(ctx)
+	if err != nil {
+		return err
+	}
+	p, etag, err := s.GetProject(project)
+	if err != nil {
+		return err
+	}
+	put := p.Writable()
+	if put.Config == nil {
+		put.Config = map[string]string{}
+	}
+	if value == "" {
+		delete(put.Config, key)
+	} else {
+		put.Config[key] = value
+	}
+	return s.UpdateProject(project, put, etag)
 }
 
 // volumes is a client for project on member (member-local pools need the

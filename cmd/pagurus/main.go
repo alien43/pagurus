@@ -723,7 +723,7 @@ func cmdProvision(ctx context.Context, cfg *config.Config, api incus.API, dryRun
 	if r := cfg.Replicate; r != nil {
 		vols = provision.Volumes{Pool: r.Pool, Names: r.Volumes}
 	}
-	plan, err := provision.Make(ctx, api, cfg.ProjectPrefix, cfg.Members, vols)
+	plan, err := provision.Make(ctx, api, cfg.Service, cfg.ProjectPrefix, cfg.Members, vols)
 	if err != nil {
 		return err
 	}

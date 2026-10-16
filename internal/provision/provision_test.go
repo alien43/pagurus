@@ -14,7 +14,7 @@ var ctx = context.Background()
 func TestFreshClusterIsProvisionedAndThenIdempotent(t *testing.T) {
 	api := fencetest.NewFakeIncus("asus", "dell")
 	delete(api.Groups, "host-dell") // dell has no group yet
-	p, err := provision.Make(ctx, api, "svc", []string{"asus", "dell"}, provision.Volumes{})
+	p, err := provision.Make(ctx, api, "svc", "svc", []string{"asus", "dell"}, provision.Volumes{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,11 +45,11 @@ func TestFreshClusterIsProvisionedAndThenIdempotent(t *testing.T) {
 	if g := api.Groups["host-dell"]; len(g) != 1 || g[0] != "dell" {
 		t.Fatalf("host-dell = %v", g)
 	}
-	if api.Projects["svc-dell"]["restricted.cluster.groups"] != "host-dell" || api.Projects["svc-dell"]["user.pagurus.managed"] != "true" {
+	if api.Projects["svc-dell"]["restricted.cluster.groups"] != "host-dell" || api.Projects["svc-dell"]["user.pagurus.service"] != "svc" || api.Projects["svc-dell"]["user.pagurus.managed"] != "" {
 		t.Fatalf("svc-dell config %v", api.Projects["svc-dell"])
 	}
-	again, err := provision.Make(ctx, api, "svc", []string{"asus", "dell"}, provision.Volumes{})
-	if err != nil || len(again.Actions) != 0 || len(again.OK) != 4 {
+	again, err := provision.Make(ctx, api, "svc", "svc", []string{"asus", "dell"}, provision.Volumes{})
+	if err != nil || len(again.Actions) != 0 || len(again.OK) != 6 {
 		t.Fatalf("second run: %d actions, %d ok, err %v; want nothing to do", len(again.Actions), len(again.OK), err)
 	}
 }
@@ -57,12 +57,12 @@ func TestFreshClusterIsProvisionedAndThenIdempotent(t *testing.T) {
 func TestRefusesWhatItWillNotFix(t *testing.T) {
 	api := fencetest.NewFakeIncus("asus", "dell")
 	api.Groups["host-asus"] = []string{"asus", "dell"}
-	if _, err := provision.Make(ctx, api, "svc", []string{"asus"}, provision.Volumes{}); err == nil || !strings.Contains(err.Error(), "Not changing it") {
+	if _, err := provision.Make(ctx, api, "svc", "svc", []string{"asus"}, provision.Volumes{}); err == nil || !strings.Contains(err.Error(), "Not changing it") {
 		t.Fatalf("shared group: %v", err)
 	}
 	api = fencetest.NewFakeIncus("asus")
 	api.Projects["svc-asus"] = map[string]string{"restricted.cluster.groups": "everyone"}
-	if _, err := provision.Make(ctx, api, "svc", []string{"asus"}, provision.Volumes{}); err == nil || !strings.Contains(err.Error(), "Not changing it") {
+	if _, err := provision.Make(ctx, api, "svc", "svc", []string{"asus"}, provision.Volumes{}); err == nil || !strings.Contains(err.Error(), "Not changing it") {
 		t.Fatalf("project pinned elsewhere: %v", err)
 	}
 }
@@ -70,7 +70,7 @@ func TestRefusesWhatItWillNotFix(t *testing.T) {
 func TestEmptyGroupIsFilledWithConfirmation(t *testing.T) {
 	api := fencetest.NewFakeIncus("asus")
 	api.Groups["host-asus"] = nil
-	p, err := provision.Make(ctx, api, "svc", []string{"asus"}, provision.Volumes{})
+	p, err := provision.Make(ctx, api, "svc", "svc", []string{"asus"}, provision.Volumes{})
 	if err != nil || !p.NeedsConfirmation() {
 		t.Fatalf("err %v, confirm %v", err, p.NeedsConfirmation())
 	}
@@ -92,7 +92,7 @@ func TestReplicatedVolumes(t *testing.T) {
 		t.Fatal(err)
 	}
 	vols := provision.Volumes{Pool: "zp", Names: []string{"data"}}
-	p, err := provision.Make(ctx, api, "svc", []string{"asus", "dell"}, vols)
+	p, err := provision.Make(ctx, api, "svc", "svc", []string{"asus", "dell"}, vols)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,11 +113,46 @@ func TestReplicatedVolumes(t *testing.T) {
 	if _, ok := api.Vols["svc-dell/zp/dell/data"]; !ok {
 		t.Fatalf("dell's volume not created: %v", api.Vols)
 	}
-	again, err := provision.Make(ctx, api, "svc", []string{"asus", "dell"}, vols)
+	again, err := provision.Make(ctx, api, "svc", "svc", []string{"asus", "dell"}, vols)
 	if err != nil || len(again.Actions) != 0 {
 		t.Fatalf("second run: %d actions, err %v", len(again.Actions), err)
 	}
-	if _, err := provision.Make(ctx, api, "svc", []string{"asus"}, provision.Volumes{Pool: "nope", Names: []string{"data"}}); err == nil {
+	if _, err := provision.Make(ctx, api, "svc", "svc", []string{"asus"}, provision.Volumes{Pool: "nope", Names: []string{"data"}}); err == nil {
 		t.Fatal("a missing pool was not refused")
+	}
+}
+
+// A project made before the marker was user.pagurus.service (it was
+// user.pagurus.managed=true, which nothing read) gets the new key and loses
+// the old one; a project marked for another service is refused.
+func TestServiceMarker(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus")
+	api.Projects["svc-asus"] = map[string]string{"restricted.cluster.groups": "host-asus", "user.pagurus.managed": "true"}
+	p, err := provision.Make(ctx, api, "web", "svc", []string{"asus"}, provision.Volumes{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cmds []string
+	for _, a := range p.Actions {
+		cmds = append(cmds, a.Command)
+	}
+	if got := strings.Join(cmds, "\n"); !strings.Contains(got, "incus project set svc-asus user.pagurus.service=web") ||
+		!strings.Contains(got, "incus project unset svc-asus user.pagurus.managed") {
+		t.Fatalf("plan:\n%s", got)
+	}
+	if p.NeedsConfirmation() {
+		t.Error("marking a project must not need confirmation")
+	}
+	if err := p.Apply(ctx, api); err != nil {
+		t.Fatal(err)
+	}
+	if c := api.Projects["svc-asus"]; c["user.pagurus.service"] != "web" || c["user.pagurus.managed"] != "" {
+		t.Fatalf("svc-asus config %v", c)
+	}
+	if again, err := provision.Make(ctx, api, "web", "svc", []string{"asus"}, provision.Volumes{}); err != nil || len(again.Actions) != 0 {
+		t.Fatalf("second run: %v, err %v", again, err)
+	}
+	if _, err := provision.Make(ctx, api, "other", "svc", []string{"asus"}, provision.Volumes{}); err == nil || !strings.Contains(err.Error(), "Not changing it") {
+		t.Fatalf("a project of another service: %v", err)
 	}
 }

@@ -207,6 +207,10 @@ Failback is never automatic. Use `pagurus move`.
 
 `pagurus provision -c cfg` prepares Incus for a service. Each member gets a cluster group
 `host-<member>` holding exactly that member, and a project `<prefix>-<member>` pinned to it.
+Each project is marked `user.pagurus.service=<service>`, so other tools can tell a pagurus
+project apart (the configs repo's standby-sync skips them). Provision adds that key to an existing
+project and drops the old, unread `user.pagurus.managed`. A project marked for another service
+is refused.
 - It plans before it acts. `--dry-run` prints the equivalent `incus` commands and changes
   nothing.
 - It is idempotent: an already-right setup reports `[ok]` lines and does nothing.
@@ -247,7 +251,7 @@ incus config trust add-certificate pagurus.crt --restricted --projects <prefix>-
 | `GET /1.0` (member name, version, architectures) | allowed |
 | `GET /1.0/projects/<own>` · `/1.0/cluster/groups/<g>` · `/1.0/cluster/members/<m>` | allowed |
 | list, start, stop, state and config of instances in its projects | allowed |
-| `POST /1.0/projects`, `POST /1.0/cluster/groups` (`pagurus provision` creating things) | **refused**: run `provision` with an admin certificate |
+| `POST /1.0/projects`, `POST /1.0/cluster/groups` (`pagurus provision` creating or marking things) | **refused**: run `provision` with an admin certificate |
 
 - 🚨 **List *every* member's project in the certificate.** For a project it may not read, a
   restricted client gets **an empty instance list, not an error**, even when instances run there

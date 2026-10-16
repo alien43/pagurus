@@ -289,6 +289,25 @@ func (f *FakeIncus) SetClusterGroupMembers(ctx context.Context, group string, me
 	return nil
 }
 
+func (f *FakeIncus) SetProjectConfig(ctx context.Context, project, key, value string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.Projects[project]
+	if !ok {
+		return notFound("project " + project)
+	}
+	f.mutations++
+	if value == "" {
+		delete(c, key)
+	} else {
+		c[key] = value
+	}
+	return nil
+}
+
 func (f *FakeIncus) CreateProject(ctx context.Context, project string, config map[string]string) error {
 	if err := f.gate(ctx); err != nil {
 		return err
