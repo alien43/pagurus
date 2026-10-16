@@ -462,7 +462,10 @@ func TestReplicaMoveCopiesBeforeStopping(t *testing.T) {
 	if err := h.coord().SetPin(context.Background(), "dell"); err != nil {
 		t.Fatal(err)
 	}
+	// Measured in data, not wall time (the takeover's own overhead varies,
+	// ~3x under -race): what dell still had to pull once nothing ran.
 	var stopped time.Time
+	var atStop int64
 	for end := time.Now().Add(20 * time.Second); ; time.Sleep(5 * time.Millisecond) {
 		on := h.sim.runningOn()
 		if slices.Contains(on, "dell") {
@@ -470,16 +473,17 @@ func TestReplicaMoveCopiesBeforeStopping(t *testing.T) {
 		}
 		if len(on) == 0 && stopped.IsZero() {
 			stopped = time.Now()
+			atStop = int64(h.replStat(func(r *simRepl) int { return int(r.pulled["dell"]) }))
 		}
 		if time.Now().After(end) {
 			t.Fatalf("dell never started (running on %v)", on)
 		}
 	}
 	_ = h.coord().SetPin(context.Background(), "")
-	gap := time.Since(stopped)
-	t.Logf("nothing ran for %s", gap.Round(time.Millisecond))
-	if gap > 1500*time.Millisecond {
-		t.Fatalf("nothing ran for %s: the move waited out dell's backlog with the workload stopped", gap.Round(time.Millisecond))
+	residual := h.startHead("dell") - atStop
+	t.Logf("nothing ran for %s; the final catch-up carried %d writes (the backlog was ~600)", time.Since(stopped).Round(time.Millisecond), residual)
+	if residual > 300 {
+		t.Fatalf("the final catch-up carried %d writes: the move stopped the workload before dell had its backlog", residual)
 	}
 	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
 		t.Fatalf("dell started from %d, asus stopped at %d", got, old)
