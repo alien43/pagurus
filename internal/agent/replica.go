@@ -25,6 +25,7 @@ import (
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/replica"
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Volumes is the storage side of replication. *incus.Driver implements it;
@@ -223,7 +224,11 @@ func (a *Agent) pullOnce(ctx context.Context) {
 		}
 		pulled = true
 	}
-	if !pulled {
+	// Every volume now has src.Snapshot. Nothing new was pulled, but if
+	// the record does not say so (a pull whose publish failed, e.g. a
+	// transient etcd error), publish it now: a waiting move or drain
+	// watches this record, and no new round comes while it waits.
+	if !pulled && mine.Snapshot == src.Snapshot && mine.SourceEpoch == epoch {
 		return
 	}
 	// Rule 1: a copy made while the office moved is not this member's
@@ -311,6 +316,10 @@ func (t *termState) replicaTakeover() bool {
 	case prev == a.member:
 		t.log.Info("replicate: this member led last; starting from its own volumes", "led_epoch", prevEpoch)
 	default:
+		if snap, ok := a.haveFinal(t.op, prevEpoch); ok {
+			t.log.Info("replicate: this member already holds the previous holder's final state; nothing lost", "previous", prev, "snapshot", snap)
+			break
+		}
 		err := t.catchUp(prev, prevEpoch, led[a.member])
 		if err == nil {
 			break
@@ -357,10 +366,8 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 		return fmt.Errorf("%s still runs %v", prev, r)
 	}
 	snap := replica.Name(prevEpoch, a.now(), true)
-	for _, vol := range a.cfg.Replicate.Volumes {
-		if err := a.vols.SnapshotVolume(ctx, prev, vol, snap); err != nil {
-			return fmt.Errorf("snapshot %s on %s: %w", vol, prev, err)
-		}
+	if err := a.snapshotAll(ctx, prev, snap); err != nil {
+		return fmt.Errorf("on %s: %w", prev, err)
 	}
 	if err := t.authorised(ctx); err != nil {
 		return err
@@ -438,6 +445,100 @@ func (a *Agent) acceptStaleFor(ctx context.Context) bool {
 
 // ------------------------------------------------------------------ leader -
 
+// snapshotAll snapshots every replicated volume of member as snap. A round is
+// all volumes or none: on a failure it deletes what it took (best effort),
+// so no volume carries a name the others lack (a lone -final would read as
+// a clean handover to rule 4).
+func (a *Agent) snapshotAll(ctx context.Context, member, snap string) error {
+	for i, vol := range a.cfg.Replicate.Volumes {
+		if err := a.vols.SnapshotVolume(ctx, member, vol, snap); err != nil {
+			for _, done := range a.cfg.Replicate.Volumes[:i] {
+				_ = a.vols.DeleteVolumeSnapshot(context.Background(), member, done, snap)
+			}
+			return fmt.Errorf("snapshot %s of %s: %w", snap, vol, err)
+		}
+	}
+	return nil
+}
+
+// DrainTimeout bounds how long a shutting-down leader waits for its
+// followers to pull its final state (within systemd's TimeoutStopSec=60s,
+// after the stop itself).
+const DrainTimeout = 30 * time.Second
+
+// drain runs when the agent shuts down while leading (a host reboot), after
+// the workload is confirmed stopped and before the office is released: it
+// snapshots every volume -final, publishes that as the round, and waits
+// until every follower with a live agent has pulled it (or DrainTimeout,
+// capped by catchup_timeout). The next leader then already holds the final
+// state and needs nothing from this host, whose Incus may be gone by then.
+func (a *Agent) drain(epoch int64, lease clientv3.LeaseID, log *slog.Logger) {
+	if !a.replicating() {
+		return
+	}
+	within := min(DrainTimeout, a.cfg.Replicate.CatchupTimeout.D())
+	ctx, cancel := context.WithTimeout(context.Background(), within+a.cfg.Fence.APITimeout.D())
+	defer cancel()
+	a.beat(within + time.Minute)
+	began := a.now()
+	snap := replica.Name(epoch, began, true)
+	if err := a.snapshotAll(ctx, a.member, snap); err != nil {
+		log.Warn("drain: no final snapshot; releasing without one", "err", err)
+		return
+	}
+	if err := a.co.Guarded(ctx, epoch, lease, a.co.OpPutReplicaSource(coord.ReplicaSource{
+		Member: a.member, Epoch: epoch, Snapshot: snap, At: a.now().UTC(),
+	})); err != nil {
+		log.Warn("drain: cannot publish the final snapshot; releasing", "err", err)
+		return
+	}
+	log.Info("drain: waiting for the followers to pull the final state", "snapshot", snap, "within", within)
+	for deadline := began.Add(within); ; {
+		var waiting []string
+		regs, err := a.co.Registrations(ctx)
+		for m := range regs {
+			if m == a.member {
+				continue
+			}
+			if rc, err := a.co.ReplicaCopy(ctx, m); err != nil || rc == nil || rc.Snapshot != snap || rc.SourceEpoch != epoch {
+				waiting = append(waiting, m)
+			}
+		}
+		if err == nil && len(waiting) == 0 {
+			log.Info("drain: the live followers have the final state; releasing", "snapshot", snap, "took", a.now().Sub(began).Round(time.Millisecond))
+			return
+		}
+		if a.now().After(deadline) {
+			slices.Sort(waiting)
+			log.Warn("drain: not every follower pulled the final state in time; releasing anyway", "waiting", waiting, "err", err)
+			return
+		}
+		if !sleep(ctx, 100*time.Millisecond) {
+			return
+		}
+	}
+}
+
+// haveFinal: this member's own copy already is prev's final state of
+// prevEpoch (a drained shutdown), on every volume.
+func (a *Agent) haveFinal(ctx context.Context, prevEpoch int64) (string, bool) {
+	mine, err := a.co.ReplicaCopy(ctx, a.member)
+	if err != nil || mine == nil || mine.SourceEpoch != prevEpoch {
+		return "", false
+	}
+	s, ok := replica.Parse(mine.Snapshot)
+	if !ok || !s.Final || s.Epoch != prevEpoch {
+		return "", false
+	}
+	for _, vol := range a.cfg.Replicate.Volumes {
+		local, err := a.vols.VolumeSnapshots(ctx, a.member, vol)
+		if err != nil || !slices.Contains(local, mine.Snapshot) {
+			return "", false
+		}
+	}
+	return mine.Snapshot, true
+}
+
 // snapshotRound snapshots every volume, prunes, and publishes the round. It
 // returns the published snapshot's name, or "" if the round failed.
 func (t *termState) snapshotRound() string {
@@ -451,12 +552,10 @@ func (t *termState) snapshotRound() string {
 		}
 	}
 	name := replica.Name(t.epoch, a.now(), false)
-	for _, vol := range r.Volumes {
-		if err := a.vols.SnapshotVolume(ctx, a.member, vol, name); err != nil {
-			a.m.Inc("pagurus_replica_snapshots_total", "result", "failed")
-			t.log.Warn("replicate: snapshot failed", "volume", vol, "err", err)
-			return ""
-		}
+	if err := a.snapshotAll(ctx, a.member, name); err != nil {
+		a.m.Inc("pagurus_replica_snapshots_total", "result", "failed")
+		t.log.Warn("replicate: snapshot failed", "err", err)
+		return ""
 	}
 	a.m.Inc("pagurus_replica_snapshots_total", "result", "ok")
 	if err := a.co.Guarded(ctx, t.epoch, t.lease, a.co.OpPutReplicaSource(coord.ReplicaSource{

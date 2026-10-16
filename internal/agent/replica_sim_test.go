@@ -63,13 +63,14 @@ type simRepl struct {
 	refreshes  map[string]int   // complete refreshes into a member
 	failed     map[string]int   // failed or cancelled refreshes into a member
 	hooks      map[string]int
+	snapFail   map[string]bool // volume name -> SnapshotVolume fails
 	calls      int // every volume call, any member
 }
 
 func (c *simCluster) repl() *simRepl {
 	if c.vol == nil {
 		c.vol = &simRepl{vols: map[string]map[string]*simVol{}, pullDelay: map[string]time.Duration{}, perWrite: map[string]time.Duration{}, pulling: map[string]bool{},
-			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}}
+			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}, snapFail: map[string]bool{}}
 	}
 	return c.vol
 }
@@ -124,6 +125,9 @@ func (r *simRT) SnapshotVolume(_ context.Context, member, vol, snap string) erro
 	defer r.c.mu.Unlock()
 	if err := r.volOp(member); err != nil {
 		return err
+	}
+	if r.c.repl().snapFail[vol] {
+		return fmt.Errorf("injected: snapshot of %s fails", vol)
 	}
 	v := r.c.volume(member, vol)
 	if slices.Contains(v.names(), snap) {
@@ -487,6 +491,81 @@ func TestReplicaMoveCopiesBeforeStopping(t *testing.T) {
 	}
 	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
 		t.Fatalf("dell started from %d, asus stopped at %d", got, old)
+	}
+}
+
+// A planned reboot: the leader's agent shuts down gracefully, and its host's
+// Incus goes away right after. The leader drains before it releases (stop,
+// snapshot -final, wait until the live followers have pulled it), so the next
+// leader starts with nothing lost although the old host is unreachable by
+// then, and the returning host finds nothing diverged (live 2026-10-16: two
+// kernel reboots took the unreachable path, 40 s and 3.5 min of exposure).
+func TestReplicaShutdownDrainsBeforeTheHostGoes(t *testing.T) {
+	h := newReplHarness(t, replicated(time.Minute))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("both followers pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") && h.pulledFromLeader("rpi5") })
+	h.nodes["asus"].cancel()
+	<-h.nodes["asus"].done
+	h.sim.set("asus", func(sm *simMember) { sm.online, sm.isolated = false, true }) // the host reboots
+	h.waitRunning("dell", 30*time.Second)
+	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
+		t.Fatalf("dell started from %d, asus stopped at %d: a planned shutdown lost %d writes", got, old, old-got)
+	}
+	h.powerOn("asus")
+	h.waitFor("asus pulled from the new leader", 15*time.Second, func() bool { return h.pulledFromLeader("asus") })
+	if o := h.orphans("asus"); len(o) != 0 {
+		t.Fatalf("asus orphaned %v after a drained shutdown", o)
+	}
+}
+
+// A follower whose pull completed but whose record did not (a transient
+// etcd error on the publish) publishes it on its next tick, without waiting
+// for a new round: a move or drain waits on exactly that record, and no new
+// round comes while it waits (code review 2026-10-16, bug 2).
+func TestReplicaUnrecordedPullIsPublishedWithoutANewRound(t *testing.T) {
+	h := newReplHarness(t, func(c *config.Config) {
+		replicated(time.Minute)(c)
+		c.Replicate.Interval = config.Duration(time.Hour) // one round only: the term's first
+		c.Replicate.MaxStaleness = config.Duration(2 * time.Hour)
+	})
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	if _, err := h.obs.Delete(context.Background(), h.coord().ReplicaCopyKey("dell")); err != nil {
+		t.Fatal(err)
+	}
+	h.waitFor("dell re-published its pull", 5*time.Second, func() bool { return h.pulledFromLeader("dell") })
+}
+
+// A round is all volumes or none: when the second volume's snapshot fails,
+// the first's is deleted again and nothing is published (review bug 4).
+func TestReplicaFailedRoundLeavesNoPartialSnapshot(t *testing.T) {
+	h := newReplHarness(t, func(c *config.Config) {
+		replicated(time.Minute)(c)
+		c.Replicate.Volumes = []string{"data", "config"}
+	})
+	h.sim.mu.Lock()
+	for _, m := range []string{"asus", "dell", "rpi5"} {
+		h.sim.volume(m, "config") // provisioned
+	}
+	h.sim.mu.Unlock()
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	src0, _ := h.coord().ReplicaSource(context.Background())
+	h.sim.mu.Lock()
+	h.sim.repl().snapFail["config"] = true
+	h.sim.mu.Unlock()
+	time.Sleep(2 * time.Second) // several 500 ms rounds, all failing
+	h.sim.mu.Lock()
+	data, config := h.sim.volume("asus", "data").names(), h.sim.volume("asus", "config").names()
+	h.sim.mu.Unlock()
+	if !slices.Equal(data, config) {
+		t.Fatalf("data has %v, config has %v: a failed round left a partial snapshot", data, config)
+	}
+	if src, _ := h.coord().ReplicaSource(context.Background()); src == nil || src0 == nil || src.Snapshot != src0.Snapshot {
+		t.Fatalf("a failed round was published: before %+v, after %+v", src0, src)
 	}
 }
 

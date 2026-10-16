@@ -57,14 +57,16 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 			log.Warn("term lost (conch ended it); conch's fence stops the workload")
 			return 70
 		}
-		reason, backoff := "agent shutdown", time.Duration(0)
+		reason, backoff, shutdown := "agent shutdown", time.Duration(0), false
 		switch {
 		case t.releaseReason != "":
 			reason, backoff = t.releaseReason, t.releaseBackoff
 		case ctx.Err() == nil:
 			reason = "term ended"
+		default:
+			shutdown = true // the host may be going down: drain first
 		}
-		if a.release(epoch, lease, reason, backoff, log) {
+		if a.release(epoch, lease, reason, backoff, shutdown, log) {
 			return 0
 		}
 		return 1
@@ -105,7 +107,7 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 // then runs the fence (which confirms at once) and resigns. If the stop cannot
 // be confirmed the member state stays may-run: conch's fence tries again, and
 // failing that the next leader must fence us.
-func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, backoff time.Duration, log *slog.Logger) bool {
+func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, backoff time.Duration, drain bool, log *slog.Logger) bool {
 	log.Info("releasing the office", "reason", reason, "backoff", backoff)
 	bg := context.Background()
 	sctx, cancel := context.WithTimeout(bg, a.cfg.SelfFence.StopBudget.D()+5*time.Second)
@@ -124,6 +126,9 @@ func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, back
 	if !ok {
 		log.Warn("release: local stop unconfirmed; leaving member state may-run for conch's fence and the next leader")
 		return false
+	}
+	if drain {
+		a.drain(epoch, lease, log)
 	}
 	if err := a.co.Guarded(bg, epoch, lease, a.co.OpPutMS(a.member, coord.MemberState{
 		State: coord.Stopped, Epoch: epoch, By: a.member, Reason: "released: " + reason, At: a.now().UTC(), Caps: a.caps(),

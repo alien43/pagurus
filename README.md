@@ -360,6 +360,25 @@ the new term's final catch-up carries only what was written since that round. Li
 a 3 GiB pull left nothing running for 104 s before this; the sim's gap dropped from 2.9 s to 0.7 s.
 For a replicating service, `move`'s default `--timeout` grows to `catchup_timeout` + 2 m.
 
+**A leader whose agent shuts down drains first.** A host reboot stops the agent, and the host's Incus
+follows within seconds, before the next leader could reach it for the final state. So, after the
+workload is confirmed stopped and before the office is released, the leader:
+1. snapshots every volume `-final`;
+2. publishes that as the round;
+3. waits, up to 30 s (capped by `catchup_timeout`), until every follower with a live agent
+   (`<prefix>/reg/`) has pulled it.
+
+A new leader whose own copy is the previous holder's `-final` of its last epoch starts from it with
+nothing lost and doesn't contact the old host. The returning host shares that `-final` with the new
+source, so rule 4 finds nothing diverged. The agent must stop before the host's Incus does: the
+NixOS unit and the rpi5 unit are ordered after `incus-startup.service`, whose stop shuts the instances
+down and puts incusd into "shutting down" mode. Live on 2026-10-16, two kernel reboots without this
+took the unreachable path, exposing 40 s and 3.5 min of writes.
+
+A snapshot round covers all volumes or none: if one volume's snapshot fails, the others' are deleted
+again. A follower whose pull completed but whose record didn't (a failed etcd write) publishes the
+record on its next tick, without waiting for a new round.
+
 **Rule 4: never destroy the loser's data.** Before a pull overwrites its volume, the member checks
 whether the volume holds writes the source lacks. It does when any of these holds:
 - it has a snapshot newer than their common snapshot that the source doesn't have;
