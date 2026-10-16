@@ -64,7 +64,7 @@ type simRepl struct {
 	failed     map[string]int   // failed or cancelled refreshes into a member
 	hooks      map[string]int
 	snapFail   map[string]bool // volume name -> SnapshotVolume fails
-	calls      int // every volume call, any member
+	calls      int             // every volume call, any member
 }
 
 func (c *simCluster) repl() *simRepl {
