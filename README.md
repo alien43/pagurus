@@ -367,7 +367,9 @@ only then resyncs. Orphans are never merged or pruned; a human decides.
    none, the member doesn't start. It alerts (`replica-stale`) and gives the office up with the
    release backoff. `pagurus accept-stale -c cfg [--member m]` lets one term start anyway, and
    that member skips its backoff. The loss is then everything after its copy; the writes stay on
-   the previous holder and become its orphan when it returns.
+   the previous holder and become its orphan when it returns. The override covers one term: a
+   term of that member (or any member's, without `--member`) that starts without needing it,
+   say because the previous holder came back and was caught up from, clears it too.
 
 Not built from the proposal: the rollback of a new leader's volume to its newest snapshot. A
 half-applied copy can't exist (the spike), and the rollback would destroy that member's own

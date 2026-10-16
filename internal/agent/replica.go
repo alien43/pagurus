@@ -324,6 +324,14 @@ func (t *termState) replicaTakeover() bool {
 		}
 	}
 	a.m.Bool("pagurus_replica_stale_blocked", false)
+	// An accept-stale is for one term: this one, if it named this member,
+	// whether or not the gate needed it. Left pending, it would pass a later,
+	// unrelated failover's gate without an operator's word.
+	if as, err := a.co.GetAcceptStale(t.op); err == nil && as != nil && (as.Member == "" || as.Member == a.member) {
+		if err := a.co.ConsumeAcceptStale(t.op, t.epoch, t.lease, as.ModRev); err == nil {
+			t.log.Info("replicate: a pending accept-stale was not needed; cleared (it covers one term)", "by", as.By)
+		}
+	}
 	if err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutReplicaLed(a.member, t.epoch)); err != nil {
 		t.log.Warn("replicate: cannot record this term in replica/led; not starting", "err", err)
 		return false

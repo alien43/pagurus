@@ -519,6 +519,31 @@ func TestReplicaStaleGateBlocksUntilAcceptStale(t *testing.T) {
 	}
 }
 
+// An accept-stale is for one term. If that term starts without needing it
+// (the previous holder came back and was caught up from), it is spent: left
+// pending, it would let a later, unrelated failover start stale without
+// anyone's word (found live, tasks/results/pagurus-replica-e2e.md).
+func TestReplicaAcceptStaleSpentByATermThatDidNotNeedIt(t *testing.T) {
+	h := newReplHarness(t, replicated(time.Minute))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	if err := h.coord().SetAcceptStale(context.Background(), coord.AcceptStale{Member: "dell", By: "test", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.coord().SetPin(context.Background(), "dell"); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRunning("dell", 15*time.Second)
+	_ = h.coord().SetPin(context.Background(), "")
+	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
+		t.Fatalf("dell started from %d, asus stopped at %d: the move did not catch up", got, old)
+	}
+	if a, _ := h.coord().GetAcceptStale(context.Background()); a != nil {
+		t.Fatalf("accept-stale still pending after dell's term started without it: %+v", a)
+	}
+}
+
 // §5 "A partitioned old leader is still running and still writing": it is
 // fenced (self-fence), and its writes become orphan material when it returns,
 // never flowing anywhere.
