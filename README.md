@@ -352,6 +352,14 @@ stopped (rule 1). A new term waits for an in-flight pull to end, up to `catchup_
 up the office past that. It waits rather than cancels, because killing the `incus` client doesn't stop
 the copy server-side.
 
+**A planned move copies first and stops second.** When the leader sees `pagurus move`'s pin to
+another member, it keeps serving and takes one more round at once. It skips its regular rounds and
+waits, up to `catchup_timeout`, until the target has pulled that round. Only then does it release.
+The target's backlog (an in-flight pull, a burst of writes) crosses while the workload still runs, and
+the new term's final catch-up carries only what was written since that round. Live, a move during
+a 3 GiB pull left nothing running for 104 s before this; the sim's gap dropped from 2.9 s to 0.7 s.
+For a replicating service, `move`'s default `--timeout` grows to `catchup_timeout` + 2 m.
+
 **Rule 4: never destroy the loser's data.** Before a pull overwrites its volume, the member checks
 whether the volume holds writes the source lacks. It does when any of these holds:
 - it has a snapshot newer than their common snapshot that the source doesn't have;

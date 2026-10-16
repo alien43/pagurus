@@ -558,6 +558,16 @@ func (t *termState) supervise() {
 		case <-tick.C:
 		}
 		if pin, err := a.co.Pin(t.op); err == nil && pin != "" && pin != a.member {
+			// A planned move: with replication, copy to the target while
+			// still serving, so the stop-to-start gap is only the final
+			// catch-up. Release only if the pin still points there.
+			t.handover(pin)
+			if t.op.Err() != nil {
+				return
+			}
+			if now, err := a.co.Pin(t.op); err != nil || now != pin {
+				continue
+			}
 			t.giveUp("office pinned to "+pin, 0)
 			return
 		}

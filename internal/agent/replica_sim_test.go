@@ -54,6 +54,7 @@ func (v *simVol) clone() *simVol {
 type simRepl struct {
 	vols       map[string]map[string]*simVol // member -> volume -> data
 	pullDelay  map[string]time.Duration      // per pulling member
+	perWrite   map[string]time.Duration      // ... plus this per write the pull carries (its size)
 	pulling    map[string]bool
 	startHead  map[string]int64 // the data volume's counter at the last start, per member
 	stopHead   map[string]int64 // ... and at the last stop
@@ -67,7 +68,7 @@ type simRepl struct {
 
 func (c *simCluster) repl() *simRepl {
 	if c.vol == nil {
-		c.vol = &simRepl{vols: map[string]map[string]*simVol{}, pullDelay: map[string]time.Duration{}, pulling: map[string]bool{},
+		c.vol = &simRepl{vols: map[string]map[string]*simVol{}, pullDelay: map[string]time.Duration{}, perWrite: map[string]time.Duration{}, pulling: map[string]bool{},
 			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}}
 	}
 	return c.vol
@@ -156,6 +157,9 @@ func (r *simRT) RefreshVolume(ctx context.Context, from, to, vol string) error {
 	rp := r.c.repl()
 	src := r.c.volume(from, vol).clone()
 	delay := rp.pullDelay[to]
+	if d := src.head - r.c.volume(to, vol).head; d > 0 {
+		delay += time.Duration(d) * rp.perWrite[to]
+	}
 	rp.pulling[to] = true
 	r.c.mu.Unlock()
 	fail := func(err error) error {
@@ -429,6 +433,56 @@ func TestReplicaFailoverMidCopy(t *testing.T) {
 	}
 	if got := h.startHead("dell"); got != int64(before) {
 		t.Fatalf("dell started from %d, its last complete copy was %d", got, before)
+	}
+}
+
+// A planned move copies first and stops second: the leader keeps serving
+// while the target pulls its backlog, and releases only once the target has
+// a fresh round, so the gap with nothing running is a small final catch-up,
+// not the rest of a big pull (104 s live, tasks/results/pagurus-replica-e2e.md).
+func TestReplicaMoveCopiesBeforeStopping(t *testing.T) {
+	h := newReplHarness(t, replicated(time.Minute))
+	h.sim.mu.Lock()
+	h.sim.repl().perWrite["dell"] = 5 * time.Millisecond // 1 s of writes takes 0.5 s to pull
+	h.sim.mu.Unlock()
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	h.nodes["dell"].crash() // dell falls 6 s behind: its next pull takes ~3 s
+	time.Sleep(6 * time.Second)
+	h.start("dell", nil)
+	h.waitFor("dell mid-copy", 10*time.Second, func() bool {
+		return h.replStat(func(r *simRepl) int {
+			if r.pulling["dell"] {
+				return 1
+			}
+			return 0
+		}) == 1
+	})
+	if err := h.coord().SetPin(context.Background(), "dell"); err != nil {
+		t.Fatal(err)
+	}
+	var stopped time.Time
+	for end := time.Now().Add(20 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		on := h.sim.runningOn()
+		if slices.Contains(on, "dell") {
+			break
+		}
+		if len(on) == 0 && stopped.IsZero() {
+			stopped = time.Now()
+		}
+		if time.Now().After(end) {
+			t.Fatalf("dell never started (running on %v)", on)
+		}
+	}
+	_ = h.coord().SetPin(context.Background(), "")
+	gap := time.Since(stopped)
+	t.Logf("nothing ran for %s", gap.Round(time.Millisecond))
+	if gap > 1500*time.Millisecond {
+		t.Fatalf("nothing ran for %s: the move waited out dell's backlog with the workload stopped", gap.Round(time.Millisecond))
+	}
+	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
+		t.Fatalf("dell started from %d, asus stopped at %d", got, old)
 	}
 }
 

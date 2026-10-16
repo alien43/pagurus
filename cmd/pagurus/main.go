@@ -147,7 +147,12 @@ func main() {
 	case "status":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdStatus(ctx, cfg, drv, cli) })
 	case "move":
-		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdMove(ctx, cfg, cli, *to, *timeout) })
+		t := *timeout
+		if r := cfg.Replicate; r != nil && !flagSet(fs, "timeout") {
+			// The leader first copies to the target, for up to catchup_timeout.
+			t = max(t, r.CatchupTimeout.D()+2*time.Minute)
+		}
+		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdMove(ctx, cfg, cli, *to, t) })
 	case "refresh":
 		err = withEtcd(cfg, func(cli *clientv3.Client) error { return cmdRefresh(ctx, cfg, cli, *timeout) })
 	case "fence-ack":
@@ -409,6 +414,13 @@ func replicaStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, co
 	return tw.Flush()
 }
 
+// flagSet reports whether name was given on the command line.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	set := false
+	fs.Visit(func(f *flag.Flag) { set = set || f.Name == name })
+	return set
+}
+
 func cmdMove(ctx context.Context, cfg *config.Config, cli *clientv3.Client, to string, timeout time.Duration) error {
 	if !slices.Contains(cfg.Members, to) {
 		return fmt.Errorf("--to %q is not a member", to)
@@ -428,7 +440,11 @@ func cmdMove(ctx context.Context, cfg *config.Config, cli *clientv3.Client, to s
 			fmt.Fprintln(os.Stderr, "the pin changed since this move wrote it (or expired); left as it is")
 		}
 	}()
-	fmt.Printf("pinned office to %s; waiting for it to take over\n", to)
+	if cfg.Replicate != nil {
+		fmt.Printf("pinned office to %s; the leader copies to it first (up to %s), then hands over\n", to, cfg.Replicate.CatchupTimeout.D())
+	} else {
+		fmt.Printf("pinned office to %s; waiting for it to take over\n", to)
+	}
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		// A release by the target written after the pin means it won and

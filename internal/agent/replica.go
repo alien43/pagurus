@@ -438,8 +438,9 @@ func (a *Agent) acceptStaleFor(ctx context.Context) bool {
 
 // ------------------------------------------------------------------ leader -
 
-// snapshotRound snapshots every volume, prunes, and publishes the round.
-func (t *termState) snapshotRound() {
+// snapshotRound snapshots every volume, prunes, and publishes the round. It
+// returns the published snapshot's name, or "" if the round failed.
+func (t *termState) snapshotRound() string {
 	a := t.a
 	r := a.cfg.Replicate
 	ctx, cancel := context.WithTimeout(t.op, r.Interval.D()+2*a.cfg.Fence.APITimeout.D())
@@ -454,7 +455,7 @@ func (t *termState) snapshotRound() {
 		if err := a.vols.SnapshotVolume(ctx, a.member, vol, name); err != nil {
 			a.m.Inc("pagurus_replica_snapshots_total", "result", "failed")
 			t.log.Warn("replicate: snapshot failed", "volume", vol, "err", err)
-			return
+			return ""
 		}
 	}
 	a.m.Inc("pagurus_replica_snapshots_total", "result", "ok")
@@ -462,6 +463,7 @@ func (t *termState) snapshotRound() {
 		Member: a.member, Epoch: t.epoch, Snapshot: name, At: a.now().UTC(),
 	})); err != nil {
 		t.log.Warn("replicate: cannot publish the snapshot", "err", err)
+		name = ""
 	}
 	a.m.SetGauge("pagurus_replica_age_seconds", 0)
 	for _, vol := range r.Volumes {
@@ -473,6 +475,44 @@ func (t *termState) snapshotRound() {
 			if err := a.vols.DeleteVolumeSnapshot(ctx, a.member, vol, old); err != nil {
 				t.log.Warn("replicate: prune failed", "volume", vol, "snapshot", old, "err", err)
 			}
+		}
+	}
+	return name
+}
+
+// handover runs before a planned move releases the office: one more round
+// now, then wait (still serving) until the target has pulled it, within
+// catchup_timeout. The target's backlog crosses while the workload runs;
+// what the new term pulls after the stop is only what was written since
+// this round. It returns early if the pin moves; the caller re-reads it.
+func (t *termState) handover(to string) {
+	a := t.a
+	if !a.replicating() {
+		return
+	}
+	within := a.cfg.Replicate.CatchupTimeout.D()
+	a.beat(within + time.Minute)
+	began := a.now()
+	snap := t.snapshotRound()
+	if snap == "" {
+		t.log.Warn("move: no fresh round to copy; releasing without one", "to", to)
+		return
+	}
+	t.log.Info("move: copying to the target before releasing", "to", to, "snapshot", snap, "within", within)
+	for deadline := began.Add(within); ; {
+		if rc, err := a.co.ReplicaCopy(t.op, to); err == nil && rc != nil && rc.Snapshot == snap && rc.SourceEpoch == t.epoch {
+			t.log.Info("move: the target has the latest round; releasing", "to", to, "took", a.now().Sub(began).Round(time.Millisecond))
+			return
+		}
+		if a.now().After(deadline) {
+			t.log.Warn("move: the target did not catch up within catchup_timeout; releasing anyway", "to", to)
+			return
+		}
+		if pin, err := a.co.Pin(t.op); err == nil && pin != to {
+			return
+		}
+		if !sleep(t.op, 100*time.Millisecond) {
+			return
 		}
 	}
 }
