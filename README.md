@@ -392,10 +392,21 @@ only then resyncs. Orphans are never merged or pruned; a human decides.
 1. If no member has led with replication yet, or it led last itself, it starts from its own volumes.
 2. Otherwise it tries to **catch up**. If the previous holder is Online in Incus and nothing runs
    in its project (it has just been fenced), it snapshots that holder's volumes `-final` and pulls
-   them. **Nothing is lost**: a move, an agent crash, an unhealthy give-up.
+   them. **Nothing is lost**: a move, an agent crash, an unhealthy give-up. A volume whose pull
+   fails is retried while the previous holder stays reachable, within `catchup_timeout`, so the
+   volumes don't end up from different rounds.
 3. If the previous holder is unreachable (host down, partition), it starts from its own newest
-   copy. The **staleness gate** applies: if that copy is older than `max_staleness`, or there is
-   none, the member doesn't start. It alerts (`replica-stale`) and gives the office up with the
+   copy, after two checks:
+   - **The freshest copy leads.** If another member with a live agent (`<prefix>/reg/`) has
+     published a newer copy, this member steps aside (giving the office up for
+     (members + 1) × `grace`) so that member can take it. It does this once per previous term,
+     so a fresher member that can't host doesn't keep the office empty.
+   - **A consistent copy only.** "Its copy" is the newest round that every volume has. If the
+     volumes' own newest snapshots differ (a pull or catch-up that stopped part-way), the copy is
+     mixed and the member doesn't start.
+
+   The **staleness gate** applies: if that copy is older than `max_staleness`, is mixed, or there
+   is none, the member doesn't start. It alerts (`replica-stale`) and gives the office up with the
    release backoff. `pagurus accept-stale -c cfg [--member m]` lets one term start anyway, and
    that member skips its backoff. The loss is then everything after its copy; the writes stay on
    the previous holder and become its orphan when it returns. The override covers one term: a
@@ -405,7 +416,12 @@ only then resyncs. Orphans are never merged or pruned; a human decides.
 Not built from the proposal: the rollback of a new leader's volume to its newest snapshot. A
 half-applied copy can't exist (the spike), and the rollback would destroy that member's own
 uncopied writes. Not built yet: a byte counter for pulls (neither the CLI nor the API reports
-bytes), and preferring the freshest follower at failover.
+bytes).
+
+**Multi-volume consistency has a limit.** Each volume is refreshed separately, and a refresh
+carries the source's live head. So a follower's volumes match to the round, but their heads can
+differ by the seconds between two pulls. An application that needs its volumes from one instant
+(say, a database split over two volumes) should keep its state on one volume.
 
 `pagurus status` shows, for a replicating service:
 - the last published round;

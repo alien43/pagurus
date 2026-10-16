@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -64,13 +65,14 @@ type simRepl struct {
 	failed     map[string]int   // failed or cancelled refreshes into a member
 	hooks      map[string]int
 	snapFail   map[string]bool // volume name -> SnapshotVolume fails
+	refFail    map[string]bool // "<to>/<volume>" -> RefreshVolume into it fails
 	calls      int             // every volume call, any member
 }
 
 func (c *simCluster) repl() *simRepl {
 	if c.vol == nil {
 		c.vol = &simRepl{vols: map[string]map[string]*simVol{}, pullDelay: map[string]time.Duration{}, perWrite: map[string]time.Duration{}, pulling: map[string]bool{},
-			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}, snapFail: map[string]bool{}}
+			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}, snapFail: map[string]bool{}, refFail: map[string]bool{}}
 	}
 	return c.vol
 }
@@ -95,6 +97,11 @@ func (c *simCluster) write() {
 	for name, m := range c.m {
 		if m.running {
 			c.volume(name, "data").head++
+			for vol, v := range c.repl().vols[name] {
+				if vol != "data" && !strings.Contains(vol, "-orphaned-") {
+					v.head++
+				}
+			}
 		}
 	}
 }
@@ -159,6 +166,11 @@ func (r *simRT) RefreshVolume(ctx context.Context, from, to, vol string) error {
 		return err
 	}
 	rp := r.c.repl()
+	if rp.refFail[to+"/"+vol] {
+		rp.failed[to]++
+		r.c.mu.Unlock()
+		return fmt.Errorf("injected: refresh of %s into %s fails", vol, to)
+	}
 	src := r.c.volume(from, vol).clone()
 	delay := rp.pullDelay[to]
 	if d := src.head - r.c.volume(to, vol).head; d > 0 {
@@ -411,8 +423,9 @@ func TestReplicaLeaderCrashBetweenSnapshots(t *testing.T) {
 }
 
 // §5 "Failover in the middle of a copy": the source dies mid-transfer. The
-// pull fails without changing anything, and the new leader starts from its
-// previous complete copy.
+// pull fails without changing anything on its target. The new leader is the
+// member with the freshest complete copy: rpi5, whose last pull finished,
+// not dell, whose pull was cut off (the freshest copy leads).
 func TestReplicaFailoverMidCopy(t *testing.T) {
 	h := newReplHarness(t, both(proceed, replicated(time.Minute)))
 	h.startAll()
@@ -429,14 +442,15 @@ func TestReplicaFailoverMidCopy(t *testing.T) {
 			return 0
 		}) == 1
 	})
-	before := h.replStat(func(r *simRepl) int { return int(r.pulled["dell"]) })
+	before := int64(h.replStat(func(r *simRepl) int { return int(r.pulled["dell"]) }))
 	h.powerOff("asus")
-	h.waitRunning("dell", 30*time.Second)
-	if f := h.replStat(func(r *simRepl) int { return r.failed["dell"] }); f == 0 {
-		t.Fatal("the interrupted pull did not fail")
+	h.waitFor("the interrupted pull failed", 10*time.Second, func() bool { return h.replStat(func(r *simRepl) int { return r.failed["dell"] }) > 0 })
+	if got := h.volHead("dell", "data"); got != before {
+		t.Fatalf("dell's volume is at %d after the interrupted pull, its last complete copy was %d", got, before)
 	}
-	if got := h.startHead("dell"); got != int64(before) {
-		t.Fatalf("dell started from %d, its last complete copy was %d", got, before)
+	h.waitRunning("rpi5", 60*time.Second)
+	if got := h.startHead("rpi5"); got < before {
+		t.Fatalf("rpi5 started from %d, older than dell's last complete copy %d", got, before)
 	}
 }
 
@@ -566,6 +580,151 @@ func TestReplicaFailedRoundLeavesNoPartialSnapshot(t *testing.T) {
 	}
 	if src, _ := h.coord().ReplicaSource(context.Background()); src == nil || src0 == nil || src.Snapshot != src0.Snapshot {
 		t.Fatalf("a failed round was published: before %+v, after %+v", src0, src)
+	}
+}
+
+// twoVolumes provisions "config" next to "data" on every member.
+func twoVolumes(h *harness) {
+	h.sim.mu.Lock()
+	for _, m := range []string{"asus", "dell", "rpi5"} {
+		h.sim.volume(m, "config")
+	}
+	h.sim.mu.Unlock()
+}
+
+func (h *harness) volHead(m, vol string) int64 {
+	h.sim.mu.Lock()
+	defer h.sim.mu.Unlock()
+	return h.sim.volume(m, vol).head
+}
+
+func multi(maxStale time.Duration) func(*config.Config) {
+	return func(c *config.Config) {
+		replicated(maxStale)(c)
+		c.Replicate.Volumes = []string{"data", "config"}
+	}
+}
+
+// The leader dies unreachable and the first member to win holds an older
+// copy than another live member: it steps aside once so the member with the
+// freshest copy leads. On the rig (2026-10-16) the preferred member started
+// from a 1m55s copy while rpi5 held a fresher one, which then became an orphan.
+func TestReplicaFailoverPrefersTheFreshestCopy(t *testing.T) {
+	h := newReplHarness(t, both(proceed, replicated(time.Minute)))
+	h.cfg.Prefer = []string{"dell", "asus", "rpi5"}
+	h.startAll()
+	h.waitRunning("dell", 10*time.Second)
+	h.waitFor("followers pulled", 10*time.Second, func() bool { return h.pulledFromLeader("asus") && h.pulledFromLeader("rpi5") })
+	h.nodes["asus"].crash() // asus stops pulling: its copy ages
+	time.Sleep(3 * time.Second)
+	h.waitFor("rpi5 pulled again", 5*time.Second, func() bool { return h.pulledFromLeader("rpi5") })
+	h.powerOff("dell")
+	h.start("asus", nil) // asus is preferred over rpi5
+	h.waitRunning("rpi5", 60*time.Second)
+	got, copyAt := h.startHead("rpi5"), int64(h.replStat(func(r *simRepl) int { return int(r.pulled["rpi5"]) }))
+	asusCopy := int64(h.replStat(func(r *simRepl) int { return int(r.pulled["asus"]) }))
+	t.Logf("rpi5 started from %d (its copy %d); asus's copy was %d", got, copyAt, asusCopy)
+	if got <= asusCopy {
+		t.Fatalf("rpi5 started from %d, no newer than asus's stale copy %d", got, asusCopy)
+	}
+}
+
+// Volumes from different rounds (a pull or catch-up that failed after some
+// volumes) are not a copy to start from: the member refuses, and an
+// operator's accept-stale overrides.
+func TestReplicaMixedVolumesDoNotStart(t *testing.T) {
+	h := newReplHarness(t, both(proceed, multi(time.Minute)))
+	twoVolumes(h)
+	h.cfg.Prefer = []string{"dell", "asus", "rpi5"}
+	h.startAll()
+	h.waitRunning("dell", 10*time.Second)
+	h.waitFor("asus pulled", 10*time.Second, func() bool { return h.pulledFromLeader("asus") })
+	h.nodes["rpi5"].crash() // rpi5 out of the race
+	h.sim.mu.Lock()
+	h.sim.repl().refFail["asus/config"] = true // asus's later pulls get data, not config
+	h.sim.mu.Unlock()
+	time.Sleep(2 * time.Second)
+	h.powerOff("dell")
+	h.holdNobody(20 * time.Second)
+	if v := h.nodes["asus"].agent.m.Get("pagurus_replica_stale_blocked"); v != 1 {
+		t.Fatalf("asus stale_blocked = %v, want 1 (mixed volumes)", v)
+	}
+	if err := h.coord().SetAcceptStale(context.Background(), coord.AcceptStale{Member: "asus", By: "test", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRunning("asus", 40*time.Second)
+}
+
+// Two volumes follow the office together: a clean move loses nothing on
+// either, and a leader that dies unreachable leaves an orphan of each volume
+// with its exact data, preserved once.
+func TestReplicaMultiVolumeMoveAndOrphan(t *testing.T) {
+	h := newReplHarness(t, both(proceed, multi(time.Minute)))
+	twoVolumes(h)
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	if err := h.coord().SetPin(context.Background(), "dell"); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRunning("dell", 15*time.Second)
+	_ = h.coord().SetPin(context.Background(), "")
+	for _, vol := range []string{"data", "config"} {
+		if a, d := h.volHead("asus", vol), h.volHead("dell", vol); d < a {
+			t.Fatalf("%s: dell has %d, asus stopped at %d: the move lost writes", vol, d, a)
+		}
+	}
+	h.waitFor("asus pulled from dell", 10*time.Second, func() bool { return h.pulledFromLeader("asus") })
+	time.Sleep(300 * time.Millisecond) // dell writes past its last round
+	at := map[string]int64{}
+	h.sim.set("dell", func(sm *simMember) { sm.online, sm.isolated = false, true })
+	h.nodes["dell"].crash()
+	for _, vol := range []string{"data", "config"} {
+		at[vol] = h.volHead("dell", vol)
+	}
+	h.sim.set("dell", func(sm *simMember) { sm.running = false })
+	h.waitFor("a new leader runs", 60*time.Second, func() bool { return len(h.sim.runningOn()) == 1 })
+	h.powerOn("dell")
+	h.waitFor("dell pulled from the new leader", 20*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	o := h.orphans("dell")
+	for _, vol := range []string{"data", "config"} {
+		n := 0
+		for name, head := range o {
+			if strings.HasPrefix(name, vol+"-orphaned-") {
+				n++
+				if head != at[vol] {
+					t.Errorf("%s: orphan %s holds %d, dell died at %d", vol, name, head, at[vol])
+				}
+			}
+		}
+		if n != 1 {
+			t.Errorf("%s: %d orphans on dell, want exactly 1 (%v)", vol, n, o)
+		}
+		for name := range o {
+			if strings.HasPrefix(name, vol+"-orphaned-") && !regexp.MustCompile(`^`+vol+`-orphaned-[1-9][0-9]*-[0-9]{8}T[0-9]{9}Z$`).MatchString(name) {
+				t.Errorf("orphan %s: want <vol>-orphaned-<epoch>-<YYYYMMDDTHHMMSSmmm>Z", name)
+			}
+		}
+	}
+}
+
+// accept-stale --member names one member: another member winning with a
+// stale copy stays blocked and leaves the pass for the named one.
+func TestReplicaScopedAcceptStale(t *testing.T) {
+	h := newReplHarness(t, both(proceed, replicated(2*time.Second)))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("followers pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") && h.pulledFromLeader("rpi5") })
+	h.powerOff("asus")
+	if err := h.coord().SetAcceptStale(context.Background(), coord.AcceptStale{Member: "rpi5", By: "test", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRunning("rpi5", 60*time.Second)
+	if v := h.nodes["dell"].agent.m.Get("pagurus_replica_stale_blocked"); v != 1 {
+		t.Errorf("dell stale_blocked = %v, want 1: it must not have used rpi5's pass", v)
+	}
+	if a, _ := h.coord().GetAcceptStale(context.Background()); a != nil {
+		t.Fatalf("rpi5's pass still pending after rpi5 started: %+v", a)
 	}
 }
 

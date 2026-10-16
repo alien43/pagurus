@@ -685,7 +685,7 @@ func cmdFenceSelf(cfg *config.Config, rt *incus.Driver, member string, log *slog
 	if ts, ok := agent.ReadTypes(cfg); ok {
 		t.Types = ts
 	} else {
-		t.Types = []string{"container", "virtual-machine"}
+		t.Types = fallbackTypes(cfg)
 	}
 	log = log.With("member", member, "reason", os.Getenv("CONCH_FENCE_REASON"), "rev", os.Getenv("CONCH_REV"))
 	res := chain.Run(context.Background(), t, log)
@@ -695,6 +695,17 @@ func cmdFenceSelf(cfg *config.Config, rt *incus.Driver, member string, log *slog
 	}
 	log.Info("fence-self confirmed", "by", res.By)
 	return 0
+}
+
+// fallbackTypes is fence-self's target types when the agent recorded none:
+// from the config. The compose starter runs containers only (nil: every
+// container fence applies); a mixed container/VM target matches no single
+// built-in fence, so it is only the instances starter's answer.
+func fallbackTypes(cfg *config.Config) []string {
+	if cfg.Start.Kind == "compose" {
+		return nil
+	}
+	return []string{"container", "virtual-machine"}
 }
 
 // runtime is the agent's view of the world: the Incus driver (projects,

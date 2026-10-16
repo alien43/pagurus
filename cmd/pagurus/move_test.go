@@ -11,6 +11,7 @@ import (
 
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/testutil"
 )
 
@@ -139,5 +140,17 @@ func TestMoveInterruptedDropsItsPin(t *testing.T) {
 	}
 	if p, _ := co.Pin(context.Background()); p != "" {
 		t.Errorf("pin %q left after an interrupted move", p)
+	}
+}
+
+// fence-self with no recorded types still confirms for a compose service:
+// every built-in container fence applies to its fallback target (review 6B).
+func TestFenceSelfFallbackTypesForCompose(t *testing.T) {
+	cfg := &config.Config{Start: config.Start{Kind: "compose"}}
+	tg := fence.Target{Member: "asus", Types: fallbackTypes(cfg)}
+	for _, f := range []fence.Fence{&fence.IncusStop{}, &fence.CgroupKill{}} {
+		if !f.Applies(tg) {
+			t.Errorf("%s does not apply to the compose fallback %v", f.Kind(), tg.Types)
+		}
 	}
 }

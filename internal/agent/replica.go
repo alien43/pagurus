@@ -265,7 +265,14 @@ func (a *Agent) preserve(ctx context.Context, vol string, local, source []string
 	if mine.Orphaned[vol] == key {
 		return true // preserved already; the last pull failed after it
 	}
-	dst := fmt.Sprintf("%s-orphaned-%d-%s", vol, led, a.now().UTC().Format("20060102T150405Z"))
+	// Named by the diverged data's epoch (a never-led follower can hold a
+	// newer term's rounds), in milliseconds like the snapshot names.
+	oe := led
+	if n, ok := replica.Newest(local); ok && n.Epoch > oe {
+		oe = n.Epoch
+	}
+	ts := strings.Replace(a.now().UTC().Format("20060102T150405.000"), ".", "", 1)
+	dst := fmt.Sprintf("%s-orphaned-%d-%sZ", vol, oe, ts)
 	if err := a.vols.CopyVolume(ctx, a.member, vol, dst); err != nil {
 		log.Error("rule 4: cannot preserve diverged data; NOT pulling over it", "volume", vol, "why", d.Why, "err", err)
 		return false
@@ -328,7 +335,7 @@ func (t *termState) replicaTakeover() bool {
 			return false
 		}
 		t.log.Warn("replicate: cannot pull the previous holder's final state; checking this member's own copy", "previous", prev, "err", err)
-		if !t.staleGate(prev) {
+		if !t.staleGate(prev, prevEpoch) {
 			return false
 		}
 	}
@@ -391,9 +398,21 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 		if !a.preserve(ctx, vol, local, source, myLed, mine, t.log) {
 			return errors.New("cannot preserve this member's own diverged data")
 		}
-		if err := a.vols.RefreshVolume(ctx, prev, a.member, vol); err != nil {
+		// Retry while prev stays reachable, within catchup_timeout: giving
+		// up after some volumes leaves them from different rounds.
+		for {
+			err := a.vols.RefreshVolume(ctx, prev, a.member, vol)
+			if err == nil {
+				break
+			}
 			a.m.Inc("pagurus_replica_pulls_total", "result", "failed")
-			return fmt.Errorf("pull %s from %s: %w", vol, prev, err)
+			if on, oerr := a.rt.MemberOnline(ctx, prev); ctx.Err() != nil || oerr != nil || !on {
+				return fmt.Errorf("pull %s from %s: %w", vol, prev, err)
+			}
+			t.log.Warn("replicate: catch-up pull failed; retrying while the previous holder is reachable", "volume", vol, "err", err)
+			if !sleep(ctx, 2*time.Second) {
+				return fmt.Errorf("pull %s from %s: %w", vol, prev, err)
+			}
 		}
 	}
 	if err := t.authorised(ctx); err != nil {
@@ -407,17 +426,36 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 
 // staleGate: start from this member's own newest copy only if it is no
 // older than max_staleness, or an operator accepted a stale start.
-func (t *termState) staleGate(prev string) bool {
+func (t *termState) staleGate(prev string, prevEpoch int64) bool {
 	a := t.a
 	limit := a.cfg.Replicate.MaxStaleness.D()
-	age, ok := a.replicaAge(t.op)
-	if ok && age <= limit {
+	round, ok, mixed := a.localRound(t.op)
+	// The freshest copy should lead: step aside, once per previous term, for
+	// a member with a live agent whose copy is newer than ours. Once only, so
+	// a fresher member that cannot host does not keep the office empty.
+	if m, at := a.fresherMember(t.op, round, ok, prev); m != "" && a.deferOnce(prevEpoch) {
+		backoff := time.Duration(len(a.cfg.Members)+1) * a.cfg.Grace.D()
+		t.log.Warn("replicate: another live member holds a newer copy; stepping aside so it leads",
+			"previous", prev, "fresher", m, "its_copy", at.UTC().Format(time.RFC3339Nano), "mine", round.Name, "backoff", backoff)
+		t.giveUp("replicate: "+m+" holds a newer copy", backoff)
+		return false
+	}
+	var age time.Duration
+	if ok {
+		age = a.now().Sub(round.At)
+	}
+	if ok && !mixed && age <= limit {
 		t.log.Warn("replicate: starting from this member's newest copy; writes after it on the previous holder are lost here (rule 4 keeps them there)",
-			"previous", prev, "age", age.Round(time.Millisecond))
+			"previous", prev, "snapshot", round.Name, "age", age.Round(time.Millisecond))
 		return true
 	}
 	what := "no complete copy"
-	if ok {
+	switch {
+	case mixed:
+		// A pull or catch-up that stopped after some volumes: they are from
+		// different moments, which a multi-volume application may not survive.
+		what = "the volumes are from different rounds (a pull stopped part-way)"
+	case ok:
 		what = "newest copy is " + age.Round(time.Second).String() + " old"
 	}
 	if as, err := a.co.GetAcceptStale(t.op); err == nil && as != nil && (as.Member == "" || as.Member == a.member) {
@@ -517,6 +555,83 @@ func (a *Agent) drain(epoch int64, lease clientv3.LeaseID, log *slog.Logger) {
 			return
 		}
 	}
+}
+
+// localRound is this member's newest consistent copy: the newest pagurus
+// snapshot that every replicated volume has. mixed: the volumes' own newest
+// snapshots differ, so their heads are from different rounds.
+func (a *Agent) localRound(ctx context.Context) (round replica.Snap, ok, mixed bool) {
+	var common map[string]bool
+	newest := ""
+	for i, vol := range a.cfg.Replicate.Volumes {
+		names, err := a.vols.VolumeSnapshots(ctx, a.member, vol)
+		if err != nil {
+			return replica.Snap{}, false, false
+		}
+		snaps := replica.Sorted(names)
+		n := ""
+		if len(snaps) > 0 {
+			n = snaps[len(snaps)-1].Name
+		}
+		have := map[string]bool{}
+		for _, s := range snaps {
+			if i == 0 || common[s.Name] {
+				have[s.Name] = true
+			}
+		}
+		if i == 0 {
+			newest = n
+		} else if n != newest {
+			mixed = true
+		}
+		common = have
+	}
+	var names []string
+	for n := range common {
+		names = append(names, n)
+	}
+	if s := replica.Sorted(names); len(s) > 0 {
+		return s[len(s)-1], true, mixed
+	}
+	return replica.Snap{}, false, mixed
+}
+
+// fresherMember is a member with a live agent (other than this one and the
+// unreachable previous holder) whose published copy is newer than this
+// member's round, the newest such; "" if none.
+func (a *Agent) fresherMember(ctx context.Context, round replica.Snap, ok bool, prev string) (string, time.Time) {
+	regs, err := a.co.Registrations(ctx)
+	if err != nil {
+		return "", time.Time{}
+	}
+	best, bestAt := "", time.Time{}
+	for m := range regs {
+		if m == a.member || m == prev {
+			continue
+		}
+		rc, err := a.co.ReplicaCopy(ctx, m)
+		if err != nil || rc == nil {
+			continue
+		}
+		s, sok := replica.Parse(rc.Snapshot)
+		if !sok || (ok && !s.At.After(round.At)) || !s.At.After(bestAt) {
+			continue
+		}
+		best, bestAt = m, s.At
+	}
+	return best, bestAt
+}
+
+// deferOnce reports whether this member may still step aside for a fresher
+// member after the previous holder's term prevEpoch, and records that it did.
+func (a *Agent) deferOnce(prevEpoch int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.deferredFor == prevEpoch {
+		return false
+	}
+	a.deferredFor = prevEpoch
+	return true
 }
 
 // haveFinal: this member's own copy already is prev's final state of

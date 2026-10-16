@@ -110,7 +110,9 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, backoff time.Duration, drain bool, log *slog.Logger) bool {
 	log.Info("releasing the office", "reason", reason, "backoff", backoff)
 	bg := context.Background()
-	sctx, cancel := context.WithTimeout(bg, a.cfg.SelfFence.StopBudget.D()+5*time.Second)
+	// The self-fence chain's budget (fences.self or the old self_fence), and
+	// never less than the 5 s graceful stop plus the forced stop after it.
+	sctx, cancel := context.WithTimeout(bg, max(a.cfg.SelfFenceLead(), 4*time.Second)+5*time.Second)
 	err := a.rt.Stop(sctx, a.member, 5*time.Second)
 	cancel()
 	running, lerr := a.rt.LocalRunning(a.member)
