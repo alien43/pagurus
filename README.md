@@ -596,6 +596,28 @@ for 10 min) and `PagurusOrphanedData` (rule 4 preserved something). None fires o
 
 `TestMetricsShowTheFourConditions` drives each condition in the sim.
 
+## Architecture
+
+The core (`internal/agent`, with `coord`, `replica`, `watchdog`, `metrics`, `config` and the
+chain runner in `fence`) knows the lease, office, epochs, `prefer`, restart budget, release
+backoff, the config-skew guard and replication's rules. It reaches the workload only through
+seams named for what they mean, all wired once in `cmd/pagurus` (`agent.Backend`):
+
+| Seam | Means | Implemented by (`internal/backend/incus/…`) |
+|---|---|---|
+| `Site` | a member's place to run the workload: check, list, stop, no autostart, address | `*incus.Driver`: a project pinned to the member |
+| `Starter` | bring the member's copy up: check, prepare, pull, start | `start.Compose` (incus-compose), `start.Instances` |
+| `Observer` | does the workload run on this host, without the daemon or quorum | `*incus.Driver`: cgroupfs `lxc.payload.<project>_*` |
+| `Membership` | this host's member name; is member *m* online | `*incus.Driver`: Incus cluster member state |
+| `Fences` | the member's self and peer fence chains | `fence.Configured` over `*incus.Driver` (kinds below) |
+| `Replicator` | snapshot, ship, keep aside, prepare a volume for first use | `*incus.Driver`: custom volumes on a ZFS pool |
+
+`internal/backend` holds the one neutral type, an instance as a site reports it. The fence kinds
+stay in `internal/fence`: `config` validates a chain by building it, and none of them imports the
+Incus client (`cgroup-kill` and `qemu-kill` work without incusd by design). The provisioner
+(`pagurus provision`) is CLI-only, so it has no seam. `go list -deps ./internal/agent` lists
+nothing from `lxc/incus` or `internal/backend/incus`.
+
 ## Layout
 
 ```
