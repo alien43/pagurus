@@ -69,6 +69,13 @@ type simMember struct {
 	// hideCgroup: cgroupfs shows no payload cgroup although Incus says it
 	// runs (a liblxc that names payload cgroups differently).
 	hideCgroup bool
+	// dieAfterUp: the next N starts' workload dies right after `up` returns
+	// (its cgroup is gone at once), while Incus still lists it Running for
+	// staleLists more List calls: the status lag a crash at start leaves
+	// (gokapi-dev on asus 2026-10-18, a container init killed mid-restart).
+	dieAfterUp int
+	staleLists int
+	stale      int // List calls left that report the dead workload Running
 	// slowPause, once set, pauses the next slow start phase (Prepare, or a
 	// Start not preceded by Prepare: a whole `up`) for that long, ignoring
 	// cancellation, as a paused process would. paused is set while it waits.
@@ -199,6 +206,10 @@ func (r *simRT) List(_ context.Context, m string) ([]incus.Instance, error) {
 		return nil, fmt.Errorf("member %s is offline", m)
 	}
 	st := incus.StatusStopped
+	if !sm.running && sm.stale > 0 {
+		sm.stale--
+		st = incus.StatusRunning
+	}
 	if sm.running {
 		st = incus.StatusRunning
 		if sm.unhealthy {
@@ -279,6 +290,10 @@ func (r *simRT) Start(_ context.Context, m string) error {
 	r.c.m[m].running = true
 	r.c.repl().startHead[m] = r.c.volume(m, "data").head
 	r.c.check("up on " + m)
+	if sm := r.c.m[m]; sm.dieAfterUp > 0 {
+		sm.dieAfterUp--
+		sm.running, sm.stale = false, sm.staleLists
+	}
 	return nil
 }
 
@@ -839,6 +854,22 @@ func TestUnrecognisedCgroupLayoutAfterStartGivesUp(t *testing.T) {
 	t.Logf("dell running %s after start; asus refused its term", took)
 	if on := h.sim.runningOn(); len(on) != 1 || on[0] != "dell" {
 		t.Fatalf("running on %v, want only dell", on)
+	}
+}
+
+// asus's workload dies right after `up`, while Incus still lists it Running
+// for a moment, so cgroupfs and Incus disagree exactly as with an unknown
+// cgroup layout. That is a start failure, not a layout problem: asus must retry
+// its start in the same term and lead, not give the office up for an hour with
+// a "misplaced" alert (asus, 2026-10-18 08:15:16).
+func TestWorkloadDyingAtStartIsNotALayoutError(t *testing.T) {
+	h := newHarness(t, nil)
+	h.sim.set("asus", func(m *simMember) { m.dieAfterUp, m.staleLists = 1, 1 })
+	h.startAll()
+	took := h.waitRunning("asus", 20*time.Second)
+	t.Logf("asus running %s after start (its first start's workload died)", took)
+	if on := h.sim.runningOn(); len(on) != 1 || on[0] != "asus" {
+		t.Fatalf("running on %v, want only asus", on)
 	}
 }
 

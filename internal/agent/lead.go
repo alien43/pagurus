@@ -359,11 +359,59 @@ func (t *termState) start() error {
 		}
 	}
 	a.setTypes(insts)
-	if err := a.checkCgroupLayout(insts); err != nil {
-		return fmt.Errorf("%w: %v", errMisplaced, err)
+	if err := t.confirmCgroupLayout(uctx, insts); err != nil {
+		return err
 	}
 	t.publish()
 	return nil
+}
+
+// layoutRechecks: how many times (1 s apart) a cgroup-layout mismatch after a
+// start is re-read before it counts as one.
+const layoutRechecks = 3
+
+// confirmCgroupLayout tells an unrecognised cgroup layout (errMisplaced: 1 h
+// backoff and an alert) from a workload that died right after `up`. Both look
+// alike for a moment: Incus still lists the dead container Running while its
+// payload cgroup is already gone (asus, 2026-10-18 08:15:16, a container init
+// killed mid-restart). A container that stops while re-reading is a start
+// failure, retried like any other; one that stays Running with no payload
+// cgroup is the layout problem.
+func (t *termState) confirmCgroupLayout(ctx context.Context, insts []incus.Instance) error {
+	a := t.a
+	err := a.checkCgroupLayout(insts)
+	for i := 0; err != nil && i < layoutRechecks; i++ {
+		if !sleep(ctx, time.Second) {
+			return ctx.Err()
+		}
+		fresh, lerr := a.rt.List(ctx, a.member)
+		if lerr != nil {
+			return lerr
+		}
+		if name := stoppedSince(insts, fresh); name != "" {
+			return fmt.Errorf("instance %s stopped right after the start (Incus had listed it Running with no payload cgroup)", name)
+		}
+		err = a.checkCgroupLayout(fresh)
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %v", errMisplaced, err)
+	}
+	return nil
+}
+
+// stoppedSince names a container Running in before that is not Running (or
+// gone) in after.
+func stoppedSince(before, after []incus.Instance) string {
+	now := map[string]string{}
+	for _, in := range after {
+		now[in.Name] = in.Status
+	}
+	for _, in := range before {
+		if in.Status == incus.StatusRunning && now[in.Name] != incus.StatusRunning {
+			return in.Name
+		}
+	}
+	return ""
 }
 
 // allRunning reports whether this member's project has instances and all of
