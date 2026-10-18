@@ -41,7 +41,7 @@ import (
 type Runtime interface {
 	Identity(ctx context.Context) (member, arch string, err error)
 	CheckProject(ctx context.Context, member string) error
-	// CheckStart / Start are the configured starter (internal/start).
+	// CheckStart / Start are the configured starter (internal/backend/incus/start).
 	CheckStart(ctx context.Context, member string) error
 	Prepare(ctx context.Context, member string) error
 	Pull(ctx context.Context, member string) error

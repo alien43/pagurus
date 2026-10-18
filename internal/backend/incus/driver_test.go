@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alien43/pagurus/internal/backend/incus"
 	"github.com/alien43/pagurus/internal/fence/fencetest"
-	"github.com/alien43/pagurus/internal/incus"
 )
 
 func driver(api *fencetest.FakeIncus) *incus.Driver {

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/backend/incus"
 )
 
 // TestLivePermissionsProbe calls every incus.API method once with the

@@ -51,7 +51,7 @@ func (b *Bin) Calls(t testing.TB) []string {
 }
 
 // CgroupFS is a fake cgroup2 root with lxc.payload.<project>_<name>
-// directories, the layout internal/incus reads.
+// directories, the layout internal/backend/incus reads.
 type CgroupFS struct {
 	Root string
 	// KillWorks: writing "1" to cgroup.kill empties the cgroup (default
@@ -84,7 +84,7 @@ func (c *CgroupFS) Run(t testing.TB, project, name string) {
 		t.Fatal(err)
 	}
 	// cgroup.kill exists on a real cgroup2 directory; writers open it, they
-	// do not create it (internal/incus writes it with mode 0).
+	// do not create it (internal/backend/incus writes it with mode 0).
 	if err := os.WriteFile(filepath.Join(d, "cgroup.kill"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}

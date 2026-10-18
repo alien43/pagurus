@@ -16,7 +16,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/backend/incus"
 )
 
 // GroupPrefix names the per-member cluster groups: host-<member>.

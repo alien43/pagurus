@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alien43/pagurus/internal/backend/incus/provision"
 	"github.com/alien43/pagurus/internal/fence/fencetest"
-	"github.com/alien43/pagurus/internal/provision"
 )
 
 var ctx = context.Background()

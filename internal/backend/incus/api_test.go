@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/backend/incus"
 )
 
 // fakeIncusREST is a minimal Incus REST server on a unix socket: enough of

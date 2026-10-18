@@ -277,7 +277,7 @@ type Start struct {
 
 type Config struct {
 	Service string `json:"service"`
-	// Start says how a member brings its copy up (internal/start).
+	// Start says how a member brings its copy up (internal/backend/incus/start).
 	Start Start `json:"start"`
 	// Compose, ComposeArgs and UpArgs are the prototype's top-level form of
 	// start.kind=compose. Still read, mapped onto Start; see Deprecations.

@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alien43/pagurus/internal/backend/incus"
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/fence/fencetest"
-	"github.com/alien43/pagurus/internal/incus"
 )
 
 // fakeRemote is the cluster's view of one member.

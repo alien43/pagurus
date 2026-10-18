@@ -282,7 +282,7 @@ for a conch that pagurus spawns. The password travels as a file path, never on a
 
 ## Starters
 
-How a member brings its copy up is the configured **starter** (`internal/start`). The agent
+How a member brings its copy up is the configured **starter** (`internal/backend/incus/start`). The agent
 itself only fences, records `may-run`, calls `Start`, then checks location and autostart.
 
 ```jsonc
@@ -604,9 +604,10 @@ cmd/pagurus/            CLI: run | validate | status | move | fence-ack | audit 
 cmd/blackhole-proxy/    drill-only TCP proxy; SIGUSR1 = partition the agent from etcd
 internal/config/        schema, defaults, the timing validation (conch's rule)
 internal/coord/         etcd schema: the office (conch's election keys), member states, registrations, pin
-internal/incus/         incus / incus-compose / cgroupfs driver
+internal/backend/        backend-neutral types (an instance)
+internal/backend/incus/ incus / incus-compose / cgroupfs driver
 internal/fence/         fence kinds (incl. qemu-kill), the chain runner, fencetest (fakes + contract)
-internal/start/         starters: compose, instances
+internal/backend/incus/start/      starters: compose, instances
 internal/watchdog/      off | dry-run | systemd (sd_notify) | device (ioctl)
 internal/metrics/       Prometheus text exposition (no client library)
 deploy/grafana/         alert rules, to move into the fleet's Grafana provisioning
@@ -615,7 +616,7 @@ internal/agent/         agent.go: the daemon (ground truth, campaigning); conch.
 examples/whoami/        a generic compose example (placeholder addresses, 192.0.2.0/24)
 examples/whoami-instances/  the same with the instances starter
 scripts/drill.sh        live drills against pagurus@<svc> units, refereed by `audit`
-internal/provision/     `pagurus provision`: per-member cluster groups + pinned projects (+ replicated volumes)
+internal/backend/incus/provision/  `pagurus provision`: per-member cluster groups + pinned projects (+ replicated volumes)
 internal/replica/       replication's pure rules: snapshot names, pruning, rule 4 (divergence)
 internal/agent/replica.go  replication: the leader's rounds, the follower's pull, the takeover
 ```

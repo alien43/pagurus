@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/backend/incus"
 )
 
 // layoutRT is a runtime where Incus's view (insts) and cgroupfs's view

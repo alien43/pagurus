@@ -8,14 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alien43/pagurus/internal/backend/incus"
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/fence/fencetest"
-	"github.com/alien43/pagurus/internal/incus"
 )
 
 // containerEnv: one container "web" of project p-asus in a FakeIncus whose
 // Stop empties the container's cgroup (as the kernel would), and a fake
-// cgroupfs. The real internal/incus Driver sits in between.
+// cgroupfs. The real internal/backend/incus Driver sits in between.
 type containerEnv struct {
 	fencetest.Env
 	Driver *incus.Driver

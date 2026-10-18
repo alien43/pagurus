@@ -23,8 +23,8 @@ import (
 	"time"
 
 	"github.com/alien43/pagurus/internal/backend"
+	"github.com/alien43/pagurus/internal/backend/incus"
 	"github.com/alien43/pagurus/internal/coord"
-	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/replica"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )

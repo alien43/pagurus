@@ -5,9 +5,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/alien43/pagurus/internal/backend/incus"
+	"github.com/alien43/pagurus/internal/backend/incus/start"
 	"github.com/alien43/pagurus/internal/fence/fencetest"
-	"github.com/alien43/pagurus/internal/incus"
-	"github.com/alien43/pagurus/internal/start"
 )
 
 func project(m string) string { return "p-" + m }

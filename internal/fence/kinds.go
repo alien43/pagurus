@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Local is what the self-fences need from the Incus driver. internal/incus's
+// Local is what the self-fences need from the Incus driver. internal/backend/incus's
 // Driver implements it, and so does the agent's simulated runtime.
 type Local interface {
 	// Stop stops every instance of member's project through Incus.
