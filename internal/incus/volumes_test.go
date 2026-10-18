@@ -60,3 +60,56 @@ func TestDriverVolumes(t *testing.T) {
 		t.Fatal("a driver without a pool listed volumes")
 	}
 }
+
+// A volume never attached (volatile.idmap.last empty: fresh from provision,
+// or pulled) gets the containers' map before the first start, so Incus does
+// not shift it by +1000000. A stamped volume is left alone; VMs only: nothing.
+func TestEnsureVolumeIdmap(t *testing.T) {
+	const m1 = `[{"Isuid":true,"Isgid":false,"Hostid":1000000,"Nsid":0,"Maprange":1000000000}]`
+	ctx := context.Background()
+	setup := func(insts ...incus.Instance) (*fencetest.FakeIncus, *incus.Driver) {
+		api := fencetest.NewFakeIncus("asus")
+		api.Projects["svc-asus"] = map[string]string{}
+		api.Pools["zp"] = true
+		api.Insts["svc-asus"] = insts
+		if err := api.CreateVolume(ctx, "svc-asus", "zp", "asus", "data"); err != nil {
+			t.Fatal(err)
+		}
+		return api, incus.New(incus.Options{ProjectPrefix: "svc", API: api, Pool: "zp"})
+	}
+	ct := func(name, idmap string) incus.Instance {
+		return incus.Instance{Name: name, Type: "container", Location: "asus", Status: "Stopped",
+			Expanded: map[string]string{"volatile.idmap.next": idmap}}
+	}
+	last := func(api *fencetest.FakeIncus) string {
+		c, err := api.VolumeConfig(ctx, "svc-asus", "zp", "asus", "data")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c[incus.IdmapLastKey]
+	}
+
+	api, drv := setup(ct("app-1", m1), ct("app-2", m1))
+	if got, err := drv.EnsureVolumeIdmap(ctx, "asus", "data"); err != nil || got != m1 || last(api) != m1 {
+		t.Fatalf("empty volume: stamped %q, err %v, now %q; want %q", got, err, last(api), m1)
+	}
+	if got, err := drv.EnsureVolumeIdmap(ctx, "asus", "data"); err != nil || got != "" {
+		t.Fatalf("stamped volume touched again: %q, %v", got, err)
+	}
+
+	api, drv = setup(ct("app-1", m1))
+	_ = api.SetVolumeConfig(ctx, "svc-asus", "zp", "asus", "data", incus.IdmapLastKey, "[other]")
+	if got, err := drv.EnsureVolumeIdmap(ctx, "asus", "data"); err != nil || got != "" || last(api) != "[other]" {
+		t.Fatalf("a set volume was changed: %q, %v, now %q", got, err, last(api))
+	}
+
+	api, drv = setup(incus.Instance{Name: "vm", Type: "virtual-machine", Location: "asus"})
+	if got, err := drv.EnsureVolumeIdmap(ctx, "asus", "data"); err != nil || got != "" || last(api) != "" {
+		t.Fatalf("VMs only: %q, %v, now %q", got, err, last(api))
+	}
+
+	_, drv = setup(ct("app-1", m1), ct("app-2", "[different]"))
+	if _, err := drv.EnsureVolumeIdmap(ctx, "asus", "data"); err == nil {
+		t.Fatal("containers with different maps: no error")
+	}
+}

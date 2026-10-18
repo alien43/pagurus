@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -33,6 +34,10 @@ const writeTick = 10 * time.Millisecond
 type simVol struct {
 	head  int64
 	snaps []simSnap
+	// idmapped: volatile.idmap.last is set. Starting a container on a volume
+	// without it makes Incus shift the whole volume by +1000000 (counted in
+	// simRepl.shifted).
+	idmapped bool
 }
 
 type simSnap struct {
@@ -49,7 +54,7 @@ func (v *simVol) names() []string {
 }
 
 func (v *simVol) clone() *simVol {
-	return &simVol{head: v.head, snaps: slices.Clone(v.snaps)}
+	return &simVol{head: v.head, snaps: slices.Clone(v.snaps), idmapped: v.idmapped}
 }
 
 type simRepl struct {
@@ -64,6 +69,7 @@ type simRepl struct {
 	refreshes  map[string]int   // complete refreshes into a member
 	failed     map[string]int   // failed or cancelled refreshes into a member
 	hooks      map[string]int
+	shifted    map[string]int  // starts on a member that found a volume without volatile.idmap.last
 	snapFail   map[string]bool // volume name -> SnapshotVolume fails
 	refFail    map[string]bool // "<to>/<volume>" -> RefreshVolume into it fails
 	calls      int             // every volume call, any member
@@ -72,7 +78,7 @@ type simRepl struct {
 func (c *simCluster) repl() *simRepl {
 	if c.vol == nil {
 		c.vol = &simRepl{vols: map[string]map[string]*simVol{}, pullDelay: map[string]time.Duration{}, perWrite: map[string]time.Duration{}, pulling: map[string]bool{},
-			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}, snapFail: map[string]bool{}, refFail: map[string]bool{}}
+			startHead: map[string]int64{}, stopHead: map[string]int64{}, pulled: map[string]int64{}, refreshes: map[string]int{}, failed: map[string]int{}, hooks: map[string]int{}, shifted: map[string]int{}, snapFail: map[string]bool{}, refFail: map[string]bool{}}
 	}
 	return c.vol
 }
@@ -207,6 +213,9 @@ func (r *simRT) RefreshVolume(ctx context.Context, from, to, vol string) error {
 	if r.c.m[to].running {
 		r.c.t.Errorf("RULE 1 VIOLATED: refresh into %s's %s volume while its workload runs", to, vol)
 	}
+	// the target keeps its own config (volatile.idmap.last included): a
+	// refresh carries data and snapshots, not the key
+	src.idmapped = rp.vols[to][vol] != nil && rp.vols[to][vol].idmapped
 	rp.vols[to][vol] = src
 	rp.refreshes[to]++
 	if vol == "data" {
@@ -228,6 +237,20 @@ func (r *simRT) CopyVolume(_ context.Context, member, vol, dst string) error {
 	r.c.repl().vols[member][dst] = r.c.volume(member, vol).clone()
 	r.c.log = append(r.c.log, fmt.Sprintf("%s copy %s/%s -> %s", time.Now().Format("05.000"), member, vol, dst))
 	return nil
+}
+
+func (r *simRT) EnsureVolumeIdmap(_ context.Context, member, vol string) (string, error) {
+	r.c.mu.Lock()
+	defer r.c.mu.Unlock()
+	if err := r.volOp(member); err != nil {
+		return "", err
+	}
+	v := r.c.volume(member, vol)
+	if v.idmapped {
+		return "", nil
+	}
+	v.idmapped = true
+	return "[sim idmap]", nil
 }
 
 func (r *simRT) ListVolumes(_ context.Context, member string) ([]string, error) {
@@ -961,5 +984,31 @@ func TestReplicaOffMeansNoVolumeCalls(t *testing.T) {
 	time.Sleep(time.Second)
 	if n := h.replStat(func(r *simRepl) int { return r.calls }); n != 0 {
 		t.Fatalf("%d volume calls without replicate", n)
+	}
+}
+
+// Replicated volumes come from provision (or a pull) with volatile.idmap.last
+// empty, and Incus shifts such a volume by +1000000 on its first attach
+// (gokapi-dev 2026-10-16: 1001000 -> 2001000, "permission denied"). Every
+// start, the first on each member included, must find its volumes stamped.
+func TestReplicaVolumesStampedBeforeFirstStart(t *testing.T) {
+	h := newReplHarness(t, replicated(time.Minute))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("both followers pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") && h.pulledFromLeader("rpi5") })
+	for _, to := range []string{"rpi5", "dell"} {
+		if err := h.coord().SetPin(context.Background(), to); err != nil {
+			t.Fatal(err)
+		}
+		h.waitRunning(to, 15*time.Second)
+	}
+	_ = h.coord().SetPin(context.Background(), "")
+	h.sim.mu.Lock()
+	shifted := maps.Clone(h.sim.vol.shifted)
+	h.sim.mu.Unlock()
+	for m, n := range shifted {
+		if n > 0 {
+			t.Errorf("%s: %d start(s) shifted an unstamped volume by +1000000", m, n)
+		}
 	}
 }

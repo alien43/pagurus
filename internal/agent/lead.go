@@ -328,6 +328,9 @@ func (t *termState) start() error {
 	if err := t.authorised(uctx); err != nil {
 		return err
 	}
+	if err := t.stampVolumeIdmaps(uctx); err != nil {
+		return err
+	}
 	if err := a.rt.Start(uctx, a.member); err != nil {
 		// `up` can fail after the instance started (incus-compose's DNS
 		// records step, when another member is offline). If everything runs,
@@ -363,6 +366,29 @@ func (t *termState) start() error {
 		return err
 	}
 	t.publish()
+	return nil
+}
+
+// stampVolumeIdmaps gives every replicated volume that was never attached on
+// this member (fresh from provision, or only ever pulled into) the containers'
+// idmap before they start. Otherwise Incus shifts it by +1000000 on that
+// first attach, and the workload finds its files owned by a stranger
+// (gokapi-dev 2026-10-16: 1001000 -> 2001000, "permission denied").
+func (t *termState) stampVolumeIdmaps(ctx context.Context) error {
+	a := t.a
+	if !a.replicating() || a.vols == nil {
+		return nil
+	}
+	for _, vol := range a.cfg.Replicate.Volumes {
+		stamped, err := a.vols.EnsureVolumeIdmap(ctx, a.member, vol)
+		if err != nil {
+			return fmt.Errorf("replicate: volume %s: stamping volatile.idmap.last: %w", vol, err)
+		}
+		if stamped != "" {
+			t.log.Info("replicate: stamped an unset volatile.idmap.last with the containers' idmap, so the first attach does not shift the volume",
+				"volume", vol)
+		}
+	}
 	return nil
 }
 

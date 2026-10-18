@@ -49,6 +49,10 @@ type API interface {
 	VolumeSnapshots(ctx context.Context, project, pool, member, vol string) ([]string, error)
 	CreateVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error
 	DeleteVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error
+	// VolumeConfig / SetVolumeConfig read and set a custom volume's config
+	// (volatile keys included, e.g. volatile.idmap.last).
+	VolumeConfig(ctx context.Context, project, pool, member, vol string) (map[string]string, error)
+	SetVolumeConfig(ctx context.Context, project, pool, member, vol, key, value string) error
 }
 
 // Address is one address of an instance interface.
@@ -386,6 +390,38 @@ func (c *Client) CreateVolumeSnapshot(ctx context.Context, project, pool, member
 		return err
 	}
 	return op.WaitContext(ctx)
+}
+
+func (c *Client) VolumeConfig(ctx context.Context, project, pool, member, vol string) (map[string]string, error) {
+	s, err := c.volumes(ctx, project, member)
+	if err != nil {
+		return nil, err
+	}
+	v, _, err := s.GetStoragePoolVolume(pool, "custom", vol)
+	if err != nil {
+		return nil, err
+	}
+	return v.Config, nil
+}
+
+func (c *Client) SetVolumeConfig(ctx context.Context, project, pool, member, vol, key, value string) error {
+	s, err := c.volumes(ctx, project, member)
+	if err != nil {
+		return err
+	}
+	v, etag, err := s.GetStoragePoolVolume(pool, "custom", vol)
+	if err != nil {
+		return err
+	}
+	if v.Config[key] == value {
+		return nil
+	}
+	put := v.Writable()
+	if put.Config == nil {
+		put.Config = map[string]string{}
+	}
+	put.Config[key] = value
+	return s.UpdateStoragePoolVolume(pool, "custom", vol, put, etag) // ETag: refuses a concurrent edit
 }
 
 func (c *Client) DeleteVolumeSnapshot(ctx context.Context, project, pool, member, vol, snap string) error {

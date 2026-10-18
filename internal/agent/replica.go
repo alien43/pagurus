@@ -46,6 +46,11 @@ type Volumes interface {
 	ListVolumes(ctx context.Context, member string) ([]string, error)
 	// Exec runs argv in an instance of member's project.
 	Exec(ctx context.Context, member, instance string, argv []string) error
+	// EnsureVolumeIdmap sets vol's volatile.idmap.last to its containers' map
+	// when it is empty, returning what it set ("": left alone). Called after
+	// Prepare and before Start: an unstamped volume is shifted by +1000000 on
+	// its first attach, contents and all.
+	EnsureVolumeIdmap(ctx context.Context, member, vol string) (string, error)
 }
 
 var errStale = errors.New("replica too stale to start")

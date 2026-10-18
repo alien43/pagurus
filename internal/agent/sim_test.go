@@ -288,6 +288,14 @@ func (r *simRT) Start(_ context.Context, m string) error {
 		return errors.New("DNSWatcher: instance(svc-1): updating dnsmasq records: peer node is down")
 	}
 	r.c.m[m].running = true
+	if r.c.vol != nil {
+		for _, v := range r.c.vol.vols[m] {
+			if !v.idmapped {
+				r.c.vol.shifted[m]++
+				v.idmapped = true // Incus stamps it as it shifts
+			}
+		}
+	}
 	r.c.repl().startHead[m] = r.c.volume(m, "data").head
 	r.c.check("up on " + m)
 	if sm := r.c.m[m]; sm.dieAfterUp > 0 {

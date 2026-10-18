@@ -29,6 +29,8 @@ type FakeIncus struct {
 	// each with its snapshot names.
 	Pools map[string]bool
 	Vols  map[string][]string
+	// VolCfg holds custom volumes' config by the same key as Vols.
+	VolCfg map[string]map[string]string
 
 	// Hang makes every call block until its context ends.
 	Hang bool
@@ -351,6 +353,44 @@ func (f *FakeIncus) Volumes(ctx context.Context, project, pool, member string) (
 	}
 	slices.Sort(out)
 	return out, nil
+}
+
+func (f *FakeIncus) VolumeConfig(ctx context.Context, project, pool, member, vol string) (map[string]string, error) {
+	if err := f.gate(ctx); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := volKey(project, pool, member, vol)
+	if _, ok := f.Vols[k]; !ok {
+		return nil, notFound("storage volume " + vol)
+	}
+	out := map[string]string{}
+	for kk, v := range f.VolCfg[k] {
+		out[kk] = v
+	}
+	return out, nil
+}
+
+func (f *FakeIncus) SetVolumeConfig(ctx context.Context, project, pool, member, vol, key, value string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := volKey(project, pool, member, vol)
+	if _, ok := f.Vols[k]; !ok {
+		return notFound("storage volume " + vol)
+	}
+	if f.VolCfg == nil {
+		f.VolCfg = map[string]map[string]string{}
+	}
+	if f.VolCfg[k] == nil {
+		f.VolCfg[k] = map[string]string{}
+	}
+	f.mutations++
+	f.VolCfg[k][key] = value
+	return nil
 }
 
 func (f *FakeIncus) CreateVolume(ctx context.Context, project, pool, member, name string) error {
