@@ -136,7 +136,7 @@ func main() {
 	}
 	drv := incus.New(dopts)
 	rt := &runtime{Driver: drv, Starter: newStarter(cfg, drv)}
-	be := agent.Backend{Site: drv, Starter: rt.Starter, Observer: drv, Members: drv,
+	be := agent.Backend{Site: drv, Starter: rt.Starter, Observer: drv, Members: drv, Replicator: drv,
 		Fences: fence.Configured{Local: drv, Remote: drv, Self: cfg.SelfFences(), Peer: cfg.PeerFences(), RebootMargin: cfg.Fence.RebootMargin.D()}}
 
 	switch cmd {

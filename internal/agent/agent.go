@@ -89,6 +89,9 @@ type Backend struct {
 	Observer Observer
 	Members  Membership
 	Fences   Fences
+	// Replicator is used only with a replicate block; nil: the backend
+	// cannot replicate.
+	Replicator Replicator
 }
 
 // Fences are this member's configured fence chains (fence.Configured over
@@ -161,8 +164,8 @@ type Agent struct {
 	localMu sync.Mutex // serialises guardLocal against the start of a term
 	fenceMu sync.Mutex // serialises self-fences
 
-	// Replication (replica.go); vols is nil without a replicate block.
-	vols   Volumes
+	// Replication (replica.go); repl is nil when the backend cannot replicate.
+	repl   Replicator
 	pullMu sync.Mutex // held by a follower pull into this member's volumes
 }
 
@@ -213,6 +216,7 @@ func New(o Options) *Agent {
 		observer:  o.Backend.Observer,
 		members:   o.Backend.Members,
 		fences:    o.Backend.Fences,
+		repl:      o.Backend.Replicator,
 		cli:       o.Etcd,
 		co:        coord.New(o.Etcd, o.Config.EtcdPrefix, o.Config.Etcd.OpTimeout.D()),
 		log:       o.Log,

@@ -400,11 +400,11 @@ func (t *termState) start() error {
 // (gokapi-dev 2026-10-16: 1001000 -> 2001000, "permission denied").
 func (t *termState) stampVolumeIdmaps(ctx context.Context) error {
 	a := t.a
-	if !a.replicating() || a.vols == nil {
+	if !a.replicating() || a.repl == nil {
 		return nil
 	}
 	for _, vol := range a.cfg.Replicate.Volumes {
-		stamped, err := a.vols.EnsureVolumeIdmap(ctx, a.member, vol)
+		stamped, err := a.repl.EnsureVolumeIdmap(ctx, a.member, vol)
 		if err != nil {
 			return fmt.Errorf("replicate: volume %s: stamping volatile.idmap.last: %w", vol, err)
 		}

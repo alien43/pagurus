@@ -522,7 +522,11 @@ func simBackend(cfg *config.Config, rt interface {
 	fence.Local
 	fence.Remote
 }) Backend {
-	return Backend{Site: rt, Starter: rt, Observer: rt, Members: rt, Fences: fencesOver(cfg, rt)}
+	b := Backend{Site: rt, Starter: rt, Observer: rt, Members: rt, Fences: fencesOver(cfg, rt)}
+	if r, ok := rt.(Replicator); ok {
+		b.Replicator = r
+	}
+	return b
 }
 
 // start launches (or restarts) member's agent. dog may be nil (watchdog off).
