@@ -247,7 +247,8 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, log *slog.Logg
 	}
 	ms := metrics.New(cfg.Service, self)
 	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log),
-		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: []string{exe, "term", "--socket"}, Metrics: ms})
+		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: []string{exe, "term", "--socket"}, Metrics: ms,
+		StartLock: filepath.Join(cfg.StateDir, "start.lock")})
 	if metricsAddr != "" {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", ms.Handler())

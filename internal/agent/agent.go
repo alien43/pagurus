@@ -66,20 +66,21 @@ const (
 var UpTimeout = 5 * time.Minute
 
 type Agent struct {
-	cfg      *config.Config
-	rt       Runtime
-	cli      *clientv3.Client
-	co       *coord.Coord
-	wd       watchdog.Watchdog
-	log      *slog.Logger
-	alerter  *Alerter
-	http     *http.Client
-	version  string
-	versions map[string]string
-	conchCmd []string // conch binary (argv prefix)
-	fenceCmd []string // `pagurus fence-self -c <cfg>` (argv prefix; --member is appended)
-	termCmd  []string // `pagurus term --socket` (argv prefix; the socket is appended)
-	procOut  io.Writer
+	startLock string // hostStartLock path ("" none)
+	cfg       *config.Config
+	rt        Runtime
+	cli       *clientv3.Client
+	co        *coord.Coord
+	wd        watchdog.Watchdog
+	log       *slog.Logger
+	alerter   *Alerter
+	http      *http.Client
+	version   string
+	versions  map[string]string
+	conchCmd  []string // conch binary (argv prefix)
+	fenceCmd  []string // `pagurus fence-self -c <cfg>` (argv prefix; --member is appended)
+	termCmd   []string // `pagurus term --socket` (argv prefix; the socket is appended)
+	procOut   io.Writer
 
 	member string
 	arch   string
@@ -138,6 +139,9 @@ type Options struct {
 	ProcOutput io.Writer
 	// Metrics, if set, receives the agent's metrics (else a private set).
 	Metrics *metrics.Set
+	// StartLock is the host-wide start lock file shared by every service's
+	// agent on this host (hostStartLock); empty: none (tests).
+	StartLock string
 }
 
 func New(o Options) *Agent {
@@ -155,24 +159,25 @@ func New(o Options) *Agent {
 		o.Metrics = metrics.New(o.Config.Service, o.Member)
 	}
 	return &Agent{
-		m:        o.Metrics,
-		cfg:      o.Config,
-		rt:       o.Runtime,
-		cli:      o.Etcd,
-		co:       coord.New(o.Etcd, o.Config.EtcdPrefix, o.Config.Etcd.OpTimeout.D()),
-		log:      o.Log,
-		alerter:  NewAlerter(o.Config.AlertURL, o.Config.Service, o.Log),
-		http:     &http.Client{Timeout: o.Config.Health.Timeout.D()},
-		version:  o.Version,
-		versions: o.Versions,
-		conchCmd: o.Conch,
-		fenceCmd: o.FenceCmd,
-		termCmd:  o.TermCmd,
-		procOut:  o.ProcOutput,
-		member:   o.Member,
-		agentID:  fmt.Sprintf("%s/%d/%d", host, os.Getpid(), time.Now().UnixNano()),
-		now:      time.Now,
-		role:     roleStarting,
+		m:         o.Metrics,
+		cfg:       o.Config,
+		rt:        o.Runtime,
+		cli:       o.Etcd,
+		co:        coord.New(o.Etcd, o.Config.EtcdPrefix, o.Config.Etcd.OpTimeout.D()),
+		log:       o.Log,
+		alerter:   NewAlerter(o.Config.AlertURL, o.Config.Service, o.Log),
+		http:      &http.Client{Timeout: o.Config.Health.Timeout.D()},
+		version:   o.Version,
+		versions:  o.Versions,
+		conchCmd:  o.Conch,
+		fenceCmd:  o.FenceCmd,
+		startLock: o.StartLock,
+		termCmd:   o.TermCmd,
+		procOut:   o.ProcOutput,
+		member:    o.Member,
+		agentID:   fmt.Sprintf("%s/%d/%d", host, os.Getpid(), time.Now().UnixNano()),
+		now:       time.Now,
+		role:      roleStarting,
 	}
 }
 

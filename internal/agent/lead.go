@@ -347,6 +347,14 @@ func (t *termState) start() error {
 	a.beat(UpTimeout)
 	uctx, cancel := context.WithTimeout(t.op, UpTimeout)
 	defer cancel()
+	release, waited, err := hostStartLock(uctx, a.startLock)
+	if err != nil {
+		return fmt.Errorf("waiting for this host's start lock: %w", err)
+	}
+	defer release()
+	if waited > time.Second {
+		t.log.Info("waited for another service's start on this host", "waited", waited.Round(100*time.Millisecond))
+	}
 	if err := a.rt.Prepare(uctx, a.member); err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
