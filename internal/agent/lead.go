@@ -222,15 +222,6 @@ func peerResult(o fence.Outcome) string {
 	}
 }
 
-// fenceVia names a peer fence in a member record; the API stop keeps the
-// prototype's wording, which records and operators already know.
-func fenceVia(kind string) string {
-	if kind == fence.KindIncusAPIStop {
-		return "Incus API"
-	}
-	return kind
-}
-
 // fenceMember tries to establish that m runs nothing. It returns done=true
 // when that is confirmed or covered by a policy, else a reason to wait.
 //
@@ -249,7 +240,7 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 		WatchdogTimeout: st.Caps.WatchdogTimeout,
 		SinceAcquired:   since,
 	}
-	out, by := a.peerChain().Attempt(t.op, pt)
+	out, by := a.fences.PeerChain().Attempt(t.op, pt)
 	kind := by
 	if kind == "" {
 		kind = "none"
@@ -270,7 +261,7 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 		if st.State == coord.MayRun {
 			err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutMS(m, coord.MemberState{
 				State: coord.Stopped, Epoch: st.Epoch, By: a.member, At: a.now().UTC(), Caps: st.Caps,
-				Reason: fmt.Sprintf("fenced via %s by epoch %d", fenceVia(by), t.epoch),
+				Reason: fmt.Sprintf("fenced via %s by epoch %d", fence.Via(by), t.epoch),
 			}))
 			if err != nil {
 				return false, "cannot record fence: " + err.Error(), retry

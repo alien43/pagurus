@@ -52,8 +52,15 @@ type Runtime interface {
 	EnforceNoAutostart(ctx context.Context, member string) error
 	Stop(ctx context.Context, member string, graceful time.Duration) error
 	LocalRunning(member string) ([]string, error)
-	Kill(ctx context.Context, member string) error
 	IPv4(ctx context.Context, member, name string) (string, error)
+}
+
+// Fences are this member's configured fence chains (fence.Configured over
+// the backend). The agent runs chains; which kinds they hold, and how each
+// kind acts, is the chain's business.
+type Fences interface {
+	SelfChain() fence.Chain
+	PeerChain() fence.PeerChain
 }
 
 const (
@@ -69,6 +76,7 @@ type Agent struct {
 	startLock string // hostStartLock path ("" none)
 	cfg       *config.Config
 	rt        Runtime
+	fences    Fences
 	cli       *clientv3.Client
 	co        *coord.Coord
 	wd        watchdog.Watchdog
@@ -122,6 +130,8 @@ type Agent struct {
 type Options struct {
 	Config  *config.Config
 	Runtime Runtime
+	// Fences are the member's fence chains over the same backend.
+	Fences  Fences
 	Etcd    *clientv3.Client
 	Log     *slog.Logger
 	Version string
@@ -162,6 +172,7 @@ func New(o Options) *Agent {
 		m:         o.Metrics,
 		cfg:       o.Config,
 		rt:        o.Runtime,
+		fences:    o.Fences,
 		cli:       o.Etcd,
 		co:        coord.New(o.Etcd, o.Config.EtcdPrefix, o.Config.Etcd.OpTimeout.D()),
 		log:       o.Log,
@@ -512,23 +523,8 @@ func (a *Agent) reportStopped(ctx context.Context) {
 	a.log.Info("recorded member state stopped (self-verified)", "epoch", ms.Epoch)
 }
 
-// selfChain is this member's configured self-fence chain over the runtime.
-func (a *Agent) selfChain() fence.Chain {
-	c, err := fence.BuildSelf(a.rt, a.cfg.SelfFences())
-	if err != nil {
-		panic(err) // config.Validate builds the same chain
-	}
-	return c
-}
-
-// peerChain is the configured peer-fence chain over the runtime.
-func (a *Agent) peerChain() fence.PeerChain {
-	c, err := fence.BuildPeer(a.rt, a.cfg.Fence.RebootMargin.D(), a.cfg.PeerFences())
-	if err != nil {
-		panic(err) // config.Validate builds the same chain
-	}
-	return c
-}
+// selfChain is this member's configured self-fence chain.
+func (a *Agent) selfChain() fence.Chain { return a.fences.SelfChain() }
 
 func (a *Agent) selfTarget() fence.Target {
 	a.typesMu.Lock()

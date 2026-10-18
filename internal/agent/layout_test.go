@@ -44,7 +44,8 @@ func TestPreflightRefusesAnUnrecognisedCgroupLayout(t *testing.T) {
 		"nothing running":                                   {&layoutRT{insts: []incus.Instance{{Name: "svc-1", Status: incus.StatusStopped, Type: "container"}}}, false},
 		"a running VM (no payload cgroup by design)":        {&layoutRT{insts: []incus.Instance{{Name: "vm", Status: incus.StatusRunning, Type: "virtual-machine"}}}, false},
 	} {
-		a := New(Options{Config: testConfig(t, nil), Runtime: c.rt})
+		cfg := testConfig(t, nil)
+		a := New(Options{Config: cfg, Runtime: c.rt, Fences: fencesOver(cfg, c.rt)})
 		err := a.Preflight(context.Background())
 		if got := errors.Is(err, errCgroupLayout); got != c.want {
 			t.Errorf("%s: err %v, want layout error %v", name, err, c.want)

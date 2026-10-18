@@ -20,7 +20,8 @@ func TestRelayFollowsConch(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	cfg.StateDir = dir
 	self, _ := os.Executable()
-	a := New(Options{Config: cfg, Runtime: &simRT{c: newSim(t, "asus"), me: "asus"}, Member: "asus",
+	rt := &simRT{c: newSim(t, "asus"), me: "asus"}
+	a := New(Options{Config: cfg, Runtime: rt, Fences: fencesOver(cfg, rt), Member: "asus",
 		Conch: []string{self, "sim-pet", "10"}, FenceCmd: []string{"true"}, TermCmd: []string{"true"}, ProcOutput: procOutput()})
 	a.wd = &simDog{timeout: time.Second} // freshness: 500ms
 	r, err := listenNotify(filepath.Join(dir, "svc.notify"), a.relayFreshness)
@@ -82,7 +83,8 @@ func TestCampaigningConchSilenceIsNotUnfit(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(dir) })
 	cfg.StateDir = dir
 	self, _ := os.Executable()
-	a := New(Options{Config: cfg, Runtime: &simRT{c: newSim(t, "asus"), me: "asus"}, Member: "asus",
+	rt := &simRT{c: newSim(t, "asus"), me: "asus"}
+	a := New(Options{Config: cfg, Runtime: rt, Fences: fencesOver(cfg, rt), Member: "asus",
 		Conch: []string{self, "sim-pet", "0"}, FenceCmd: []string{"true"}, TermCmd: []string{"true"}, ProcOutput: procOutput()})
 	a.wd = &simDog{timeout: time.Second} // freshness: 500ms
 	r, err := listenNotify(filepath.Join(dir, "svc.notify"), a.relayFreshness)

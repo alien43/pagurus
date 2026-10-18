@@ -165,3 +165,31 @@ func BuildSelf(l Local, specs []Spec) (Chain, error) {
 	}
 	return c, nil
 }
+
+// Configured is a member's configured chains over its backend: the self
+// fences over Local, the peer fences over Remote. Each call builds its chain
+// afresh. A build error panics: config.Validate builds the same chains.
+type Configured struct {
+	Local        Local
+	Remote       Remote
+	Self, Peer   []Spec
+	RebootMargin time.Duration
+}
+
+// SelfChain is the member's self-fence chain.
+func (c Configured) SelfChain() Chain {
+	ch, err := BuildSelf(c.Local, c.Self)
+	if err != nil {
+		panic(err) // config.Validate builds the same chain
+	}
+	return ch
+}
+
+// PeerChain is the configured peer-fence chain.
+func (c Configured) PeerChain() PeerChain {
+	ch, err := BuildPeer(c.Remote, c.RebootMargin, c.Peer)
+	if err != nil {
+		panic(err) // config.Validate builds the same chain
+	}
+	return ch
+}

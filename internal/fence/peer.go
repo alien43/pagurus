@@ -156,6 +156,15 @@ func (f ExecPeer) Attempt(ctx context.Context, t PeerTarget) Outcome {
 	return Outcome{Status: Confirmed, Verified: true}
 }
 
+// Via names a peer fence kind in a member record; the API stop keeps the
+// prototype's wording, which records and operators already know.
+func Via(kind string) string {
+	if kind == KindIncusAPIStop {
+		return "Incus API"
+	}
+	return kind
+}
+
 // PeerChain is an ordered list of peer fences.
 type PeerChain []PeerFence
 

@@ -20,6 +20,7 @@ import (
 	"github.com/alien43/pagurus/internal/backend/incus"
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
+	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/testutil"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
@@ -502,6 +503,15 @@ func procOutput() io.Writer {
 	return io.Discard
 }
 
+// fencesOver is cfg's fence chains over a fake backend, wired the way
+// cmd/pagurus wires them over *incus.Driver.
+func fencesOver(cfg *config.Config, rt interface {
+	fence.Local
+	fence.Remote
+}) fence.Configured {
+	return fence.Configured{Local: rt, Remote: rt, Self: cfg.SelfFences(), Peer: cfg.PeerFences(), RebootMargin: cfg.Fence.RebootMargin.D()}
+}
+
 // start launches (or restarts) member's agent. dog may be nil (watchdog off).
 func (h *harness) start(name string, dog *simDog) *node {
 	cfg := *h.cfg
@@ -522,7 +532,7 @@ func (h *harness) start(name string, dog *simDog) *node {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	a := New(Options{Config: &cfg, Runtime: rt, Etcd: cli, Log: logger(h.t, name), Version: "test",
+	a := New(Options{Config: &cfg, Runtime: rt, Fences: fencesOver(&cfg, rt), Etcd: cli, Log: logger(h.t, name), Version: "test",
 		Conch: []string{conchBin}, FenceCmd: []string{self, "sim-fence", h.host}, TermCmd: []string{self, "sim-term"},
 		ProcOutput: procOutput()})
 	if err := a.Preflight(h.t.Context()); err != nil {
