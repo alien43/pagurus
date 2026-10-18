@@ -512,6 +512,19 @@ func fencesOver(cfg *config.Config, rt interface {
 	return fence.Configured{Local: rt, Remote: rt, Self: cfg.SelfFences(), Peer: cfg.PeerFences(), RebootMargin: cfg.Fence.RebootMargin.D()}
 }
 
+// simBackend wires one fake as every seam, the way cmd/pagurus wires
+// *incus.Driver.
+func simBackend(cfg *config.Config, rt interface {
+	Site
+	Starter
+	Observer
+	Membership
+	fence.Local
+	fence.Remote
+}) Backend {
+	return Backend{Site: rt, Starter: rt, Observer: rt, Members: rt, Fences: fencesOver(cfg, rt)}
+}
+
 // start launches (or restarts) member's agent. dog may be nil (watchdog off).
 func (h *harness) start(name string, dog *simDog) *node {
 	cfg := *h.cfg
@@ -532,7 +545,7 @@ func (h *harness) start(name string, dog *simDog) *node {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	a := New(Options{Config: &cfg, Runtime: rt, Fences: fencesOver(&cfg, rt), Etcd: cli, Log: logger(h.t, name), Version: "test",
+	a := New(Options{Config: &cfg, Backend: simBackend(&cfg, rt), Etcd: cli, Log: logger(h.t, name), Version: "test",
 		Conch: []string{conchBin}, FenceCmd: []string{self, "sim-fence", h.host}, TermCmd: []string{self, "sim-term"},
 		ProcOutput: procOutput()})
 	if err := a.Preflight(h.t.Context()); err != nil {

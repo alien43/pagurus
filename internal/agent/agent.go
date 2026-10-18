@@ -36,23 +36,59 @@ import (
 	"github.com/alien43/pagurus/internal/watchdog"
 )
 
-// Runtime is everything the agent needs from Incus. *incus.Driver implements
-// it; tests substitute a simulated cluster.
-type Runtime interface {
-	Identity(ctx context.Context) (member, arch string, err error)
+// The agent drives its workload through these seams, each named for what it
+// means to the agent. cmd/pagurus wires the Incus implementation of every one
+// (internal/backend/incus: *incus.Driver and the configured starter); tests
+// substitute a simulated cluster.
+
+// Site is a member's place to run the workload: today its Incus project,
+// pinned to that member.
+type Site interface {
+	// CheckProject: member's site is set up so that what runs in it runs on
+	// member and nowhere else, and nothing restarts it behind the agent.
 	CheckProject(ctx context.Context, member string) error
-	// CheckStart / Start are the configured starter (internal/backend/incus/start).
+	// List is what member's site holds, as the backend sees it.
+	List(ctx context.Context, member string) ([]backend.Instance, error)
+	// Stop stops everything in member's site; graceful > 0 tries a clean
+	// shutdown first.
+	Stop(ctx context.Context, member string, graceful time.Duration) error
+	// EnforceNoAutostart: nothing in member's site starts on its own at boot.
+	EnforceNoAutostart(ctx context.Context, member string) error
+	// IPv4 is the address an instance of member's site is reached at.
+	IPv4(ctx context.Context, member, name string) (string, error)
+}
+
+// Starter brings member's copy of the workload up (internal/backend/incus/start).
+type Starter interface {
 	CheckStart(ctx context.Context, member string) error
 	Prepare(ctx context.Context, member string) error
 	Pull(ctx context.Context, member string) error
-	CheckCgroup2() error
-	MemberOnline(ctx context.Context, member string) (bool, error)
-	List(ctx context.Context, member string) ([]backend.Instance, error)
 	Start(ctx context.Context, member string) error
-	EnforceNoAutostart(ctx context.Context, member string) error
-	Stop(ctx context.Context, member string, graceful time.Duration) error
+}
+
+// Observer is whether the workload runs here, read without asking the
+// backend's daemon or the cluster (today: cgroupfs), so the self-checks and
+// self-fences work when both are gone.
+type Observer interface {
+	// CheckCgroup2: the host can be observed this way at all.
+	CheckCgroup2() error
+	// LocalRunning lists member's instances with live processes on this host.
 	LocalRunning(member string) ([]string, error)
-	IPv4(ctx context.Context, member, name string) (string, error)
+}
+
+// Membership is this host's identity and the cluster's view of a member.
+type Membership interface {
+	Identity(ctx context.Context) (member, arch string, err error)
+	MemberOnline(ctx context.Context, member string) (bool, error)
+}
+
+// Backend is the agent's seams, wired once.
+type Backend struct {
+	Site     Site
+	Starter  Starter
+	Observer Observer
+	Members  Membership
+	Fences   Fences
 }
 
 // Fences are this member's configured fence chains (fence.Configured over
@@ -75,7 +111,10 @@ var UpTimeout = 5 * time.Minute
 type Agent struct {
 	startLock string // hostStartLock path ("" none)
 	cfg       *config.Config
-	rt        Runtime
+	site      Site
+	starter   Starter
+	observer  Observer
+	members   Membership
 	fences    Fences
 	cli       *clientv3.Client
 	co        *coord.Coord
@@ -129,9 +168,7 @@ type Agent struct {
 
 type Options struct {
 	Config  *config.Config
-	Runtime Runtime
-	// Fences are the member's fence chains over the same backend.
-	Fences  Fences
+	Backend Backend
 	Etcd    *clientv3.Client
 	Log     *slog.Logger
 	Version string
@@ -171,8 +208,11 @@ func New(o Options) *Agent {
 	return &Agent{
 		m:         o.Metrics,
 		cfg:       o.Config,
-		rt:        o.Runtime,
-		fences:    o.Fences,
+		site:      o.Backend.Site,
+		starter:   o.Backend.Starter,
+		observer:  o.Backend.Observer,
+		members:   o.Backend.Members,
+		fences:    o.Backend.Fences,
 		cli:       o.Etcd,
 		co:        coord.New(o.Etcd, o.Config.EtcdPrefix, o.Config.Etcd.OpTimeout.D()),
 		log:       o.Log,
@@ -214,7 +254,7 @@ func (a *Agent) fitness() (bool, string) {
 // interval: each member's own ground truth, independent of the office.
 func (a *Agent) sampleLocal(ctx context.Context) {
 	for {
-		if running, err := a.rt.LocalRunning(a.member); err == nil {
+		if running, err := a.observer.LocalRunning(a.member); err == nil {
 			a.m.SetGauge("pagurus_local_running", float64(len(running)))
 		}
 		a.m.Bool("pagurus_self_chain_verified", a.selfChain().Verified(a.selfTarget()))
@@ -294,7 +334,7 @@ func (a *Agent) caps() coord.Caps {
 func (a *Agent) Preflight(ctx context.Context) error {
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	m, arch, err := a.rt.Identity(cctx)
+	m, arch, err := a.members.Identity(cctx)
 	if err != nil {
 		return fmt.Errorf("identity: %w", err)
 	}
@@ -306,13 +346,13 @@ func (a *Agent) Preflight(ctx context.Context) error {
 	if !slices.Contains(a.cfg.Members, m) {
 		return fmt.Errorf("member %q is not in members %v", m, a.cfg.Members)
 	}
-	if err := a.rt.CheckCgroup2(); err != nil {
+	if err := a.observer.CheckCgroup2(); err != nil {
 		return err
 	}
-	if err := a.rt.CheckProject(cctx, m); err != nil {
+	if err := a.site.CheckProject(cctx, m); err != nil {
 		return err
 	}
-	insts, err := a.rt.List(cctx, m)
+	insts, err := a.site.List(cctx, m)
 	if err != nil {
 		return err
 	}
@@ -324,7 +364,7 @@ func (a *Agent) Preflight(ctx context.Context) error {
 		a.log.Warn("no fence in the self chain applies to this project's instances: no verified self-fence (advertised; peers will not trust it under proceed)",
 			"types", t.Types, "chain", a.cfg.SelfFences())
 	}
-	if err := a.rt.CheckStart(cctx, m); err != nil {
+	if err := a.starter.CheckStart(cctx, m); err != nil {
 		return err
 	}
 	return a.preflightReplica(cctx)
@@ -414,7 +454,7 @@ func (a *Agent) followRefreshes(ctx context.Context) {
 			continue
 		}
 		pctx, cancel := context.WithTimeout(ctx, UpTimeout)
-		err = a.rt.Pull(pctx, a.member)
+		err = a.starter.Pull(pctx, a.member)
 		cancel()
 		if err != nil {
 			a.log.Warn("pull after the leader's refresh failed; retrying", "member", a.member, "token", done, "err", err)
@@ -490,7 +530,7 @@ func (a *Agent) guardLocal(ctx context.Context) {
 	if a.inTerm() {
 		return
 	}
-	running, err := a.rt.LocalRunning(a.member)
+	running, err := a.observer.LocalRunning(a.member)
 	if err != nil {
 		a.log.Error("cannot read local cgroups", "err", err)
 		a.setLocalStopped(false)
@@ -551,7 +591,7 @@ func (a *Agent) checkCgroupLayout(insts []backend.Instance) error {
 	if len(running) == 0 {
 		return nil
 	}
-	local, err := a.rt.LocalRunning(a.member)
+	local, err := a.observer.LocalRunning(a.member)
 	if err != nil {
 		return fmt.Errorf("%w: reading cgroupfs: %v", errCgroupLayout, err)
 	}
@@ -643,7 +683,7 @@ func (a *Agent) stopLocal(ctx context.Context, reason string) bool {
 	if ok {
 		log.Info("local instances stopped", "by", res.By, "took", a.now().Sub(start).Round(time.Millisecond))
 	} else {
-		running, lerr := a.rt.LocalRunning(a.member)
+		running, lerr := a.observer.LocalRunning(a.member)
 		a.alerter.Alert("self-fence-failed", "CANNOT confirm local instances stopped — watchdog is the backstop",
 			"member", a.member, "chain", res.String(), "running", running, "err", lerr, "watchdog", a.caps().WatchdogMode)
 	}
@@ -655,7 +695,7 @@ func (a *Agent) stopLocal(ctx context.Context, reason string) bool {
 func (a *Agent) startupFence(ctx context.Context) {
 	for ctx.Err() == nil {
 		a.beat(a.cfg.SelfFenceLead() + a.cfg.EligibleInterval.D())
-		running, err := a.rt.LocalRunning(a.member)
+		running, err := a.observer.LocalRunning(a.member)
 		if err == nil && len(running) == 0 {
 			a.setLocalStopped(true)
 			return
@@ -825,14 +865,14 @@ func (a *Agent) inTerm() bool {
 func (a *Agent) eligible(ctx context.Context) error {
 	cctx, cancel := context.WithTimeout(ctx, a.cfg.Fence.APITimeout.D())
 	defer cancel()
-	online, err := a.rt.MemberOnline(cctx, a.member)
+	online, err := a.members.MemberOnline(cctx, a.member)
 	if err != nil {
 		return fmt.Errorf("local Incus: %w", err)
 	}
 	if !online {
 		return errors.New("this member is not Online in the Incus cluster")
 	}
-	if err := a.rt.CheckProject(cctx, a.member); err != nil {
+	if err := a.site.CheckProject(cctx, a.member); err != nil {
 		return err
 	}
 	a.mu.Lock()

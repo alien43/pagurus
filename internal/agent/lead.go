@@ -113,9 +113,9 @@ func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, back
 	// The self-fence chain's budget (fences.self or the old self_fence), and
 	// never less than the 5 s graceful stop plus the forced stop after it.
 	sctx, cancel := context.WithTimeout(bg, max(a.cfg.SelfFenceLead(), 4*time.Second)+5*time.Second)
-	err := a.rt.Stop(sctx, a.member, 5*time.Second)
+	err := a.site.Stop(sctx, a.member, 5*time.Second)
 	cancel()
-	running, lerr := a.rt.LocalRunning(a.member)
+	running, lerr := a.observer.LocalRunning(a.member)
 	ok := err == nil && lerr == nil && len(running) == 0
 	if !ok {
 		ok = a.stopLocal(bg, "release: "+reason)
@@ -346,7 +346,7 @@ func (t *termState) start() error {
 	if waited > time.Second {
 		t.log.Info("waited for another service's start on this host", "waited", waited.Round(100*time.Millisecond))
 	}
-	if err := a.rt.Prepare(uctx, a.member); err != nil {
+	if err := a.starter.Prepare(uctx, a.member); err != nil {
 		return fmt.Errorf("prepare: %w", err)
 	}
 	if err := t.authorised(uctx); err != nil {
@@ -355,7 +355,7 @@ func (t *termState) start() error {
 	if err := t.stampVolumeIdmaps(uctx); err != nil {
 		return err
 	}
-	if err := a.rt.Start(uctx, a.member); err != nil {
+	if err := a.starter.Start(uctx, a.member); err != nil {
 		// `up` can fail after the instance started (incus-compose's DNS
 		// records step, when another member is offline). If everything runs,
 		// the term goes on: returning here skipped the checks below and the
@@ -370,10 +370,10 @@ func (t *termState) start() error {
 		a.stopLocal(context.WithoutCancel(uctx), "deposed while starting")
 		return fmt.Errorf("%w: the office moved while starting", errDeposed)
 	}
-	if err := a.rt.EnforceNoAutostart(uctx, a.member); err != nil {
+	if err := a.site.EnforceNoAutostart(uctx, a.member); err != nil {
 		return fmt.Errorf("enforce boot.autostart=false: %w", err)
 	}
-	insts, err := a.rt.List(uctx, a.member)
+	insts, err := a.site.List(uctx, a.member)
 	if err != nil {
 		return err
 	}
@@ -434,7 +434,7 @@ func (t *termState) confirmCgroupLayout(ctx context.Context, insts []backend.Ins
 		if !sleep(ctx, time.Second) {
 			return ctx.Err()
 		}
-		fresh, lerr := a.rt.List(ctx, a.member)
+		fresh, lerr := a.site.List(ctx, a.member)
 		if lerr != nil {
 			return lerr
 		}
@@ -467,7 +467,7 @@ func stoppedSince(before, after []backend.Instance) string {
 // allRunning reports whether this member's project has instances and all of
 // them are Running.
 func (t *termState) allRunning(ctx context.Context) bool {
-	insts, err := t.a.rt.List(ctx, t.a.member)
+	insts, err := t.a.site.List(ctx, t.a.member)
 	if err != nil || len(insts) == 0 {
 		return false
 	}
@@ -503,9 +503,9 @@ func (t *termState) authorised(ctx context.Context) error {
 func (t *termState) publish() {
 	a := t.a
 	ep := coord.Endpoint{Member: a.member, Epoch: t.epoch, Addresses: map[string]string{}}
-	if insts, err := a.rt.List(t.op, a.member); err == nil {
+	if insts, err := a.site.List(t.op, a.member); err == nil {
 		for _, in := range insts {
-			if ip, err := a.rt.IPv4(t.op, a.member, in.Name); err == nil {
+			if ip, err := a.site.IPv4(t.op, a.member, in.Name); err == nil {
 				ep.Addresses[in.Name] = ip
 			}
 		}
@@ -519,7 +519,7 @@ func (t *termState) health() error {
 	a := t.a
 	cctx, cancel := context.WithTimeout(t.op, a.cfg.Fence.APITimeout.D())
 	defer cancel()
-	insts, err := a.rt.List(cctx, a.member)
+	insts, err := a.site.List(cctx, a.member)
 	if err != nil {
 		return err
 	}
@@ -534,7 +534,7 @@ func (t *termState) health() error {
 	if a.cfg.Health.HTTP == "" {
 		return nil
 	}
-	ip, err := a.rt.IPv4(cctx, a.member, a.cfg.Health.Instance)
+	ip, err := a.site.IPv4(cctx, a.member, a.cfg.Health.Instance)
 	if err != nil {
 		return err
 	}
@@ -563,11 +563,11 @@ func (t *termState) audit() {
 			continue
 		}
 		cctx, cancel := context.WithTimeout(t.op, a.cfg.Fence.APITimeout.D())
-		if on, err := a.rt.MemberOnline(cctx, m); err == nil && on {
-			if insts, err := a.rt.List(cctx, m); err == nil {
+		if on, err := a.members.MemberOnline(cctx, m); err == nil && on {
+			if insts, err := a.site.List(cctx, m); err == nil {
 				if r := backend.Running(insts); len(r) > 0 {
 					a.alerter.Alert("rogue", "instances running on a non-leader member — stopping them", "member", m, "instances", r, "epoch", t.epoch)
-					if err := a.rt.Stop(cctx, m, 0); err != nil {
+					if err := a.site.Stop(cctx, m, 0); err != nil {
 						t.log.Error("could not stop rogue instances", "peer", m, "err", err)
 					}
 				}
@@ -686,7 +686,7 @@ func (t *termState) supervise() {
 		if tok, err := a.co.GetString(t.op, a.co.RefreshKey()); err == nil && tok != "" && tok != applied {
 			applied = tok
 			pctx, cancel := context.WithTimeout(t.op, UpTimeout)
-			err := a.rt.Pull(pctx, a.member)
+			err := a.starter.Pull(pctx, a.member)
 			cancel()
 			if err != nil {
 				// Not acknowledged: `pagurus refresh` times out and says so.

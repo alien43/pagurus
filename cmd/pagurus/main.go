@@ -136,13 +136,14 @@ func main() {
 	}
 	drv := incus.New(dopts)
 	rt := &runtime{Driver: drv, Starter: newStarter(cfg, drv)}
-	fences := fence.Configured{Local: drv, Remote: drv, Self: cfg.SelfFences(), Peer: cfg.PeerFences(), RebootMargin: cfg.Fence.RebootMargin.D()}
+	be := agent.Backend{Site: drv, Starter: rt.Starter, Observer: drv, Members: drv,
+		Fences: fence.Configured{Local: drv, Remote: drv, Self: cfg.SelfFences(), Peer: cfg.PeerFences(), RebootMargin: cfg.Fence.RebootMargin.D()}}
 
 	switch cmd {
 	case "validate":
-		err = cmdValidate(ctx, cfg, rt, fences)
+		err = cmdValidate(ctx, cfg, rt, be)
 	case "run":
-		err = cmdRun(ctx, cfg, rt, fences, log, *self, *cfgPath, *metricsAddr)
+		err = cmdRun(ctx, cfg, rt, be, log, *self, *cfgPath, *metricsAddr)
 	case "fence-self":
 		os.Exit(cmdFenceSelf(cfg, drv, *member, log))
 	case "status":
@@ -202,8 +203,8 @@ func withEtcd(cfg *config.Config, f func(*clientv3.Client) error) error {
 	return f(cli)
 }
 
-func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime, fences agent.Fences) error {
-	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Fences: fences, Etcd: nil})
+func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backend) error {
+	a := agent.New(agent.Options{Config: cfg, Backend: be, Etcd: nil})
 	if err := a.Preflight(ctx); err != nil {
 		return err
 	}
@@ -229,7 +230,7 @@ func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime, fences ag
 	return nil
 }
 
-func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, fences agent.Fences, log *slog.Logger, self, cfgPath, metricsAddr string) error {
+func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backend, log *slog.Logger, self, cfgPath, metricsAddr string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("run must be root (cgroup.kill, watchdog)")
 	}
@@ -247,7 +248,7 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, fences agent.F
 		return err
 	}
 	ms := metrics.New(cfg.Service, self)
-	a := agent.New(agent.Options{Config: cfg, Runtime: rt, Fences: fences, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log),
+	a := agent.New(agent.Options{Config: cfg, Backend: be, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log),
 		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: []string{exe, "term", "--socket"}, Metrics: ms,
 		StartLock: filepath.Join(cfg.StateDir, "start.lock")})
 	if metricsAddr != "" {
@@ -710,8 +711,8 @@ func fallbackTypes(cfg *config.Config) []string {
 	return []string{"container", "virtual-machine"}
 }
 
-// runtime is the agent's view of the world: the Incus driver (projects,
-// instances, fencing primitives) plus the configured starter.
+// runtime is the Incus driver (projects, instances, fencing primitives) plus
+// the configured starter, for the commands that use both.
 type runtime struct {
 	*incus.Driver
 	start.Starter

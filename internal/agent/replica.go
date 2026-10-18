@@ -65,7 +65,7 @@ func (a *Agent) preflightReplica(ctx context.Context) error {
 	if !a.replicating() {
 		return nil
 	}
-	v, ok := a.rt.(Volumes)
+	v, ok := a.site.(Volumes)
 	if !ok {
 		return errors.New("replicate is set but this runtime has no volume support")
 	}
@@ -368,10 +368,10 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 	a := t.a
 	ctx, cancel := context.WithTimeout(t.op, a.cfg.Replicate.CatchupTimeout.D())
 	defer cancel()
-	if on, err := a.rt.MemberOnline(ctx, prev); err != nil || !on {
+	if on, err := a.members.MemberOnline(ctx, prev); err != nil || !on {
 		return fmt.Errorf("%s is not reachable (online=%v, err=%v)", prev, on, err)
 	}
-	insts, err := a.rt.List(ctx, prev)
+	insts, err := a.site.List(ctx, prev)
 	if err != nil {
 		return err
 	}
@@ -412,7 +412,7 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 				break
 			}
 			a.m.Inc("pagurus_replica_pulls_total", "result", "failed")
-			if on, oerr := a.rt.MemberOnline(ctx, prev); ctx.Err() != nil || oerr != nil || !on {
+			if on, oerr := a.members.MemberOnline(ctx, prev); ctx.Err() != nil || oerr != nil || !on {
 				return fmt.Errorf("pull %s from %s: %w", vol, prev, err)
 			}
 			t.log.Warn("replicate: catch-up pull failed; retrying while the previous holder is reachable", "volume", vol, "err", err)
