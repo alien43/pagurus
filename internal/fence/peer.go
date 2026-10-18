@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/backend"
 )
 
 // Peer fences are what a new leader does to another member that may still
@@ -68,7 +68,7 @@ type PeerFence interface {
 // Remote is what incus-api-stop needs: the cluster's view of a member.
 type Remote interface {
 	MemberOnline(ctx context.Context, member string) (bool, error)
-	List(ctx context.Context, member string) ([]incus.Instance, error)
+	List(ctx context.Context, member string) ([]backend.Instance, error)
 	Stop(ctx context.Context, member string, graceful time.Duration) error
 }
 
@@ -93,14 +93,14 @@ func (f IncusAPIStop) Attempt(ctx context.Context, t PeerTarget) Outcome {
 		return Outcome{Status: Skip, Why: "offline in the Incus cluster"}
 	}
 	insts, err := f.R.List(ctx, t.Member)
-	if err == nil && !incus.AllStopped(insts) {
+	if err == nil && !backend.AllStopped(insts) {
 		_ = f.R.Stop(ctx, t.Member, 0) // judged by the re-list below
 		insts, err = f.R.List(ctx, t.Member)
 	}
 	if err != nil {
 		return Outcome{Status: Skip, Why: "Incus API error: " + err.Error()}
 	}
-	if !incus.AllStopped(insts) {
+	if !backend.AllStopped(insts) {
 		return Outcome{Status: Wait, Why: fmt.Sprintf("instances on %s still not stopped after API stop", t.Member)}
 	}
 	for _, in := range insts {

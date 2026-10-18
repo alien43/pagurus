@@ -9,7 +9,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/alien43/pagurus/internal/incus"
+	"github.com/alien43/pagurus/internal/backend"
 )
 
 const (
@@ -43,7 +43,7 @@ type Runner func(ctx context.Context, name string, args ...string) ([]byte, erro
 
 // Lister is the cluster's view of a member's project.
 type Lister interface {
-	List(ctx context.Context, member string) ([]incus.Instance, error)
+	List(ctx context.Context, member string) ([]backend.Instance, error)
 }
 
 // InstanceStarter lists and starts instances of a member's project
@@ -125,7 +125,7 @@ func (s Instances) Kind() string    { return KindInstances }
 func (s Instances) Types() []string { return []string{"container", "virtual-machine"} }
 
 // selected returns the instances Start acts on, checking the names exist.
-func (s Instances) selected(ctx context.Context, member string) ([]incus.Instance, error) {
+func (s Instances) selected(ctx context.Context, member string) ([]backend.Instance, error) {
 	insts, err := s.L.List(ctx, member)
 	if err != nil {
 		return nil, err
@@ -136,10 +136,10 @@ func (s Instances) selected(ctx context.Context, member string) ([]incus.Instanc
 		}
 		return insts, nil
 	}
-	var out []incus.Instance
+	var out []backend.Instance
 	var missing []string
 	for _, n := range s.Names {
-		i := slices.IndexFunc(insts, func(in incus.Instance) bool { return in.Name == n })
+		i := slices.IndexFunc(insts, func(in backend.Instance) bool { return in.Name == n })
 		if i < 0 {
 			missing = append(missing, n)
 			continue
@@ -185,7 +185,7 @@ func (s Instances) Start(ctx context.Context, member string) error {
 	}
 	var names []string
 	for _, in := range insts {
-		if in.Status != incus.StatusRunning {
+		if in.Status != backend.StatusRunning {
 			names = append(names, in.Name)
 		}
 	}

@@ -24,19 +24,16 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/alien43/pagurus/internal/backend"
 )
 
-type Instance struct {
-	Name     string            `json:"name"`
-	Status   string            `json:"status"`
-	Location string            `json:"location"`
-	Type     string            `json:"type"`
-	Expanded map[string]string `json:"expanded_config"`
-}
+// Instance and its statuses are the backend-neutral types, re-exported.
+type Instance = backend.Instance
 
 const (
-	StatusRunning = "Running"
-	StatusStopped = "Stopped"
+	StatusRunning = backend.StatusRunning
+	StatusStopped = backend.StatusStopped
 )
 
 type Options struct {
@@ -246,26 +243,11 @@ func (d *Driver) Stop(ctx context.Context, member string, graceful time.Duration
 	return stopAll(ctx, 0, true)
 }
 
-// AllStopped is true when every instance is Stopped (an empty project counts).
-func AllStopped(insts []Instance) bool {
-	for _, in := range insts {
-		if in.Status != StatusStopped {
-			return false
-		}
-	}
-	return true
-}
-
-// Running returns the names of instances in a Running state.
-func Running(insts []Instance) []string {
-	var out []string
-	for _, in := range insts {
-		if in.Status == StatusRunning {
-			out = append(out, in.Name)
-		}
-	}
-	return out
-}
+// AllStopped and Running are backend.AllStopped and backend.Running.
+var (
+	AllStopped = backend.AllStopped
+	Running    = backend.Running
+)
 
 // payloadPrefix is liblxc's payload cgroup name prefix for this member's
 // project: "lxc.payload.<project>_<instance>".

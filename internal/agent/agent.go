@@ -28,10 +28,10 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/alien43/pagurus/internal/backend"
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/fence"
-	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/metrics"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
@@ -47,7 +47,7 @@ type Runtime interface {
 	Pull(ctx context.Context, member string) error
 	CheckCgroup2() error
 	MemberOnline(ctx context.Context, member string) (bool, error)
-	List(ctx context.Context, member string) ([]incus.Instance, error)
+	List(ctx context.Context, member string) ([]backend.Instance, error)
 	Start(ctx context.Context, member string) error
 	EnforceNoAutostart(ctx context.Context, member string) error
 	Stop(ctx context.Context, member string, graceful time.Duration) error
@@ -545,10 +545,10 @@ var errCgroupLayout = errors.New("cgroup layout not recognised")
 // checkCgroupLayout requires that every container Incus reports Running in
 // this member's project has a live payload cgroup (lxc.payload.<project>_<name>)
 // that LocalRunning sees. VMs have no payload cgroup and are not checked here.
-func (a *Agent) checkCgroupLayout(insts []incus.Instance) error {
+func (a *Agent) checkCgroupLayout(insts []backend.Instance) error {
 	var running []string
 	for _, in := range insts {
-		if in.Status == incus.StatusRunning && (in.Type == "" || in.Type == "container") {
+		if in.Status == backend.StatusRunning && (in.Type == "" || in.Type == "container") {
 			running = append(running, in.Name)
 		}
 	}
@@ -570,7 +570,7 @@ func (a *Agent) checkCgroupLayout(insts []incus.Instance) error {
 }
 
 // setTypes records the distinct instance types of insts (sorted).
-func (a *Agent) setTypes(insts []incus.Instance) {
+func (a *Agent) setTypes(insts []backend.Instance) {
 	var ts []string
 	for _, in := range insts {
 		if in.Type != "" && !slices.Contains(ts, in.Type) {

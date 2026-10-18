@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alien43/pagurus/internal/backend"
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/incus"
 	"github.com/alien43/pagurus/internal/replica"
@@ -374,7 +375,7 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 	if err != nil {
 		return err
 	}
-	if r := incus.Running(insts); len(r) > 0 {
+	if r := backend.Running(insts); len(r) > 0 {
 		return fmt.Errorf("%s still runs %v", prev, r)
 	}
 	snap := replica.Name(prevEpoch, a.now(), true)

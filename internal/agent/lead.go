@@ -12,10 +12,10 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/alien43/pagurus/internal/backend"
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/fence"
-	"github.com/alien43/pagurus/internal/incus"
 )
 
 // lead runs one term, handed over by `pagurus term` (conch's child). epoch is
@@ -436,7 +436,7 @@ const layoutRechecks = 3
 // killed mid-restart). A container that stops while re-reading is a start
 // failure, retried like any other; one that stays Running with no payload
 // cgroup is the layout problem.
-func (t *termState) confirmCgroupLayout(ctx context.Context, insts []incus.Instance) error {
+func (t *termState) confirmCgroupLayout(ctx context.Context, insts []backend.Instance) error {
 	a := t.a
 	err := a.checkCgroupLayout(insts)
 	for i := 0; err != nil && i < layoutRechecks; i++ {
@@ -460,13 +460,13 @@ func (t *termState) confirmCgroupLayout(ctx context.Context, insts []incus.Insta
 
 // stoppedSince names a container Running in before that is not Running (or
 // gone) in after.
-func stoppedSince(before, after []incus.Instance) string {
+func stoppedSince(before, after []backend.Instance) string {
 	now := map[string]string{}
 	for _, in := range after {
 		now[in.Name] = in.Status
 	}
 	for _, in := range before {
-		if in.Status == incus.StatusRunning && now[in.Name] != incus.StatusRunning {
+		if in.Status == backend.StatusRunning && now[in.Name] != backend.StatusRunning {
 			return in.Name
 		}
 	}
@@ -481,7 +481,7 @@ func (t *termState) allRunning(ctx context.Context) bool {
 		return false
 	}
 	for _, in := range insts {
-		if in.Status != incus.StatusRunning {
+		if in.Status != backend.StatusRunning {
 			return false
 		}
 	}
@@ -536,7 +536,7 @@ func (t *termState) health() error {
 		return errors.New("no instances")
 	}
 	for _, in := range insts {
-		if in.Status != incus.StatusRunning {
+		if in.Status != backend.StatusRunning {
 			return fmt.Errorf("%s is %s", in.Name, in.Status)
 		}
 	}
@@ -574,7 +574,7 @@ func (t *termState) audit() {
 		cctx, cancel := context.WithTimeout(t.op, a.cfg.Fence.APITimeout.D())
 		if on, err := a.rt.MemberOnline(cctx, m); err == nil && on {
 			if insts, err := a.rt.List(cctx, m); err == nil {
-				if r := incus.Running(insts); len(r) > 0 {
+				if r := backend.Running(insts); len(r) > 0 {
 					a.alerter.Alert("rogue", "instances running on a non-leader member — stopping them", "member", m, "instances", r, "epoch", t.epoch)
 					if err := a.rt.Stop(cctx, m, 0); err != nil {
 						t.log.Error("could not stop rogue instances", "peer", m, "err", err)
