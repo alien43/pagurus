@@ -554,7 +554,7 @@ then its confirm. It is meant for drills on scratch projects.
 | :--- | :--- | :--- |
 | `off` | nothing | no |
 | `dry-run` *(default)* | logs `NOT FIT — withholding pet` | no |
-| `systemd` | the unit's `WatchdogSec=` fires. Default: systemd kills the agent and restarts it, and the restarted agent kills anything still running locally (startup fence). With `FailureAction=reboot-force` the host reboots; the agent reads its own unit's `FailureAction` to decide what it advertises. | only with a reboot `FailureAction` |
+| `systemd` | the unit's `WatchdogSec=` fires. Default: systemd kills the agent and restarts it, and the restarted agent kills anything still running locally (startup fence). With `FailureAction=reboot-force` the host reboots, and not only on a missed deadline: systemd runs `FailureAction` on **any** failed result of the unit, so a SIGKILL, crash or OOM kill of the agent reboots the host too (dell, 2026-10-18). That is intended: `fences_by_reboot` promises peers that the host resets once the agent stops petting, and a dead agent has stopped petting (a crash-looping one never re-arms systemd's watchdog). The agent reads its own unit's `FailureAction` to decide what it advertises. `scripts/drill.sh` refuses `restart`/`crash`/`pause` on such a member unless `ALLOW_REBOOT=1`. | only with a reboot `FailureAction` |
 | `device` | opens `watchdog.device` (e.g. `/dev/watchdog1`, unused on asus/dell; `/dev/watchdog0` is systemd's `RuntimeWatchdogSec`) **only with `arm: true`**, else behaves as dry-run. Magic-close disarm only on a clean exit with nothing running. | yes, when armed |
 
 In every mode except `off`, conch's pets come through the daemon's relay (§ Process shape):

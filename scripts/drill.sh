@@ -76,6 +76,16 @@ settle() { wait_for 180 settled >/dev/null || miss "cluster did not settle (lead
 not_running_on() { ! running_on | grep -qw "$1"; }
 mainpid() { on "$1" "systemctl show -p MainPID --value $unit"; }
 restart_agent() { on "$1" "sudo systemctl start $unit" || miss "could not restart the agent on $1"; }
+# reboot_armed M: M's unit has a reboot FailureAction (rebootOnWatchdog). There ANY failure of the agent --
+# SIGKILL, crash, OOM kill, missed watchdog -- force-reboots the host (systemd runs FailureAction on the
+# failed result before Restart= applies; dell 2026-10-18 08:00:52). That is the fences_by_reboot contract
+# peers rely on, so restart/crash/pause there are host reboots: refused unless ALLOW_REBOOT=1.
+reboot_armed() { on "$1" "systemctl show -p FailureAction --value $unit" | grep -q '^reboot'; }
+refuse_armed() {
+  reboot_armed "$1" || return 1
+  [ "${ALLOW_REBOOT:-}" = 1 ] && { log "   ALLOW_REBOOT=1: this REBOOTS $1 (all its pagurus services fail over)"; return 1; }
+  miss "$2 on $1 refused: $1 is reboot-armed, so this reboots the host (ALLOW_REBOOT=1 to do it anyway)"
+}
 
 audit_log=$(mktemp /tmp/pagurus-audit.XXXX)
 on "$CTL" "pagurus audit -c $cfg --every 500ms" >"$audit_log" 2>&1 </dev/null &
@@ -106,19 +116,21 @@ drill_graceful() {
 
 # No lease resume: a killed agent's term ends. systemd restarts the agent,
 # whose startup fence stops the orphaned copy; the office comes back once the
-# dead term's lease has expired. Never two.
+# dead term's lease has expired. Never two. On a reboot-armed member the kill
+# reboots the host instead (refuse_armed).
 drill_restart() {
-  local l pid e; l=$(leader); e=$(epoch); pid=$(mainpid "$l"); log "== restart: SIGKILL the agent on $l (pid $pid, epoch $e); systemd restarts it within RestartSec"
+  local l pid e; l=$(leader); refuse_armed "$l" restart && return
+  e=$(epoch); pid=$(mainpid "$l"); log "== restart: SIGKILL the agent on $l (pid $pid, epoch $e); systemd restarts it within RestartSec"
   on "$l" "sudo kill -KILL $pid"
   new_term() { local n; n=$(epoch); [ -n "$n" ] && [ "$n" != "$e" ] && settled; }
   if t=$(wait_for 120 new_term); then log "   $(leader) serving a new term (epoch $(epoch)) ${t}s after the kill"; else miss "restart (leader=$(leader) epoch=$(epoch) running=$(running_on))"; fi
 }
 
-# On a member armed with FailureAction=reboot-force this REBOOTS the host: the
-# `systemctl stop` after the kill leaves the unit failed instead of restarting
-# (a bare crash only restarts it). Seen on dell 2026-10-12.
+# On a member armed with FailureAction=reboot-force this REBOOTS the host, as
+# any agent failure there does (dell 2026-10-12, and a bare SIGKILL 2026-10-18).
 drill_crash() {
-  local l; l=$(leader); log "== crash: SIGKILL the agent on $l and keep it down (workload left running)"
+  local l; l=$(leader); refuse_armed "$l" crash && return
+  log "== crash: SIGKILL the agent on $l and keep it down (workload left running)"
   on "$l" "sudo systemctl kill -s KILL --kill-whom=main $unit; sudo systemctl stop $unit"
   if t=$(wait_for 120 some_other_healthy "$l"); then log "   $(leader) serving ${t}s after the crash (old copy fenced via API)"; else miss "no failover"; fi
   restart_agent "$l"
@@ -128,7 +140,8 @@ drill_crash() {
 # with it, unfenced). The restarted agent's startup fence stops the orphaned
 # copy, and a new term starts once the dead lease expires.
 drill_pause() {
-  local l pid e; l=$(leader); e=$(epoch); pid=$(mainpid "$l"); log "== pause: SIGSTOP the agent on $l (epoch $e) for up to 90s"
+  local l pid e; l=$(leader); refuse_armed "$l" pause && return
+  e=$(epoch); pid=$(mainpid "$l"); log "== pause: SIGSTOP the agent on $l (epoch $e) for up to 90s"
   on "$l" "sudo kill -STOP $pid"
   new_term() { local n; n=$(epoch); [ -n "$n" ] && [ "$n" != "$e" ] && settled; }
   if t=$(wait_for 90 new_term); then log "   $(leader) serving a new term (epoch $(epoch)) ${t}s into the pause"; else miss "no new term during pause (leader=$(leader) epoch=$(epoch))"; fi
