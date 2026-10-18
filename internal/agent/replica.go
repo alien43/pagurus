@@ -722,7 +722,7 @@ func (t *termState) handover(to string) {
 			t.log.Warn("move: the target did not catch up within catchup_timeout; releasing anyway", "to", to)
 			return
 		}
-		if pin, err := a.co.Pin(t.op); err == nil && pin != to {
+		if pin, err := a.activePin(t.op); err == nil && pin != to {
 			return
 		}
 		if !sleep(t.op, 100*time.Millisecond) {

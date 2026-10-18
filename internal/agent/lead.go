@@ -79,7 +79,7 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 		return finish()
 	}
 	// What made us campaign may have changed while conch waited.
-	if pin, err := a.co.Pin(op); err == nil && pin != "" && pin != a.member {
+	if pin, err := a.activePin(op); err == nil && pin != "" && pin != a.member {
 		t.giveUp("office pinned to "+pin, 0)
 		return finish()
 	}
@@ -564,7 +564,7 @@ func (t *termState) supervise() {
 			return
 		case <-tick.C:
 		}
-		if pin, err := a.co.Pin(t.op); err == nil && pin != "" && pin != a.member {
+		if pin, err := a.activePin(t.op); err == nil && pin != "" && pin != a.member {
 			// A planned move: with replication, copy to the target while
 			// still serving, so the stop-to-start gap is only the final
 			// catch-up. Release only if the pin still points there.
@@ -572,7 +572,7 @@ func (t *termState) supervise() {
 			if t.op.Err() != nil {
 				return
 			}
-			if now, err := a.co.Pin(t.op); err != nil || now != pin {
+			if now, err := a.activePin(t.op); err != nil || now != pin {
 				continue
 			}
 			t.giveUp("office pinned to "+pin, 0)
@@ -619,6 +619,11 @@ func (t *termState) supervise() {
 		case err == nil:
 			if !healthy {
 				t.log.Info("workload healthy")
+				if err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutMS(a.member, coord.MemberState{
+					State: coord.MayRun, Epoch: t.epoch, By: a.member, Reason: "healthy", At: a.now().UTC(), Caps: a.caps(),
+				})); err != nil {
+					t.log.Warn("cannot record healthy member state", "err", err)
+				}
 			}
 			if !everHealthy {
 				a.mu.Lock()

@@ -358,7 +358,9 @@ func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 		"watchdog_timeout", wd.Timeout(), "fences_by_reboot", wd.FencesByReboot(),
 		"ttl", a.cfg.Lease.TTL.D(), "unverified_policy", a.cfg.Fence.Unverified, "office", a.co.Office())
 
-	go a.registerLoop(ctx)
+	regReady := make(chan struct{})
+	go a.registerLoop(ctx, regReady)
+	<-regReady
 	go a.followRefreshes(ctx)
 	go a.followReplica(ctx)
 	a.startupFence(ctx)
@@ -408,20 +410,29 @@ func (a *Agent) followRefreshes(ctx context.Context) {
 }
 
 // registerLoop keeps reg/<member> (config hash, caps, versions) under a lease
-// of its own. Not safety-critical: peers read it for the config-skew check.
-func (a *Agent) registerLoop(ctx context.Context) {
+// of its own. Peers read it for the config-skew check and to tell whether a
+// pinned target has a live agent.
+func (a *Agent) registerLoop(ctx context.Context, ready chan<- struct{}) {
 	ttl := int64(a.cfg.Lease.TTL.D() / time.Second)
 	for ctx.Err() == nil {
 		cctx, cancel := context.WithTimeout(ctx, a.cfg.Etcd.OpTimeout.D())
 		g, err := a.cli.Grant(cctx, ttl)
 		cancel()
 		if err != nil {
+			if ready != nil {
+				close(ready)
+				ready = nil
+			}
 			sleep(ctx, a.cfg.EligibleInterval.D())
 			continue
 		}
 		reg := coord.Registration{AgentID: a.agentID, Version: a.version, Arch: a.arch, Caps: a.caps(), Started: a.now().UTC(), Versions: a.versions, ConfigHash: a.cfg.SafetyHash()}
 		if err := a.co.Register(ctx, a.member, g.ID, reg); err != nil {
 			a.log.Warn("register failed", "err", err)
+		}
+		if ready != nil {
+			close(ready)
+			ready = nil
 		}
 		ka, err := a.cli.KeepAlive(ctx, g.ID)
 		if err == nil {
@@ -432,6 +443,9 @@ func (a *Agent) registerLoop(ctx context.Context) {
 		_, _ = a.cli.Revoke(rctx, g.ID)
 		cancel()
 		sleep(ctx, time.Second)
+	}
+	if ready != nil {
+		close(ready)
 	}
 }
 
@@ -661,10 +675,30 @@ type campaign struct {
 	why   string        // non-empty: do not campaign
 }
 
+// activePin returns the member the office is pinned to, or "" when unpinned
+// or when the pin names another member whose agent is not registered (reg/<pin>
+// is absent, so its lease has expired or it is not running). A pin to a dead
+// target must never keep live members out of the election or make a leader
+// step down into a void.
+func (a *Agent) activePin(ctx context.Context) (string, error) {
+	pin, err := a.co.Pin(ctx)
+	if err != nil || pin == "" || pin == a.member {
+		return pin, err
+	}
+	regs, err := a.co.Registrations(ctx)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := regs[pin]; !ok {
+		return "", nil
+	}
+	return pin, nil
+}
+
 // desired decides whether to campaign, and with what delay: rank × grace,
 // or none for the member the office is pinned to.
 func (a *Agent) desired(ctx context.Context) campaign {
-	pin, err := a.co.Pin(ctx)
+	pin, err := a.activePin(ctx)
 	if err != nil {
 		return campaign{why: "etcd unreachable: " + err.Error()}
 	}

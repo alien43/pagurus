@@ -1171,3 +1171,23 @@ func TestRefreshThatStaysUnhealthyFailsOver(t *testing.T) {
 		t.Errorf("followers pulled a refresh that failed: dell=%d rpi5=%d", h.pulls("dell"), h.pulls("rpi5"))
 	}
 }
+
+// A pin left behind by a dead `pagurus move` client (13 min lease) whose
+// target is also dead must not keep a live member from leading once the
+// target's registration lease has expired.
+func TestPinToDeadTargetDoesNotBlockLiveMember(t *testing.T) {
+	h := newHarness(t, nil)
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	if _, err := h.coord().PinFor(context.Background(), "dell", 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	h.nodes["dell"].crash()
+	h.nodes["asus"].crash()
+	took := h.waitRunning("rpi5", 25*time.Second)
+	t.Logf("rpi5 running %s after asus and pinned target dell crashed", took.Round(100*time.Millisecond))
+	h.holdOne("rpi5", 2*time.Second)
+	if got := h.memberStates()["rpi5"]; got.State != coord.MayRun || got.Reason != "healthy" {
+		t.Fatalf("rpi5 member state = %+v, want may-run (healthy)", got)
+	}
+}
