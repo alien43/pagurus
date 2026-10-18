@@ -6,7 +6,7 @@
 # itself (move, audit) runs on $CTL, a member with the binary and config.
 #
 #   drill.sh [move|graceful|restart|crash|pause|partition]...   (default: all but partition, in that order)
-#   SVC=<service> HEALTH_PATH=<path> CTL=<member> select the service, its probe path, the control member.
+#   SVC=<service> HEALTH_PATH=<path> HEALTH_PORT=<port> CTL=<member> select the service, its probe path and port, the control member.
 #
 # Exit status is non-zero if any drill misses its expectation or the audit
 # ever saw two members running at once.
@@ -22,6 +22,7 @@
 set -uo pipefail
 svc=${SVC:-whoami}
 health_path=${HEALTH_PATH:-/health} # an HTTP path the workload answers 200 on
+health_port=${HEALTH_PORT:-80}       # the port it answers on inside the instance (gokapi: 53842)
 unit=pagurus@$svc
 declare -A ssh=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
 CTL=${CTL:-asus}
@@ -68,7 +69,7 @@ endpoint_ip() { etcdctl --endpoints=$eps get "$kprefix/endpoint" --print-value-o
 # M: the instance sits on M's own incusbr0)
 healthy_on() {
   local ip; ip=$(endpoint_ip)
-  [ "$(leader)" = "$1" ] && [ "$(running_on)" = "$1" ] && [ -n "$ip" ] && on "$1" "curl -fsS -m 3 http://$ip:80$health_path" >/dev/null 2>&1
+  [ "$(leader)" = "$1" ] && [ "$(running_on)" = "$1" ] && [ -n "$ip" ] && on "$1" "curl -fsS -m 3 http://$ip:$health_port$health_path" >/dev/null 2>&1
 }
 some_other_healthy() { local l; l=$(leader); [ -n "$l" ] && [ "$l" != "$1" ] && healthy_on "$l"; }
 settled() { local l; l=$(leader); [ -n "$l" ] && healthy_on "$l"; }
@@ -180,7 +181,7 @@ drill_partition() {
     local l ip; l=$(leader); ip=$(endpoint_ip)
     [ -n "$l" ] && [ "$l" != "$m" ] && [ -n "$ip" ] \
       && [ "$(incus list --project "$prefix-$l" -c s --format csv 2>/dev/null | grep -c RUNNING)" -gt 0 ] \
-      && on "$l" "curl -fsS -m 3 http://$ip:80$health_path" >/dev/null 2>&1
+      && on "$l" "curl -fsS -m 3 http://$ip:$health_port$health_path" >/dev/null 2>&1
   }
   if t=$(wait_for 240 serving_elsewhere); then log "   $(leader) serving ${t}s after the cut (failover gap)"; else miss "partition: no failover within 240s (leader=$(leader) running=$(running_on))"; fi
   wait_for $((CUT + 90)) online_in_incus "$m" >/dev/null || miss "partition: $m not ONLINE again"
