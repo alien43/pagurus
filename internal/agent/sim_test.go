@@ -87,6 +87,11 @@ type simMember struct {
 	pulls     int // Pull calls
 	// launchPause pauses inside the launch itself (the residual window).
 	launchPause time.Duration
+	// listDelay: the cluster takes this long to answer a List of this member
+	// (a slow incusd or cluster database). A caller whose budget is shorter
+	// gets its context's error, as from a real API timeout (mqtt-lab
+	// 2026-10-18: "context deadline exceeded" at incus-api-stop's 15 s).
+	listDelay time.Duration
 }
 
 func newSim(t *testing.T, members ...string) *simCluster {
@@ -196,8 +201,17 @@ func (r *simRT) MemberOnline(_ context.Context, m string) (bool, error) {
 	return r.c.m[m].online, nil
 }
 
-func (r *simRT) List(_ context.Context, m string) ([]incus.Instance, error) {
+func (r *simRT) List(ctx context.Context, m string) ([]incus.Instance, error) {
 	r.c.mu.Lock()
+	if d := r.c.m[m].listDelay; d > 0 {
+		r.c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(d):
+		}
+		r.c.mu.Lock()
+	}
 	defer r.c.mu.Unlock()
 	if err := r.clusterOp(); err != nil {
 		return nil, err

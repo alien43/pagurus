@@ -58,6 +58,10 @@ type Replicator interface {
 
 var errStale = errors.New("replica too stale to start")
 
+// errPrevRunning: the previous holder's copy is seen running and could not be
+// stopped. Starting would make two; the term gives up instead.
+var errPrevRunning = errors.New("the previous holder's copy still runs")
+
 func (a *Agent) replicating() bool { return a.cfg.Replicate != nil }
 
 // preflightReplica: the runtime can replicate and every volume exists here.
@@ -339,6 +343,10 @@ func (t *termState) replicaTakeover() bool {
 		if t.op.Err() != nil {
 			return false
 		}
+		if errors.Is(err, errPrevRunning) {
+			t.giveUp("replicate: "+err.Error()+"; not starting a second copy", a.cfg.Fence.RetryInterval.D())
+			return false
+		}
 		t.log.Warn("replicate: cannot pull the previous holder's final state; checking this member's own copy", "previous", prev, "err", err)
 		if !t.staleGate(prev, prevEpoch) {
 			return false
@@ -375,7 +383,20 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 		return err
 	}
 	if r := backend.Running(insts); len(r) > 0 {
-		return fmt.Errorf("%s still runs %v", prev, r)
+		// The fence could not see it (an Incus API slower than the fence's
+		// budget) and the term went on trusting a self-fence that never
+		// ran (mqtt-lab 2026-10-18: agent and conch killed, broker left
+		// running). The cluster sees it now: stop it, with this longer
+		// budget, and take its final state; or start nothing.
+		t.log.Warn("replicate: the previous holder still runs although its fence passed; stopping it through the Incus API", "previous", prev, "instances", r)
+		_ = a.site.Stop(ctx, prev, 0) // judged by the re-list below
+		if insts, err = a.site.List(ctx, prev); err != nil {
+			return fmt.Errorf("%w: %s ran %v and cannot be listed after the stop: %v", errPrevRunning, prev, r, err)
+		}
+		if r := backend.Running(insts); len(r) > 0 {
+			return fmt.Errorf("%w: %s still runs %v", errPrevRunning, prev, r)
+		}
+		t.log.Info("replicate: stopped the previous holder's copy", "previous", prev)
 	}
 	snap := replica.Name(prevEpoch, a.now(), true)
 	if err := a.snapshotAll(ctx, prev, snap); err != nil {

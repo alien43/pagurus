@@ -1037,3 +1037,22 @@ func TestReplicaStepAsideDoesNotRewaitTheFence(t *testing.T) {
 		t.Fatalf("dell's record %+v: want stopped, marked unverified, so a later term does not wait again", st)
 	}
 }
+
+// mqtt-lab 2026-10-18: the leader's agent and conch are killed (no
+// self-fence) while its broker runs, and the cluster answers a List of it
+// slower than incus-api-stop's budget. The fence skips, policy=proceed
+// trusts the self-fence that never ran, and the takeover's catch-up (a longer
+// budget) sees the old copy still running. It must stop it there and take the
+// final state, not start a second copy from its own.
+func TestReplicaCatchUpStopsAPreviousHolderTheFenceCouldNotSee(t *testing.T) {
+	h := newReplHarness(t, both(proceed, replicated(time.Minute)))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	h.sim.set("asus", func(m *simMember) { m.listDelay = 2 * time.Second })
+	h.nodes["asus"].crash()
+	h.waitRunning("dell", 40*time.Second)
+	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
+		t.Fatalf("dell started from %d, asus was stopped at %d: lost %d writes", got, old, old-got)
+	}
+}
