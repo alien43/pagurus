@@ -264,6 +264,7 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 	case fence.Confirmed:
 		if !out.Verified {
 			t.log.Warn("member unreachable; treating as fenced", "peer", m, "by", by, "waited", since.Round(time.Second))
+			t.recordAssumedStopped(m, st, by)
 			return true, "", 0
 		}
 		if st.State == coord.MayRun {
@@ -298,12 +299,36 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 		if since >= wait {
 			a.alerter.Alert("fence-unverified", "proceeding WITHOUT a verified fence (policy=proceed): trusting the member's self-fence",
 				"member", m, "reach", reach, "their_epoch", st.Epoch, "waited", since.Round(time.Second))
+			t.recordAssumedStopped(m, st, "self-fence-trust")
 			return true, "", 0
 		}
 		return false, fmt.Sprintf("waiting %s before trusting %s's self-fence (%s)", (wait - since).Round(time.Second), m, reach), min(retry, wait-since)
 	}
 	return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is unreachable (%s), and no peer fence confirmed; "+
 		"waiting for it to come back, or run `pagurus fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
+}
+
+// recordAssumedStopped records an unreachable member as stopped once a
+// time-based fence (watchdog-wait, or trusting its self-fence under
+// policy=proceed) has concluded that it runs nothing for its epoch st.Epoch.
+// That conclusion holds until the member runs a new term, which writes a fresh
+// may-run record, so a later term in the same outage (a step-aside to a
+// fresher copy, a failed start) need not wait it out again: unrecorded, B2 on
+// gokapi-dev (2026-10-18) paid 2 x 55 s. The reason says unverified, and the
+// write is guarded by this term's lease like a verified fence's. Failing to
+// record only costs the next term the wait, so it does not hold this one up.
+func (t *termState) recordAssumedStopped(m string, st coord.MemberState, by string) {
+	if st.State != coord.MayRun {
+		return
+	}
+	a := t.a
+	err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutMS(m, coord.MemberState{
+		State: coord.Stopped, Epoch: st.Epoch, By: a.member, At: a.now().UTC(), Caps: st.Caps,
+		Reason: fmt.Sprintf("assumed stopped via %s (unverified: unreachable) by epoch %d", by, t.epoch),
+	}))
+	if err != nil {
+		t.log.Warn("cannot record the assumed fence; a later term will wait again", "peer", m, "err", err)
+	}
 }
 
 // ---------------------------------------------------------------- supervise -

@@ -1012,3 +1012,28 @@ func TestReplicaVolumesStampedBeforeFirstStart(t *testing.T) {
 		}
 	}
 }
+
+// The B2 shape (gokapi-dev, 2026-10-18): the leader dies unreachable, the
+// first winner holds an older copy and steps aside, a fresher member leads.
+// The first winner's wait already established that the dead leader runs
+// nothing (an unverified, time-based fence), so the second term must not wait
+// it out again: live, that cost a second 55 s (147.5 s down). The record says
+// so, marked unverified.
+func TestReplicaStepAsideDoesNotRewaitTheFence(t *testing.T) {
+	h := newReplHarness(t, both(proceed, replicated(time.Minute)))
+	h.cfg.Prefer = []string{"dell", "asus", "rpi5"}
+	h.startAll()
+	h.waitRunning("dell", 10*time.Second)
+	h.waitFor("followers pulled", 10*time.Second, func() bool { return h.pulledFromLeader("asus") && h.pulledFromLeader("rpi5") })
+	h.nodes["asus"].crash()
+	time.Sleep(3 * time.Second)
+	h.waitFor("rpi5 pulled again", 5*time.Second, func() bool { return h.pulledFromLeader("rpi5") })
+	h.powerOff("dell")
+	h.start("asus", nil)
+	took := h.waitRunning("rpi5", 60*time.Second)
+	st := h.memberStates()["dell"]
+	t.Logf("rpi5 running %s after dell's power-off; dell's record: %s by %s (%s)", took, st.State, st.By, st.Reason)
+	if st.State != coord.Stopped || !strings.Contains(st.Reason, "unverified") {
+		t.Fatalf("dell's record %+v: want stopped, marked unverified, so a later term does not wait again", st)
+	}
+}
