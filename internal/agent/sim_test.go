@@ -725,6 +725,22 @@ func TestCrashedAgentIsFencedViaAPI(t *testing.T) {
 	}
 }
 
+// The A6 shape without replicate (mqtt-lab 2026-10-18): the leader's agent
+// and conch are killed (no self-fence) while its workload runs, and the
+// cluster answers a List of it slower than incus-api-stop's budget. The fence
+// skips, policy=proceed trusts the self-fence that never ran; the last look
+// before the start (a longer budget) must see the copy and stop it, not start
+// a second one beside it.
+func TestLastLookStopsACopyTheFenceCouldNotSee(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Fence.Unverified = config.UnverifiedProceed })
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.sim.set("asus", func(m *simMember) { m.listDelay = 2 * time.Second })
+	h.nodes["asus"].crash()
+	h.waitRunning("dell", h.cfg.Fence.UnverifiedWait.D()+20*time.Second)
+	h.holdOne("dell", 2*time.Second)
+}
+
 // Agent crash + quick restart (within TTL). conch has no lease resume
 // (Andrey's Q3 decision: accept it): the restarted agent stops the orphaned
 // copy at startup, and the office comes back after the dead term's lease

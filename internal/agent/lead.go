@@ -90,6 +90,9 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 	if err := t.fenceOthers(); err != nil {
 		return finish()
 	}
+	if err := t.lastLook(); err != nil {
+		return finish()
+	}
 	if !t.replicaTakeover() {
 		return finish()
 	}
@@ -152,6 +155,9 @@ type termState struct {
 
 	releaseReason  string
 	releaseBackoff time.Duration
+
+	// verified: members a fence confirmed stopped this term by looking.
+	verified map[string]bool
 }
 
 func (t *termState) giveUp(reason string, backoff time.Duration) {
@@ -258,6 +264,10 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 			t.recordAssumedStopped(m, st, by)
 			return true, "", 0
 		}
+		if t.verified == nil {
+			t.verified = map[string]bool{}
+		}
+		t.verified[m] = true
 		if st.State == coord.MayRun {
 			err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutMS(m, coord.MemberState{
 				State: coord.Stopped, Epoch: st.Epoch, By: a.member, At: a.now().UTC(), Caps: st.Caps,
@@ -297,6 +307,83 @@ func (t *termState) fenceMember(m string, st coord.MemberState) (done bool, why 
 	}
 	return false, fmt.Sprintf("BLOCKED: %s may still run the workload (epoch %d), is unreachable (%s), and no peer fence confirmed; "+
 		"waiting for it to come back, or run `pagurus fence-ack --member %s` once you have verified it is down", m, st.Epoch, reach, m), retry
+}
+
+// lastLookBudget bounds one look at a member in lastLook: longer than a
+// fence attempt, whose budget is what a slow incusd ran out (mqtt-lab
+// 2026-10-18: 15 s).
+const lastLookBudget = 4
+
+// lastLook checks again, with a longer budget, every member that no fence
+// saw stopped this term (an unreachable one, a time-based fence, policy=proceed
+// trusting a self-fence) before anything starts here. A member the cluster
+// reports offline is what those fences are for and is left to them. One that
+// is online must answer: if it still runs the workload it is stopped through
+// the Incus API, and until it answers, or runs nothing, or goes offline, the
+// term waits. mqtt-lab 2026-10-18: the agent and conch were killed (no
+// self-fence), incus-api-stop timed out, policy=proceed trusted the
+// self-fence after 41 s, and a second copy started beside the running one.
+func (t *termState) lastLook() error {
+	a := t.a
+	budget := lastLookBudget * a.cfg.Fence.APITimeout.D()
+	alerted := map[string]bool{}
+	for _, m := range a.cfg.Members {
+		if m == a.member || t.verified[m] {
+			continue
+		}
+		for tries := 1; ; tries++ {
+			a.beat(2*budget + a.cfg.Fence.RetryInterval.D())
+			done, why := t.lookAt(m, budget)
+			if done {
+				break
+			}
+			if !alerted[why] {
+				alerted[why] = true
+				t.log.Warn("last look before start pending", "peer", m, "why", why)
+			}
+			if tries == 2 {
+				a.alerter.Alert("fence-blocked", "not starting: an online member has not shown that it runs nothing; waiting for it to answer, run nothing, or go offline",
+					"member", m, "why", why, "epoch", t.epoch)
+			}
+			if !sleep(t.op, a.cfg.Fence.RetryInterval.D()) {
+				return t.op.Err()
+			}
+		}
+	}
+	return nil
+}
+
+// lookAt is one look at m for lastLook; done=false comes with a reason.
+func (t *termState) lookAt(m string, budget time.Duration) (done bool, why string) {
+	a := t.a
+	ctx, cancel := context.WithTimeout(t.op, budget)
+	defer cancel()
+	on, err := a.members.MemberOnline(ctx, m)
+	if err != nil {
+		return false, "cannot tell whether it is online: " + err.Error()
+	}
+	if !on {
+		return true, ""
+	}
+	insts, err := a.site.List(ctx, m)
+	if err != nil {
+		return false, "online but its instances cannot be listed: " + err.Error()
+	}
+	r := backend.Running(insts)
+	if len(r) == 0 {
+		return true, ""
+	}
+	a.alerter.Alert("fence-missed", "a member still runs the workload although its fence passed; stopping it through the Incus API before starting",
+		"member", m, "instances", r, "epoch", t.epoch)
+	_ = a.site.Stop(ctx, m, 0) // judged by the re-list below
+	if insts, err = a.site.List(ctx, m); err != nil {
+		return false, fmt.Sprintf("ran %v and cannot be listed after the stop: %v", r, err)
+	}
+	if r := backend.Running(insts); len(r) > 0 {
+		return false, fmt.Sprintf("still runs %v after a stop", r)
+	}
+	t.log.Info("last look: stopped a copy the fence had missed", "peer", m)
+	return true, ""
 }
 
 // recordAssumedStopped records an unreachable member as stopped once a

@@ -124,8 +124,17 @@ re-checks every instance's `location` after every `up`.
      - `block` (default) waits, fail-closed, until the member returns or `fence-ack`;
      - `proceed` waits `unverified_wait` and trusts the member's software self-fence (step 2).
 
-   This chain covers zombies too. A member fenced only by assumption keeps its `may-run`
-   record, so every later leader deals with it again.
+   This chain covers zombies too. A member fenced only by assumption is recorded `stopped`,
+   marked unverified. That holds until it runs a new term, so a later term in the same outage
+   doesn't wait it out again.
+
+   **Last look.** Before starting, the leader looks again at every member no fence saw stopped,
+   with 4 × `api_timeout`. If the cluster reports the member offline, that's the case the fences
+   above handle. If it's online, it has to answer. A running copy is stopped through the API
+   (`fence-missed`). Until the member answers, runs nothing or goes offline, the term waits
+   (`fence-blocked` on the second try). This covers an incusd too slow for the fence's budget:
+   a killed agent and conch, the workload still running, and `proceed` trusting a self-fence
+   that never ran (mqtt-lab 2026-10-18).
 
 4. **Nothing else starts it.** The agent enforces `boot.autostart=false` after every `up`.
    (Unset means "restore last state on boot", so a rebooting host would bring a second copy
