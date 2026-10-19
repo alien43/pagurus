@@ -7,6 +7,7 @@
 #
 #   drill.sh [move|graceful|restart|crash|pause|partition]...   (default: all but partition, in that order)
 #   SVC=<service> HEALTH_PATH=<path> HEALTH_PORT=<port> CTL=<member> select the service, its probe path and port, the control member.
+#   HEALTH_TCP=1 probes with a TCP connect to HEALTH_PORT instead of HTTP (a workload with no HTTP: mosquitto 1883).
 #
 # Exit status is non-zero if any drill misses its expectation or the audit
 # ever saw two members running at once.
@@ -23,6 +24,7 @@ set -uo pipefail
 svc=${SVC:-whoami}
 health_path=${HEALTH_PATH:-/health} # an HTTP path the workload answers 200 on
 health_port=${HEALTH_PORT:-80}       # the port it answers on inside the instance (gokapi: 53842)
+health_tcp=${HEALTH_TCP:-}
 unit=pagurus@$svc
 declare -A ssh=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
 CTL=${CTL:-asus}
@@ -65,11 +67,16 @@ wait_for() {
   return 1
 }
 endpoint_ip() { etcdctl --endpoints=$eps get "$kprefix/endpoint" --print-value-only 2>/dev/null | jq -r '.addresses | to_entries[0].value // empty'; }
-# healthy_on M: M leads, only M runs, and the workload answers on M (curl from
-# M: the instance sits on M's own incusbr0)
+# probe M IP: the workload at IP answers, asked from M (the instance sits on
+# M's own incusbr0)
+probe() {
+  if [ -n "$health_tcp" ]; then on "$1" "timeout 3 bash -c '</dev/tcp/$2/$health_port'" >/dev/null 2>&1
+  else on "$1" "curl -fsS -m 3 http://$2:$health_port$health_path" >/dev/null 2>&1; fi
+}
+# healthy_on M: M leads, only M runs, and the workload answers on M
 healthy_on() {
   local ip; ip=$(endpoint_ip)
-  [ "$(leader)" = "$1" ] && [ "$(running_on)" = "$1" ] && [ -n "$ip" ] && on "$1" "curl -fsS -m 3 http://$ip:$health_port$health_path" >/dev/null 2>&1
+  [ "$(leader)" = "$1" ] && [ "$(running_on)" = "$1" ] && [ -n "$ip" ] && probe "$1" "$ip"
 }
 some_other_healthy() { local l; l=$(leader); [ -n "$l" ] && [ "$l" != "$1" ] && healthy_on "$l"; }
 settled() { local l; l=$(leader); [ -n "$l" ] && healthy_on "$l"; }
@@ -155,7 +162,7 @@ online_in_incus() { incus cluster list --format csv -c ns 2>/dev/null | grep -qx
 agent_log() { on "$1" "journalctl -u $unit --since '$2' --no-pager -q -o cat"; }
 
 drill_partition() {
-  local m=$PART_MEMBER peers=() p t0 since t ips rules
+  local m=$PART_MEMBER peers=() p t0 since t ips rules nft
   for p in "${!incus_ip[@]}"; do [ "$p" = "$m" ] || peers+=("${incus_ip[$p]}"); done
   ips="$etcd_ips,$(IFS=,; echo "${peers[*]}")"
   log "== partition: cut $m's host from etcd + Incus (TCP 2379/8443 <-> $ips) for ${CUT}s"
@@ -168,8 +175,11 @@ drill_partition() {
   chain out { type filter hook output priority -10; ip daddr { $ips } tcp dport { 2379, 8443 } drop; ip daddr { $ips } tcp sport { 2379, 8443 } drop; }
 }"
   on "$m" "sudo tee /run/pagurus-drillcut.nft" <<<"$rules" >/dev/null || { miss "partition: could not stage the rules on $m"; return; }
+  # NixOS keeps nft in the system profile, Raspberry Pi OS in /usr/sbin
+  nft=$(on "$m" 'PATH=/run/current-system/sw/bin:/usr/sbin:/sbin:$PATH command -v nft')
+  [ -n "$nft" ] || { miss "partition: no nft on $m"; return; }
   since=$(on "$m" "date '+%F %T'")
-  on "$m" "sudo systemd-run --unit=pagurus-drill-cut --collect -p RuntimeMaxSec=$((CUT + 30)) -p 'ExecStopPost=-/run/current-system/sw/bin/nft delete table inet drillcut' /run/current-system/sw/bin/bash -c 'PATH=/run/current-system/sw/bin; nft -f /run/pagurus-drillcut.nft && sleep $CUT; nft delete table inet drillcut'" >/dev/null 2>&1 \
+  on "$m" "sudo systemd-run --unit=pagurus-drill-cut --collect -p RuntimeMaxSec=$((CUT + 30)) -p 'ExecStopPost=-$nft delete table inet drillcut' /bin/sh -c '$nft -f /run/pagurus-drillcut.nft && sleep $CUT; $nft delete table inet drillcut'" >/dev/null 2>&1 \
     || { miss "partition: could not start the cut on $m"; return; }
   t0=$SECONDS
   sleep 1
@@ -181,7 +191,7 @@ drill_partition() {
     local l ip; l=$(leader); ip=$(endpoint_ip)
     [ -n "$l" ] && [ "$l" != "$m" ] && [ -n "$ip" ] \
       && [ "$(incus list --project "$prefix-$l" -c s --format csv 2>/dev/null | grep -c RUNNING)" -gt 0 ] \
-      && on "$l" "curl -fsS -m 3 http://$ip:$health_port$health_path" >/dev/null 2>&1
+      && probe "$l" "$ip"
   }
   if t=$(wait_for 240 serving_elsewhere); then log "   $(leader) serving ${t}s after the cut (failover gap)"; else miss "partition: no failover within 240s (leader=$(leader) running=$(running_on))"; fi
   wait_for $((CUT + 90)) online_in_incus "$m" >/dev/null || miss "partition: $m not ONLINE again"
