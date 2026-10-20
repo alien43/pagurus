@@ -1,8 +1,12 @@
 # Grafana alert rules for pagurus: the four conditions that need a human, and
-# two more for replicating services (README "Replication"): a stale replica,
-# and preserved orphan data. Their metrics exist only where replicate is set.
+# three more for replicating services (README "Replication"): a stale replica,
+# preserved orphan data, and pulls that keep failing. Their metrics exist only
+# where replicate is set.
 # PagurusReplicaStale's 1h is for the default replicate.interval 15m (4 rounds
 # missed); keep it under the service's max_staleness.
+# PagurusReplicaPullsFailing catches a follower that stopped pulling long before
+# the replica is an hour old: 2 failed pulls in 15m (a counter that appears on
+# its first failure shows 1 less) is ~3 min at interval 1m, ~15 min at 5m.
 # Grafana file provisioning (provisioning/alerting/); the metrics come from a
 # Prometheus job scraping every agent's --metrics-addr. Set datasourceUid to
 # your Prometheus datasource and folder to yours.
@@ -277,6 +281,52 @@ groups:
           - refId: B
             relativeTimeRange:
               from: 300
+              to: 0
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator:
+                    params:
+                      - 0
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - B
+                  reducer:
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: B
+              type: threshold
+
+      - uid: pagurus-replica-pulls-failing
+        title: PagurusReplicaPullsFailing
+        condition: B
+        for: 0m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+        annotations:
+          summary: "pagurus {{ $labels.svc }}: {{ $labels.member }}'s pulls keep failing (2+ in 15 min) — its replica stays at its last complete snapshot and ages; check the agent's journal for 'pull failed' (a busy dataset, e.g. a leaked mount of a snapshot, blocks every refresh)"
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: derpa48qhefpcf
+            model:
+              editorMode: code
+              expr: max by (svc, member) (increase(pagurus_replica_pulls_total{result="failed"}[15m])) >= bool 2
+              instant: true
+              refId: A
+          - refId: B
+            relativeTimeRange:
+              from: 900
               to: 0
             datasourceUid: __expr__
             model:
