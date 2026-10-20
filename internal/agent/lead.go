@@ -420,29 +420,57 @@ func (t *termState) recordAssumedStopped(m string, st coord.MemberState, by stri
 //
 // Incus has no fencing token on start (PUT /1.0/instances/<n>/state ignores
 // If-Match), so this narrows the window; it cannot close it.
-func (t *termState) start() error {
+func (t *termState) start() (err error) {
 	a := t.a
 	a.beat(UpTimeout)
 	uctx, cancel := context.WithTimeout(t.op, UpTimeout)
 	defer cancel()
+	// One line per start with each step's wall time, failed starts included:
+	// a start on asus once spent ~95 s before Incus started the container
+	// with nothing logged in between (tasks/pagurus-slow-start-asus.md).
+	var steps []any
+	began, mark := time.Now(), time.Now()
+	step := func(name string) {
+		now := time.Now()
+		steps = append(steps, name, now.Sub(mark).Round(10*time.Millisecond))
+		mark = now
+	}
+	defer func() {
+		total := time.Since(began).Round(10 * time.Millisecond)
+		args := append(append(steps, "total", total), "ok", err == nil)
+		if total > slowStart {
+			t.log.Warn("slow start", args...)
+		} else {
+			t.log.Info("start steps", args...)
+		}
+	}()
 	release, waited, err := hostStartLock(uctx, a.startLock)
 	if err != nil {
 		return fmt.Errorf("waiting for this host's start lock: %w", err)
 	}
 	defer release()
+	step("lock")
 	if waited > time.Second {
 		t.log.Info("waited for another service's start on this host", "waited", waited.Round(100*time.Millisecond))
 	}
 	if err := a.starter.Prepare(uctx, a.member); err != nil {
+		step("prepare")
 		return fmt.Errorf("prepare: %w", err)
 	}
+	step("prepare")
 	if err := t.authorised(uctx); err != nil {
+		step("authorise")
 		return err
 	}
+	step("authorise")
 	if err := t.stampVolumeIdmaps(uctx); err != nil {
+		step("stamp")
 		return err
 	}
-	if err := a.starter.Start(uctx, a.member); err != nil {
+	step("stamp")
+	err = a.starter.Start(uctx, a.member)
+	step("start")
+	if err != nil {
 		// `up` can fail after the instance started (incus-compose's DNS
 		// records step, when another member is offline). If everything runs,
 		// the term goes on: returning here skipped the checks below and the
@@ -474,11 +502,17 @@ func (t *termState) start() error {
 	}
 	a.setTypes(insts)
 	if err := t.confirmCgroupLayout(uctx, insts); err != nil {
+		step("checks")
 		return err
 	}
+	step("checks")
 	t.publish()
 	return nil
 }
+
+// slowStart is when a start's step line is logged as a warning: ordinary
+// starts take 5-15 s (the 2026-10-18 outliers took ~100 s).
+const slowStart = 30 * time.Second
 
 // stampVolumeIdmaps gives every replicated volume that was never attached on
 // this member (fresh from provision, or only ever pulled into) the containers'
