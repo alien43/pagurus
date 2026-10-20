@@ -101,6 +101,11 @@ type Registration struct {
 	// ConfigHash is config.SafetyHash(); peers refuse to campaign while
 	// theirs differs. Empty from agents that predate it (not compared).
 	ConfigHash string `json:"config_hash,omitempty"`
+	// FenceHash is config.FenceHash() (skew refuses to campaign) and
+	// StartHash config.StartHash() (skew only warns). Empty from agents that
+	// predate them: those are compared by ConfigHash.
+	FenceHash string `json:"fence_hash,omitempty"`
+	StartHash string `json:"start_hash,omitempty"`
 }
 
 type Endpoint struct {

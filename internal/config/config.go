@@ -663,7 +663,28 @@ func (c *Config) ConchEtcdArgs() []string {
 // A compose file counts by its content, not its path: members install it
 // where they can (a Nix store path, /etc/pagurus/...), and a different file
 // behind the same path is a skew.
-func (c *Config) SafetyHash() string {
+//
+// Agents since 2026-10-20 also publish FenceHash and StartHash, and compare
+// those with peers that publish them: SafetyHash stays the legacy formula, so
+// an old peer still compares it unchanged.
+func (c *Config) SafetyHash() string { return c.hash(c.contentStart()) }
+
+// FenceHash is SafetyHash without what is started (only the start kind): the
+// fields a leader's fences rely on. Peers that differ refuse to campaign. A
+// different compose file doesn't: at most one runs whichever version it is,
+// and a rolling deploy of a compose change (even a comment) must not leave the
+// office vacant until the last member has it (mqtt-ha, 2026-10-20: ~3.5 min).
+func (c *Config) FenceHash() string { return c.hash(Start{Kind: c.Start.Kind}) }
+
+// StartHash fingerprints what is started (the compose file by content). Peers
+// that differ only warn (start-skew).
+func (c *Config) StartHash() string {
+	b, _ := json.Marshal(c.contentStart())
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
+}
+
+func (c *Config) contentStart() Start {
 	start := c.Start
 	if start.Kind == "compose" {
 		if b, err := os.ReadFile(start.File); err == nil {
@@ -671,6 +692,10 @@ func (c *Config) SafetyHash() string {
 			start.File = "sha256:" + hex.EncodeToString(sum[:])
 		}
 	}
+	return start
+}
+
+func (c *Config) hash(start Start) string {
 	b, _ := json.Marshal(struct {
 		Members       []string
 		ProjectPrefix string

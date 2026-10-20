@@ -13,13 +13,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -98,6 +101,68 @@ func Run(ctx context.Context, name string, args ...string) ([]byte, error) {
 		return out.Bytes(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
 	}
 	return out.Bytes(), nil
+}
+
+// SlowRun is when TimedRun logs a command's output.
+const SlowRun = 30 * time.Second
+
+// TimedRun is Run, but it keeps every line the command printed (stdout and
+// stderr) with the time since it started, and logs them when the command took
+// longer than SlowRun: a start once spent ~100 s inside `incus-compose up` with
+// incusd logging nothing (tasks/pagurus-slow-start-asus.md).
+func TimedRun(ctx context.Context, name string, args ...string) ([]byte, error) {
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 2 * time.Second
+	var out, errb bytes.Buffer
+	lines := &stampedLines{start: start}
+	cmd.Stdout, cmd.Stderr = io.MultiWriter(&out, lines), io.MultiWriter(&errb, lines)
+	err := cmd.Run()
+	if took := time.Since(start); took > SlowRun {
+		slog.Warn("slow command", "cmd", name+" "+strings.Join(args, " "), "took", took.Round(10*time.Millisecond), "output", lines.String())
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return out.Bytes(), fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), ctx.Err())
+		}
+		return out.Bytes(), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(errb.String()))
+	}
+	return out.Bytes(), nil
+}
+
+// stampedLines collects output lines, each prefixed with the seconds since
+// start at which it was written (both pipes write here; a mutex orders them).
+type stampedLines struct {
+	mu      sync.Mutex
+	start   time.Time
+	partial []byte
+	b       strings.Builder
+}
+
+func (s *stampedLines) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.partial = append(s.partial, p...)
+	for {
+		i := bytes.IndexByte(s.partial, '\n')
+		if i < 0 {
+			break
+		}
+		fmt.Fprintf(&s.b, "[+%.1fs] %s\n", time.Since(s.start).Seconds(), s.partial[:i])
+		s.partial = s.partial[i+1:]
+	}
+	return len(p), nil
+}
+
+func (s *stampedLines) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.partial) > 0 {
+		return s.b.String() + fmt.Sprintf("[+%.1fs] %s", time.Since(s.start).Seconds(), s.partial)
+	}
+	return s.b.String()
 }
 
 // Identity returns this host's cluster member name and kernel architecture.

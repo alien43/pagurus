@@ -151,6 +151,7 @@ type Agent struct {
 	role             string
 	localStopped     bool      // last ground-truth check found nothing running here
 	skewAlerted      string    // the last config-skew reason alerted, to alert once
+	startSkewAlerted string    // the last start-skew reason alerted, to alert once
 	unfitAfter       time.Time // while conch is not running and not localStopped, fit until then
 	progressDeadline time.Time // a term's loop must report progress before this (heartbeat)
 	backoffUntil     time.Time
@@ -486,7 +487,7 @@ func (a *Agent) registerLoop(ctx context.Context, ready chan<- struct{}) {
 			sleep(ctx, a.cfg.EligibleInterval.D())
 			continue
 		}
-		reg := coord.Registration{AgentID: a.agentID, Version: a.version, Arch: a.arch, Caps: a.caps(), Started: a.now().UTC(), Versions: a.versions, ConfigHash: a.cfg.SafetyHash()}
+		reg := coord.Registration{AgentID: a.agentID, Version: a.version, Arch: a.arch, Caps: a.caps(), Started: a.now().UTC(), Versions: a.versions, ConfigHash: a.cfg.SafetyHash(), FenceHash: a.cfg.FenceHash(), StartHash: a.cfg.StartHash()}
 		if err := a.co.Register(ctx, a.member, g.ID, reg); err != nil {
 			a.log.Warn("register failed", "err", err)
 		}
@@ -889,25 +890,31 @@ func (a *Agent) eligible(ctx context.Context) error {
 }
 
 // checkConfigSkew refuses to campaign while a live peer registration carries
-// a different config.SafetyHash: a leader fencing a peer that runs another
-// TTL, margin or fence chain would do so on the wrong assumptions.
+// a different config.FenceHash (config.SafetyHash for a peer that predates
+// it): a leader fencing a peer that runs another TTL, margin or fence chain
+// would do so on the wrong assumptions. A peer with another StartHash (a
+// compose change mid-rollout) only warns: whichever version runs, one runs.
 func (a *Agent) checkConfigSkew(ctx context.Context) error {
 	regs, err := a.co.Registrations(ctx)
 	if err != nil {
 		return fmt.Errorf("reading registrations: %w", err)
 	}
-	mine := a.cfg.SafetyHash()
+	a.warnStartSkew(regs)
 	for m, r := range regs {
-		if m == a.member || r.ConfigHash == "" || r.ConfigHash == mine {
+		theirs, mine := r.FenceHash, a.cfg.FenceHash()
+		if theirs == "" {
+			theirs, mine = r.ConfigHash, a.cfg.SafetyHash()
+		}
+		if m == a.member || theirs == "" || theirs == mine {
 			continue
 		}
-		why := fmt.Sprintf("config skew: %s runs config %s, this member %s; refusing to campaign until they agree", m, r.ConfigHash, mine)
+		why := fmt.Sprintf("config skew: %s runs config %s, this member %s; refusing to campaign until they agree", m, theirs, mine)
 		a.mu.Lock()
 		first := a.skewAlerted != why
 		a.skewAlerted = why
 		a.mu.Unlock()
 		if first {
-			a.alerter.Alert("config-skew", why, "peer", m, "peer_hash", r.ConfigHash, "hash", mine)
+			a.alerter.Alert("config-skew", why, "peer", m, "peer_hash", theirs, "hash", mine)
 		}
 		return errors.New(why)
 	}
@@ -915,4 +922,24 @@ func (a *Agent) checkConfigSkew(ctx context.Context) error {
 	a.skewAlerted = ""
 	a.mu.Unlock()
 	return nil
+}
+
+// warnStartSkew alerts once per distinct skew when a live peer starts
+// something else (another compose file): expected mid-rollout, worth a look
+// if it lasts.
+func (a *Agent) warnStartSkew(regs map[string]coord.Registration) {
+	mine, why := a.cfg.StartHash(), ""
+	for m, r := range regs {
+		if m != a.member && r.StartHash != "" && r.StartHash != mine {
+			why = fmt.Sprintf("start skew: %s starts %s, this member %s (a compose change mid-rollout?); campaigning anyway", m, r.StartHash, mine)
+			break
+		}
+	}
+	a.mu.Lock()
+	first := why != "" && a.startSkewAlerted != why
+	a.startSkewAlerted = why
+	a.mu.Unlock()
+	if first {
+		a.alerter.Alert("start-skew", why)
+	}
 }

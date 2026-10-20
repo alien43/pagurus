@@ -956,6 +956,25 @@ func TestConfigSkewRefusesToCampaign(t *testing.T) {
 	t.Logf("asus running %s after dell came back with the agreed config", took)
 }
 
+// dell starts something else (another compose file mid-rollout, here other
+// up args) but agrees on everything fences rely on. That must not hold the
+// office vacant: asus leads at once, and the skew is only warned about
+// (mqtt-ha 2026-10-20: a comment-only compose edit kept MQTT down ~3.5 min).
+func TestStartSkewOnlyWarns(t *testing.T) {
+	h := newHarness(t, nil)
+	h.nodeCfg = map[string]func(*config.Config){"dell": func(c *config.Config) { c.Start.UpArgs = []string{"--rollout"} }}
+	h.startAll()
+	took := h.waitRunning("asus", 10*time.Second)
+	t.Logf("asus running %s with dell on another start config", took)
+	a := h.nodes["asus"].agent
+	a.mu.Lock()
+	warned := a.startSkewAlerted
+	a.mu.Unlock()
+	if !strings.Contains(warned, "start skew: dell") {
+		t.Fatalf("no start-skew warning on asus (got %q)", warned)
+	}
+}
+
 // With an armed (simulated) watchdog the same unstoppable leader is reset by
 // its watchdog, and the new leader waits out the advertised timeout before
 // starting — no overlap.

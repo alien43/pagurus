@@ -343,7 +343,16 @@ func cmdStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, cli *c
 			if v := r.Versions["incus-compose"]; v != "" {
 				ag += " ic " + v
 			}
-			if r.ConfigHash != "" {
+			switch {
+			case r.FenceHash != "":
+				ag += " cfg " + r.FenceHash[:6]
+				if r.FenceHash != cfg.FenceHash() {
+					ag += "≠"
+				}
+				if r.StartHash != "" && r.StartHash != cfg.StartHash() {
+					ag += " start≠"
+				}
+			case r.ConfigHash != "":
 				ag += " cfg " + r.ConfigHash[:6]
 				if r.ConfigHash != cfg.SafetyHash() {
 					ag += "≠"
@@ -723,7 +732,7 @@ func newStarter(cfg *config.Config, drv *incus.Driver) start.Starter {
 	case start.KindInstances:
 		return start.Instances{Project: cfg.Project, L: drv, Names: cfg.Start.Names}
 	default:
-		return start.Compose{Run: incus.Run, Project: cfg.Project, File: cfg.Start.File, Args: cfg.Start.Args, UpArgs: cfg.Start.UpArgs}
+		return start.Compose{Run: incus.TimedRun, Project: cfg.Project, File: cfg.Start.File, Args: cfg.Start.Args, UpArgs: cfg.Start.UpArgs}
 	}
 }
 

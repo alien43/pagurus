@@ -201,6 +201,30 @@ func TestSafetyHashCoversSafetyFieldsOnly(t *testing.T) {
 	}
 }
 
+// FenceHash covers what SafetyHash covers except what is started; StartHash
+// is what is started. SafetyHash itself is unchanged (old peers compare it).
+func TestFenceHashIgnoresWhatIsStarted(t *testing.T) {
+	base, err := parse("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := *base
+	other.Start.UpArgs = []string{"--x"}
+	if other.FenceHash() != base.FenceHash() {
+		t.Error("another start changed FenceHash")
+	}
+	if other.StartHash() == base.StartHash() || other.SafetyHash() == base.SafetyHash() {
+		t.Error("another start must change StartHash and the legacy SafetyHash")
+	}
+	ttl, err := parse(`"lease": {"ttl": "30s"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ttl.FenceHash() == base.FenceHash() || ttl.StartHash() != base.StartHash() {
+		t.Error("a lease change must change FenceHash only")
+	}
+}
+
 // A compose file counts by content: the same file at two paths is no skew,
 // another file at the same path is.
 func TestSafetyHashUsesComposeContent(t *testing.T) {
