@@ -324,6 +324,10 @@ type Config struct {
 	StateDir string `json:"state_dir"`
 	// AlertURL, if set, receives a POST for every event that needs a human.
 	AlertURL string `json:"alert_url"`
+	// StartPriority: this service's starts go ahead of the other services'
+	// on the host-wide start lock (the MQTT broker). Per service, not a
+	// safety field: left out of SafetyHash and FenceHash.
+	StartPriority bool `json:"start_priority,omitempty"`
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)

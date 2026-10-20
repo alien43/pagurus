@@ -444,7 +444,7 @@ func (t *termState) start() (err error) {
 			t.log.Info("start steps", args...)
 		}
 	}()
-	release, waited, err := hostStartLock(uctx, a.startLock)
+	release, waited, err := hostStartLock(uctx, a.startLock, a.cfg.StartPriority)
 	if err != nil {
 		return fmt.Errorf("waiting for this host's start lock: %w", err)
 	}
