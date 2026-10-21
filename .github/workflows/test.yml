@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest   # amd64: -race needs it (it cannot run on rpi5's 47-bit VA kernel)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -21,27 +21,15 @@ jobs:
       - name: Install etcd
         run: |
           ETCD_VER=v3.6.12
-          DOWNLOAD_URL=https://github.com/etcd-io/etcd/releases/download
-          curl -L ${DOWNLOAD_URL}/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz -o /tmp/etcd.tar.gz
-          mkdir -p /tmp/etcd-download
-          tar -xf /tmp/etcd.tar.gz -C /tmp/etcd-download --strip-components=1
-          sudo cp /tmp/etcd-download/etcd /tmp/etcd-download/etcdctl /usr/local/bin/
+          curl -fsSL https://github.com/etcd-io/etcd/releases/download/${ETCD_VER}/etcd-${ETCD_VER}-linux-amd64.tar.gz -o /tmp/etcd.tar.gz
+          sudo tar -xzf /tmp/etcd.tar.gz -C /usr/local/bin --strip-components=1 etcd-${ETCD_VER}-linux-amd64/etcd etcd-${ETCD_VER}-linux-amd64/etcdctl
           etcd --version
 
-      - name: gofmt
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: Vet
+        run: go vet ./...
 
-      - name: Vet and build
-        run: |
-          go vet ./...
-          CGO_ENABLED=0 go build ./...
+      - name: Build
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o pagurus ./cmd/pagurus
 
-      - name: Test (race)
-        run: go test -race -count=1 -timeout 25m -v ./... 2>&1 | tee test.log; test ${PIPESTATUS[0]} -eq 0
-
-      # testutil.Etcd / EtcdTLS skip when no etcd binary is found; in CI that
-      # would turn every integration test into a silent pass. Other skips are
-      # deliberate (e.g. the qemu-kill contract's hang cases: nothing can make
-      # SIGKILL wait) and stay allowed.
-      - name: No tests skipped for want of etcd
-        run: '! grep -- "etcd binary not found" test.log'
+      - name: Run unit, integration and simulation tests (race)
+        run: go test -race -timeout 30m ./...

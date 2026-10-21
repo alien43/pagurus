@@ -7,6 +7,16 @@
 #
 #   drill.sh [move|graceful|restart|crash|pause|partition]...   (default: all but partition, in that order)
 #   SVC=<service> HEALTH_PATH=<path> HEALTH_PORT=<port> CTL=<member> select the service, its probe path and port, the control member.
+#
+# Where the cluster is (required):
+#   MEMBERS="m1=addr1 m2=addr2 m3=addr3"   member names (as in the pagurus config) and the address each is reached at
+#   ETCD_ENDPOINTS=h1:2379,h2:2379,h3:2379  the etcd cluster
+# How to reach it (optional):
+#   ON=ssh (default) runs member commands over `ssh <addr>`; ON=incus runs them with `incus exec <member>`
+#     (the lab: members are instances on this host)
+#   SUDO=sudo (default); SUDO= when member commands already run as root
+#   REMOTE_CLI=1 runs `incus` and `etcdctl` on CTL instead of here (no Incus client or etcdctl on this host)
+#   PAGURUS_CONFIG=<path on CTL>; default: the first *.json on the unit's command line (`systemctl cat`)
 #   HEALTH_TCP=1 probes with a TCP connect to HEALTH_PORT instead of HTTP (a workload with no HTTP: mosquitto 1883).
 #
 # Exit status is non-zero if any drill misses its expectation or the audit
@@ -26,24 +36,37 @@ health_path=${HEALTH_PATH:-/health} # an HTTP path the workload answers 200 on
 health_port=${HEALTH_PORT:-80}       # the port it answers on inside the instance (gokapi: 53842)
 health_tcp=${HEALTH_TCP:-}
 unit=pagurus@$svc
-declare -A ssh=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
-CTL=${CTL:-asus}
-eps=10.0.1.3:2379,10.0.1.6:2379,10.0.1.8:2379
-on() { local m=$1; shift; ssh -o BatchMode=yes "${ssh[$m]}" "$*"; }
+: "${MEMBERS:?MEMBERS=\"m1=addr1 m2=addr2 ...\" is required}" "${ETCD_ENDPOINTS:?ETCD_ENDPOINTS=h1:2379,... is required}"
+declare -A addr=()
+for kv in $MEMBERS; do addr[${kv%%=*}]=${kv#*=}; done
+read -ra member_names <<<"$(for kv in $MEMBERS; do printf '%s ' "${kv%%=*}"; done)"
+CTL=${CTL:-${member_names[0]}}
+eps=$ETCD_ENDPOINTS
+S=${SUDO-sudo}; S=${S:+$S }
+if [ "${ON:-ssh}" = incus ]; then
+  on() { local m=$1; shift; command incus exec "$m" -- sh -c "$*"; }
+else
+  on() { local m=$1; shift; ssh -o BatchMode=yes "${addr[$m]}" "$*"; }
+fi
+if [ -n "${REMOTE_CLI:-}" ]; then
+  incus() { on "$CTL" "incus $(printf '%q ' "$@")"; }
+  etcdctl() { on "$CTL" "etcdctl $(printf '%q ' "$@")"; }
+fi
 log() { printf '%s  %s\n' "$(date +%T)" "$*"; }
 fail=0
 miss() { log "MISS: $*"; fail=1; }
 
-PART_MEMBER=${PART_MEMBER:-dell}
+PART_MEMBER=${PART_MEMBER:-${member_names[1]}}
 # The stop hook incusd runs after the kill retries the cluster database for
 # ~45-100 s; the leak needs the cut to outlast that (60 s did not, 2026-10-14).
 CUT=${CUT:-180}
-etcd_ips=10.0.1.3,10.0.1.6,10.0.1.8
-declare -A incus_ip=([asus]=10.0.1.10 [dell]=10.0.1.7 [rpi5]=10.0.1.4)
+etcd_ips=$(tr ',' '\n' <<<"$eps" | sed -E 's#^[a-z]+://##; s#:[0-9]+$##' | paste -sd,)
+declare -A incus_ip=()
+for m in "${!addr[@]}"; do incus_ip[$m]=${addr[$m]#*@}; done
 HOLD=${HOLD:-}
 read -ra hold <<<"${HOLD//,/ }"
 
-cfg=$(on "$CTL" "systemctl cat $unit" | grep -o '/nix/store/[^ ]*\.json' | head -1)
+cfg=${PAGURUS_CONFIG:-$(on "$CTL" "systemctl cat $unit" | grep -oE '(^|[ =])/[^ ]*\.json' | tr -d ' =' | head -1)}
 [ -n "$cfg" ] || { echo "no $unit config on $CTL" >&2; exit 2; }
 conf=$(on "$CTL" "cat $cfg")
 mapfile -t members < <(jq -r '.members[]' <<<"$conf")
@@ -83,10 +106,10 @@ settled() { local l; l=$(leader); [ -n "$l" ] && healthy_on "$l"; }
 settle() { wait_for 180 settled >/dev/null || miss "cluster did not settle (leader=$(leader) running=$(running_on))"; }
 not_running_on() { ! running_on | grep -qw "$1"; }
 mainpid() { on "$1" "systemctl show -p MainPID --value $unit"; }
-restart_agent() { on "$1" "sudo systemctl start $unit" || miss "could not restart the agent on $1"; }
+restart_agent() { on "$1" "${S}systemctl start $unit" || miss "could not restart the agent on $1"; }
 # reboot_armed M: M's unit has a reboot FailureAction (rebootOnWatchdog). There ANY failure of the agent --
 # SIGKILL, crash, OOM kill, missed watchdog -- force-reboots the host (systemd runs FailureAction on the
-# failed result before Restart= applies; dell 2026-10-18 08:00:52). That is the fences_by_reboot contract
+# failed result before Restart= applies). That is the fences_by_reboot contract
 # peers rely on, so restart/crash/pause there are host reboots: refused unless ALLOW_REBOOT=1.
 reboot_armed() { on "$1" "systemctl show -p FailureAction --value $unit" | grep -q '^reboot'; }
 refuse_armed() {
@@ -101,7 +124,7 @@ audit_pid=$!
 # SIGINT ends the remote audit with its summary line.
 stop_audit() { on "$CTL" "pkill -INT -f 'pagurus audit -c $cfg'" 2>/dev/null; wait $audit_pid 2>/dev/null; }
 # a held agent must not stay stopped if the drill dies
-unhold() { for p in "${hold[@]}"; do on "$p" "sudo systemctl start $unit"; done; }
+unhold() { for p in "${hold[@]}"; do on "$p" "${S}systemctl start $unit"; done; }
 trap 'stop_audit; unhold' EXIT
 sleep 3
 
@@ -116,7 +139,7 @@ drill_move() {
 
 drill_graceful() {
   local l; l=$(leader); log "== graceful: systemctl stop the agent on $l"
-  on "$l" "sudo systemctl stop $unit"
+  on "$l" "${S}systemctl stop $unit"
   [ -z "$(running_on | grep -w "$l")" ] || miss "$l still running after its agent stopped"
   if t=$(wait_for 120 some_other_healthy "$l"); then log "   $(leader) serving ${t}s after the stop"; else miss "no handover"; fi
   restart_agent "$l"
@@ -129,17 +152,17 @@ drill_graceful() {
 drill_restart() {
   local l pid e; l=$(leader); refuse_armed "$l" restart && return
   e=$(epoch); pid=$(mainpid "$l"); log "== restart: SIGKILL the agent on $l (pid $pid, epoch $e); systemd restarts it within RestartSec"
-  on "$l" "sudo kill -KILL $pid"
+  on "$l" "${S}kill -KILL $pid"
   new_term() { local n; n=$(epoch); [ -n "$n" ] && [ "$n" != "$e" ] && settled; }
   if t=$(wait_for 120 new_term); then log "   $(leader) serving a new term (epoch $(epoch)) ${t}s after the kill"; else miss "restart (leader=$(leader) epoch=$(epoch) running=$(running_on))"; fi
 }
 
 # On a member armed with FailureAction=reboot-force this REBOOTS the host, as
-# any agent failure there does (dell 2026-10-12, and a bare SIGKILL 2026-10-18).
+# any agent failure there does (seen on a production member, and with a bare SIGKILL).
 drill_crash() {
   local l; l=$(leader); refuse_armed "$l" crash && return
   log "== crash: SIGKILL the agent on $l and keep it down (workload left running)"
-  on "$l" "sudo systemctl kill -s KILL --kill-whom=main $unit; sudo systemctl stop $unit"
+  on "$l" "${S}systemctl kill -s KILL --kill-whom=main $unit; ${S}systemctl stop $unit"
   if t=$(wait_for 120 some_other_healthy "$l"); then log "   $(leader) serving ${t}s after the crash (old copy fenced via API)"; else miss "no failover"; fi
   restart_agent "$l"
 }
@@ -150,10 +173,10 @@ drill_crash() {
 drill_pause() {
   local l pid e; l=$(leader); refuse_armed "$l" pause && return
   e=$(epoch); pid=$(mainpid "$l"); log "== pause: SIGSTOP the agent on $l (epoch $e) for up to 90s"
-  on "$l" "sudo kill -STOP $pid"
+  on "$l" "${S}kill -STOP $pid"
   new_term() { local n; n=$(epoch); [ -n "$n" ] && [ "$n" != "$e" ] && settled; }
   if t=$(wait_for 90 new_term); then log "   $(leader) serving a new term (epoch $(epoch)) ${t}s into the pause"; else miss "no new term during pause (leader=$(leader) epoch=$(epoch))"; fi
-  on "$l" "sudo kill -CONT $pid 2>/dev/null || true"
+  on "$l" "${S}kill -CONT $pid 2>/dev/null || true"
   sleep 10
   [ "$(running_on)" = "$(leader)" ] || miss "after SIGCONT: running on $(running_on), leader $(leader)"
 }
@@ -166,7 +189,7 @@ drill_partition() {
   for p in "${!incus_ip[@]}"; do [ "$p" = "$m" ] || peers+=("${incus_ip[$p]}"); done
   ips="$etcd_ips,$(IFS=,; echo "${peers[*]}")"
   log "== partition: cut $m's host from etcd + Incus (TCP 2379/8443 <-> $ips) for ${CUT}s"
-  for p in "${hold[@]}"; do log "   holding $p out: systemctl stop $unit"; on "$p" "sudo systemctl stop $unit"; done
+  for p in "${hold[@]}"; do log "   holding $p out: systemctl stop $unit"; on "$p" "${S}systemctl stop $unit"; done
   t=$( { time -p P move -c "$cfg" --to "$m" >/dev/null; } 2>&1 | awk '/real/{print $2}')
   healthy_on "$m" || { miss "partition: could not move the service to $m first"; return; }
   log "   $m serving (move ${t}s)"
@@ -174,16 +197,16 @@ drill_partition() {
   chain in  { type filter hook input  priority -10; ip saddr { $ips } tcp sport { 2379, 8443 } drop; ip saddr { $ips } tcp dport { 2379, 8443 } drop; }
   chain out { type filter hook output priority -10; ip daddr { $ips } tcp dport { 2379, 8443 } drop; ip daddr { $ips } tcp sport { 2379, 8443 } drop; }
 }"
-  on "$m" "sudo tee /run/pagurus-drillcut.nft" <<<"$rules" >/dev/null || { miss "partition: could not stage the rules on $m"; return; }
+  on "$m" "${S}tee /run/pagurus-drillcut.nft" <<<"$rules" >/dev/null || { miss "partition: could not stage the rules on $m"; return; }
   # NixOS keeps nft in the system profile, Raspberry Pi OS in /usr/sbin
   nft=$(on "$m" 'PATH=/run/current-system/sw/bin:/usr/sbin:/sbin:$PATH command -v nft')
   [ -n "$nft" ] || { miss "partition: no nft on $m"; return; }
   since=$(on "$m" "date '+%F %T'")
-  on "$m" "sudo systemd-run --unit=pagurus-drill-cut --collect -p RuntimeMaxSec=$((CUT + 30)) -p 'ExecStopPost=-$nft delete table inet drillcut' /bin/sh -c '$nft -f /run/pagurus-drillcut.nft && sleep $CUT; $nft delete table inet drillcut'" >/dev/null 2>&1 \
+  on "$m" "${S}systemd-run --unit=pagurus-drill-cut --collect -p RuntimeMaxSec=$((CUT + 30)) -p 'ExecStopPost=-$nft delete table inet drillcut' /bin/sh -c '$nft -f /run/pagurus-drillcut.nft && sleep $CUT; $nft delete table inet drillcut'" >/dev/null 2>&1 \
     || { miss "partition: could not start the cut on $m"; return; }
   t0=$SECONDS
   sleep 1
-  on "$m" "sudo nft list table inet drillcut" >/dev/null 2>&1 || { miss "partition: the drillcut table is not on $m (cut did not apply)"; return; }
+  on "$m" "${S}nft list table inet drillcut" >/dev/null 2>&1 || { miss "partition: the drillcut table is not on $m (cut did not apply)"; return; }
   # While m is offline Incus keeps its last state (RUNNING: the stop hook never
   # ran), so the failover gap is judged on the new leader alone; the audit
   # still referees overlap from the cgroup ground truth.
@@ -195,7 +218,7 @@ drill_partition() {
   }
   if t=$(wait_for 240 serving_elsewhere); then log "   $(leader) serving ${t}s after the cut (failover gap)"; else miss "partition: no failover within 240s (leader=$(leader) running=$(running_on))"; fi
   wait_for $((CUT + 90)) online_in_incus "$m" >/dev/null || miss "partition: $m not ONLINE again"
-  on "$m" "sudo nft list table inet drillcut" >/dev/null 2>&1 && miss "partition: drillcut table still on $m"
+  on "$m" "${S}nft list table inet drillcut" >/dev/null 2>&1 && miss "partition: drillcut table still on $m"
   log "   cut lifted, $m ONLINE $((SECONDS - t0))s after the cut"
   agent_log "$m" "$since" | grep -m1 'kind=cgroup-kill' | sed 's/^/   /' || log "   (no cgroup-kill fence step on $m)"
   agent_log "$m" "$since" | grep -q 'fence-self confirmed' || miss "partition: $m's self-fence not confirmed"

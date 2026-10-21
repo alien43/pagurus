@@ -1,0 +1,45 @@
+name: Lab
+
+# The three-member lab (lab/up.sh) on a fresh runner, then the live drills (lab/drill.sh),
+# refereed by `pagurus audit`: the job fails on any missed drill or any instant where two
+# members ran the workload at once.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  lab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Incus
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          sudo curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc
+          printf 'Enabled: yes\nTypes: deb\nURIs: https://pkgs.zabbly.com/incus/stable\nSuites: noble\nComponents: main\nArchitectures: amd64\nSigned-By: /etc/apt/keyrings/zabbly.asc\n' | sudo tee /etc/apt/sources.list.d/zabbly-incus-stable.sources
+          sudo apt-get -qq update && sudo apt-get -qq install -y incus
+          sudo incus admin init --minimal
+          sudo usermod -aG incus-admin "$USER"
+          # Docker's FORWARD DROP policy would block the lab bridge
+          sudo iptables -P FORWARD ACCEPT
+
+      - name: Lab up
+        run: sg incus-admin -c 'lab/up.sh'
+
+      - name: Drill
+        run: sg incus-admin -c 'lab/drill.sh'
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          sg incus-admin -c 'for m in pgl-1 pgl-2 pgl-3; do echo "== $m"; incus exec $m -- journalctl -u pagurus@whoami -u etcd --no-pager -n 80; done' || true
+          sg incus-admin -c 'incus exec pgl-1 -- pagurus status -c /etc/pagurus/whoami.json' || true
