@@ -44,6 +44,9 @@ const usage = `usage: pagurus <command> -c <config.json> [flags]
 commands:
   run         run the agent on this member (as root, under systemd)
   validate    check the config, this member's Incus project and the compose file
+  check-config  load the config exactly as run does, with no network at all:
+              exit 0, or 78 if this binary cannot load it (deploy.sh runs a
+              new generation's own binary on its configs before activating)
   status      show the office, member states and every member's instances
   move        planned move: pagurus move -c cfg --to <member>
   refresh     the leader recreates its workload in place from the current
@@ -110,7 +113,11 @@ func main() {
 	}
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		fatal(err)
+		fatalConfig(cmd, *cfgPath, err)
+	}
+	if cmd == "check-config" {
+		fmt.Printf("ok: %s: service %s, members %s\n", *cfgPath, cfg.Service, strings.Join(cfg.Members, ","))
+		return
 	}
 	if *endpoints != "" {
 		cfg.Etcd.Endpoints = strings.Split(*endpoints, ",")
@@ -181,6 +188,21 @@ func main() {
 func fatal(err error) {
 	fmt.Fprintln(os.Stderr, "pagurus:", err)
 	os.Exit(1)
+}
+
+// exitConfig (EX_CONFIG, sysexits.h) means exactly: this binary cannot load
+// this config (read, strict decode, validation). Nothing that needs the
+// network uses it. The pagurus@ unit maps it to a clean stop
+// (SuccessExitStatus + RestartPreventExitStatus): the unit ends inactive, not
+// failed, so a reboot-armed host's FailureAction does not fire. A config that
+// can't load is the same on every boot, so a reboot only loops (2026-10-20,
+// dell: docs/incident-2026-10-20-dell-reboot-loop-and-mqtt-outages.md).
+const exitConfig = 78
+
+func fatalConfig(cmd, path string, err error) {
+	fmt.Fprintf(os.Stderr, "pagurus %s: config %s: %v; not starting (exit %d: the unit stays inactive, the host is not rebooted)\n",
+		cmd, path, err, exitConfig)
+	os.Exit(exitConfig)
 }
 
 func newEtcd(cfg *config.Config) (*clientv3.Client, error) {
