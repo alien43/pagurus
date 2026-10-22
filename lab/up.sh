@@ -168,10 +168,10 @@ ExecStart=/usr/local/bin/pagurus run -c /etc/pagurus/%i.json --self $m
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload && pagurus validate -c /etc/pagurus/whoami.json"
+systemctl daemon-reload"
 done
 on "$first" "pagurus provision -c /etc/pagurus/whoami.json --yes"
-for m in "${members[@]}"; do on "$m" "systemctl enable --now pagurus@whoami"; done
+for m in "${members[@]}"; do on "$m" "pagurus validate -c /etc/pagurus/whoami.json && systemctl enable --now pagurus@whoami"; done
 
 log "waiting for whoami to be served"
 serving() {
