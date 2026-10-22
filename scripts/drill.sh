@@ -133,7 +133,9 @@ drill_move() {
   local order=("${members[@]:1}" "${members[0]}")
   for to in "${order[@]}"; do
     t=$( { time -p P move -c "$cfg" --to "$to" >/dev/null; } 2>&1 | awk '/real/{print $2}')
-    if healthy_on "$to"; then log "   -> $to in ${t}s"; else miss "move to $to"; fi
+    # move returns once the target holds the office and started; its endpoint record and the
+    # first good probe can trail that by a moment
+    if w=$(wait_for 60 healthy_on "$to"); then log "   -> $to in ${t}s (+${w}s to healthy)"; else miss "move to $to"; fi
   done
 }
 
