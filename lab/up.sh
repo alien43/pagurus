@@ -57,7 +57,7 @@ for m in "${members[@]}"; do
   incus init "$IMAGE" "$m" --network "$net" \
     -c security.nesting=true -c security.privileged=true \
     -c security.syscalls.intercept.mknod=true -c security.syscalls.intercept.setxattr=true >/dev/null
-  incus config device override "$m" eth0 ipv4.address="${ip[$m]}" >/dev/null
+  incus config device set "$m" eth0 ipv4.address="${ip[$m]}" >/dev/null
   incus start "$m"
 done
 
