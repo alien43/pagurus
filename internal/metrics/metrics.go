@@ -40,7 +40,7 @@ func New(svc, member string) *Set {
 	return s
 }
 
-// Help documents every metric pagurus exports (README § Metrics).
+// Help documents every metric pagurus exports (docs/01_operations.md § Metrics).
 var Help = map[string]string{
 	"pagurus_role":                    "1 while this member holds the office and runs its term, else 0",
 	"pagurus_conch_running":           "1 while this member's conch elect runs (campaigning or holding)",

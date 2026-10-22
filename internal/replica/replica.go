@@ -1,5 +1,5 @@
-// Package replica holds the pure rules of volume replication (README
-// "Replication"): how pagurus names its snapshots, which ones it may prune,
+// Package replica holds the pure rules of volume replication (docs/02_replication.md):
+// how pagurus names its snapshots, which ones it may prune,
 // and rule 4, whether a member's volume holds writes the source lacks.
 //
 // A snapshot name carries the epoch of the term that wrote the data and the

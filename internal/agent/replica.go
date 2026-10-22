@@ -1,6 +1,6 @@
 package agent
 
-// Replication of a stateful service's volumes (README "Replication",
+// Replication of a stateful service's volumes (docs/02_replication.md,
 // proposals/pagurus_stateful.md). Everything here runs only for a service
 // with a replicate block.
 //

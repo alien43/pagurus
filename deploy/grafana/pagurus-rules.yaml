@@ -1,5 +1,5 @@
 # Grafana alert rules for pagurus: the four conditions that need a human, and
-# three more for replicating services (README "Replication"): a stale replica,
+# three more for replicating services (docs/02_replication.md): a stale replica,
 # preserved orphan data, and pulls that keep failing. Their metrics exist only
 # where replicate is set.
 # PagurusReplicaStale's 1h is for the default replicate.interval 15m (4 rounds

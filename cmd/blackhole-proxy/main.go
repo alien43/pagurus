@@ -2,7 +2,7 @@
 // forwards local ports to etcd endpoints so one agent can be cut off from etcd
 // without touching the host firewall.
 //
-//	blackhole-proxy 127.0.0.1:23791=10.0.1.3:2379 127.0.0.1:23792=10.0.1.6:2379 ...
+//	blackhole-proxy 127.0.0.1:23791=192.0.2.1:2379 127.0.0.1:23792=192.0.2.2:2379 ...
 //
 // SIGUSR1 starts dropping every byte in both directions (connections stay
 // open, new ones hang — a partition, not a refusal); SIGUSR2 heals it.

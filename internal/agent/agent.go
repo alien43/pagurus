@@ -6,7 +6,7 @@
 // `pagurus term`, which hands the term back to this daemon: fence every other
 // member that may still run the workload, start it here, supervise it.
 //
-// The invariant (README.md "Safety argument"): at most one member's project has
+// The invariant (docs/00_design.md "The safety argument"): at most one member's project has
 // running instances at any time, as long as at most one member is partitioned
 // or wedged at once and the watchdog policy in force covers that member.
 package agent

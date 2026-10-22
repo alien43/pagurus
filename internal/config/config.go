@@ -1,7 +1,7 @@
 // Package config loads and validates a pagurus service definition.
 //
 // Validation is deliberately strict: every timing relation the at-most-one
-// argument depends on (README.md "Timing") is checked here, so a config that
+// argument depends on (docs/00_design.md "Timing") is checked here, so a config that
 // would make the safety argument false is refused at startup rather than
 // discovered during an outage.
 package config
@@ -234,7 +234,7 @@ type Watchdog struct {
 }
 
 // Replicate makes a stateful service's custom volumes follow the office
-// (README "Replication"). Opt-in: a service without it replicates nothing.
+// (docs/02_replication.md). Opt-in: a service without it replicates nothing.
 type Replicate struct {
 	// Pool is the Incus storage pool the volumes live on, on every member.
 	Pool string `json:"pool"`
@@ -555,7 +555,7 @@ func (c *Config) Validate() error {
 		bad("state_dir %q: must be on tmpfs (/run/...) so a reboot can never resume a lease", c.StateDir)
 	}
 
-	// The timing argument (README.md "Timing").
+	// The timing argument (docs/00_design.md "Timing").
 	ttl, renew, margin := c.Lease.TTL.D(), c.Lease.RenewInterval.D(), c.Lease.Margin.D()
 	if ttl < 5*time.Second || ttl%time.Second != 0 {
 		bad("lease.ttl %s: must be a whole number of seconds, >= 5s (etcd leases are in seconds)", ttl)
