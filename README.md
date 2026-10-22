@@ -49,7 +49,7 @@ gap it leaves, are in [`docs/00_design.md`](docs/00_design.md).
 failure drills against it, refereed by `pagurus audit`:
 
 ```sh
-lab/up.sh && lab/drill.sh    # ~10 min; lab/down.sh removes it
+lab/up.sh && lab/drill.sh    # ~3 min up, ~4 min of drills; lab/down.sh removes it
 ```
 
 The same lab runs in CI on every push (`.github/workflows/lab.yml`).
