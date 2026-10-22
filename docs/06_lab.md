@@ -22,8 +22,8 @@ lab/down.sh
 - An etcd cluster and an Incus cluster (dir storage, one `incusbr0` per member) across them.
 - `pagurus provision`, then one `pagurus@whoami` systemd unit per member.
 
-The members are **privileged containers with nesting** so their Incus can run containers of its
-own. That is a lab shortcut, not a production layout: run the lab on a disposable machine, or let CI
+The members are **privileged, AppArmor-unconfined containers with nesting** so their Incus can run
+containers of its own (confined, the nested Incus loses its own database socket once it starts one). That is a lab shortcut, not a production layout: run the lab on a disposable machine, or let CI
 run it.
 
 ## The drills

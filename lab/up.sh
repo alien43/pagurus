@@ -16,8 +16,8 @@
 #   IMAGE=images:ubuntu/24.04
 #   ETCD_VERSION=v3.6.12  INCUS_COMPOSE_VERSION=v1.3.5
 #
-# The members are privileged containers with nesting: a lab shortcut so the nested Incus can run
-# its own containers. Run it on a disposable host (or the CI job in .github/workflows/lab.yml),
+# The members are privileged, AppArmor-unconfined containers with nesting: a lab shortcut so the
+# nested Incus can run its own containers (confined, its cowsql socket gets refused once it does). Run it on a disposable host (or the CI job in .github/workflows/lab.yml),
 # not next to anything you care about.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -56,7 +56,8 @@ for m in "${members[@]}"; do
   log "member $m (${ip[$m]})"
   incus init "$IMAGE" "$m" --network "$net" \
     -c security.nesting=true -c security.privileged=true \
-    -c security.syscalls.intercept.mknod=true -c security.syscalls.intercept.setxattr=true >/dev/null
+    -c security.syscalls.intercept.mknod=true -c security.syscalls.intercept.setxattr=true \
+    -c raw.lxc=lxc.apparmor.profile=unconfined >/dev/null
   incus config device set "$m" eth0 ipv4.address="${ip[$m]}" >/dev/null
   incus start "$m"
 done
