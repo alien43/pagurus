@@ -29,6 +29,8 @@ jobs:
           sudo apt-get -qq update && sudo apt-get -qq install -y incus
           sudo incus admin init --minimal
           sudo usermod -aG incus-admin "$USER"
+          # `sudo incus` above may leave the runner's ~/.config/incus owned by root
+          sudo rm -rf "$HOME/.config/incus"
           # Docker's FORWARD DROP policy would block the lab bridge
           sudo iptables -P FORWARD ACCEPT
 
