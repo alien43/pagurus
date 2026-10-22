@@ -37,6 +37,14 @@ jobs:
       - name: Lab up
         run: sg incus-admin -c 'lab/up.sh'
 
+      - name: Probe the drill's view of the lab
+        run: |
+          sg incus-admin -c 'export MEMBERS="pgl-1=10.190.7.11 pgl-2=10.190.7.12 pgl-3=10.190.7.13" ETCD_ENDPOINTS=10.190.7.11:2379,10.190.7.12:2379,10.190.7.13:2379 ON=incus SUDO= REMOTE_CLI=1
+            bash -c "source <(sed -n 1,60p scripts/drill.sh); set -x; kprefix=/pagurus/v2/whoami
+              etcdctl --endpoints=\$eps get \$kprefix/leader --print-value-only
+              etcdctl --endpoints=\$eps get \$kprefix/endpoint --print-value-only
+              incus list --project whoami-pgl-1 -c s --format csv"' || true
+
       - name: Drill
         run: sg incus-admin -c 'lab/drill.sh'
 
