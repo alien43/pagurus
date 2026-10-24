@@ -111,6 +111,16 @@ const (
 // UpTimeout bounds one `incus-compose up` (image pulls included).
 var UpTimeout = 5 * time.Minute
 
+// APIUnavailableMax is how long a leader's health check may find the backend
+// API unavailable (backend.ErrAPIUnavailable) before that counts as unhealthy.
+// Below it the term holds: no failure counted, no restart, no give-up. It is
+// twice the 90 s Incus cluster-database stall (docs/00_design.md § Backend
+// stalls), and it never delays a self-fence: the lease is etcd's.
+var APIUnavailableMax = 3 * time.Minute
+
+// beatSlack is added to every beat's budget.
+var beatSlack = 30 * time.Second
+
 type Agent struct {
 	startLock string // hostStartLock path ("" none)
 	cfg       *config.Config
@@ -271,11 +281,14 @@ func (a *Agent) sampleLocal(ctx context.Context) {
 }
 
 // beat records a term's progress; the next beat must come within d (plus
-// slack) or the term heartbeat goes stale and conch counts the term unfit.
+// beatSlack) or the term heartbeat goes stale and conch counts the term unfit.
+// d is the longest the term may then spend before its next beat: a beat
+// before each bounded call, with that call's bound, so a call blocked on a
+// stalled backend until its timeout is progress and a wedged one is not.
 func (a *Agent) beat(d time.Duration) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.progressDeadline = a.now().Add(d + 30*time.Second)
+	a.progressDeadline = a.now().Add(d + beatSlack)
 }
 
 func (a *Agent) setLocalStopped(ok bool) {

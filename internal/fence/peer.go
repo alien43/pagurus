@@ -188,6 +188,15 @@ func (c PeerChain) Attempt(ctx context.Context, t PeerTarget) (Outcome, string) 
 	return Outcome{Status: Skip, Why: why}, ""
 }
 
+// Budget is the sum of the budgets: the longest one Attempt can take.
+func (c PeerChain) Budget() time.Duration {
+	var d time.Duration
+	for _, f := range c {
+		d += f.Budget()
+	}
+	return d
+}
+
 // BuildPeer builds a peer chain from specs.
 func BuildPeer(r Remote, watchdogMargin time.Duration, specs []Spec) (PeerChain, error) {
 	var c PeerChain

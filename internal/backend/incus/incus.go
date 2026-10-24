@@ -16,6 +16,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -223,7 +224,7 @@ func (d *Driver) CheckProject(ctx context.Context, member string) error {
 func (d *Driver) MemberOnline(ctx context.Context, member string) (bool, error) {
 	status, err := d.o.API.MemberStatus(ctx, member)
 	if err != nil {
-		return false, err
+		return false, unavailable(ctx, err)
 	}
 	return status == "Online", nil
 }
@@ -238,9 +239,27 @@ func (d *Driver) List(ctx context.Context, member string) ([]Instance, error) {
 	// that first and fail instead.
 	p := d.Project(member)
 	if _, err := d.o.API.ProjectConfig(ctx, p); err != nil {
-		return nil, fmt.Errorf("project %s not readable, so its instance list cannot be trusted: %w", p, err)
+		return nil, unavailable(ctx, fmt.Errorf("project %s not readable, so its instance list cannot be trusted: %w", p, err))
 	}
-	return d.o.API.Instances(ctx, p)
+	insts, err := d.o.API.Instances(ctx, p)
+	return insts, unavailable(ctx, err)
+}
+
+// unavailable marks err with backend.ErrAPIUnavailable when Incus did not
+// answer: the caller's deadline passed during the call, or the socket refused
+// or dropped the connection (incusd down or restarting). Anything Incus
+// actually answered (403, not found, ...) is left as it is.
+func unavailable(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	var ne net.Error
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) ||
+		(errors.As(err, &ne) && ne.Timeout()) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ENOENT) {
+		return fmt.Errorf("%w: %w", backend.ErrAPIUnavailable, err)
+	}
+	return err
 }
 
 // EnforceNoAutostart sets boot.autostart=false on every instance of member's
@@ -400,7 +419,7 @@ func (d *Driver) Kill(ctx context.Context, member string) error {
 func (d *Driver) IPv4(ctx context.Context, member, name string) (string, error) {
 	addrs, err := d.o.API.Addresses(ctx, d.Project(member), name)
 	if err != nil {
-		return "", err
+		return "", unavailable(ctx, err)
 	}
 	ifs := make([]string, 0, len(addrs))
 	for n := range addrs {

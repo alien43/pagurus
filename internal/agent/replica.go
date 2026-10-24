@@ -517,7 +517,9 @@ func (a *Agent) snapshotAll(ctx context.Context, member, snap string) error {
 	for i, vol := range a.cfg.Replicate.Volumes {
 		if err := a.repl.SnapshotVolume(ctx, member, vol, snap); err != nil {
 			for _, done := range a.cfg.Replicate.Volumes[:i] {
-				_ = a.repl.DeleteVolumeSnapshot(context.Background(), member, done, snap)
+				dctx, cancel := context.WithTimeout(context.Background(), a.cfg.Fence.APITimeout.D())
+				_ = a.repl.DeleteVolumeSnapshot(dctx, member, done, snap)
+				cancel()
 			}
 			return fmt.Errorf("snapshot %s of %s: %w", snap, vol, err)
 		}
@@ -685,7 +687,10 @@ func (a *Agent) haveFinal(ctx context.Context, prevEpoch int64) (string, bool) {
 func (t *termState) snapshotRound() string {
 	a := t.a
 	r := a.cfg.Replicate
-	ctx, cancel := context.WithTimeout(t.op, r.Interval.D()+2*a.cfg.Fence.APITimeout.D())
+	budget := r.Interval.D() + 2*a.cfg.Fence.APITimeout.D()
+	// The round's ctx, then snapshotAll's cleanup (one API timeout per volume).
+	a.beat(budget + time.Duration(len(r.Volumes))*a.cfg.Fence.APITimeout.D())
+	ctx, cancel := context.WithTimeout(t.op, budget)
 	defer cancel()
 	if h := r.PreHook; h != nil {
 		if err := a.repl.Exec(ctx, a.member, h.Instance, h.Command); err != nil {
@@ -731,9 +736,9 @@ func (t *termState) handover(to string) {
 		return
 	}
 	within := a.cfg.Replicate.CatchupTimeout.D()
-	a.beat(within + time.Minute)
 	began := a.now()
-	snap := t.snapshotRound()
+	snap := t.snapshotRound() // beats with its own budget
+	a.beat(within + time.Minute)
 	if snap == "" {
 		t.log.Warn("move: no fresh round to copy; releasing without one", "to", to)
 		return

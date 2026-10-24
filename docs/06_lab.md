@@ -7,7 +7,7 @@ everything. It is the quickest way to watch a failover, and CI runs it on every 
 
 ```sh
 lab/up.sh       # build pagurus + conch, three members, Incus cluster, etcd cluster, whoami served
-lab/drill.sh    # move graceful restart crash pause, refereed by `pagurus audit`; exit 0 = all met, 0 violations
+lab/drill.sh    # move graceful restart crash pause stall, refereed by `pagurus audit`; exit 0 = all met, 0 violations
 lab/down.sh
 ```
 
@@ -35,6 +35,7 @@ run it.
 | `restart` | SIGKILL the leader's agent; systemd restarts it | its startup fence stops the orphan; the office returns after the lease |
 | `crash` | SIGKILL and keep it down | a peer fences the copy through the Incus API, then takes over |
 | `pause` | SIGSTOP the leader's agent | systemd's watchdog kills it; a standby takes over |
+| `stall` | SIGSTOP the leader's incusd for 90 s (`STALL`), after moving the service off the control member | the agent holds: same term, no restart in place, no watchdog starve (design § Backend stalls) |
 
 `partition` (cutting a member off etcd and the Incus cluster with nftables) exists in
 `scripts/drill.sh` but is not part of the lab's default set.

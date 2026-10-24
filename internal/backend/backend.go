@@ -3,6 +3,15 @@
 // implementation of every seam is internal/backend/incus.
 package backend
 
+import "errors"
+
+// ErrAPIUnavailable marks a read the backend's API did not answer in time,
+// or refused to connect for: the daemon is stalled or down, so the answer
+// says nothing about the workload either way. The Incus cluster database
+// stalls every API read for 90 s on some instance starts
+// (docs/00_design.md § Backend stalls).
+var ErrAPIUnavailable = errors.New("backend API unavailable")
+
 type Instance struct {
 	Name     string            `json:"name"`
 	Status   string            `json:"status"`

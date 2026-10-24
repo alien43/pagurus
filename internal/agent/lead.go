@@ -179,7 +179,7 @@ func (t *termState) fenceOthers() error {
 	alerted := map[string]bool{}
 	defer a.m.Bool("pagurus_fence_blocked", false)
 	for {
-		a.beat(a.cfg.Fence.RetryInterval.D() + time.Duration(len(pending)+1)*a.cfg.Fence.APITimeout.D())
+		a.beat(a.cfg.Fence.RetryInterval.D() + a.cfg.Fence.APITimeout.D() + time.Duration(len(pending))*a.fences.PeerChain().Budget())
 		next := a.cfg.Fence.RetryInterval.D()
 		states, err := a.co.MemberStates(t.op)
 		if err == nil {
@@ -683,6 +683,7 @@ func (t *termState) audit() {
 		if m == a.member {
 			continue
 		}
+		a.beat(a.cfg.Fence.APITimeout.D())
 		cctx, cancel := context.WithTimeout(t.op, a.cfg.Fence.APITimeout.D())
 		if on, err := a.members.MemberOnline(cctx, m); err == nil && on {
 			if insts, err := a.site.List(cctx, m); err == nil {
@@ -774,9 +775,16 @@ func (t *termState) supervise() {
 		nextRound = a.now().Add(a.cfg.Replicate.Interval.D())
 	}
 	startedAt, lastAudit := a.now(), time.Time{}
+	// Since when the health check has found the backend API unavailable
+	// (zero: it answers). Below APIUnavailableMax the term holds its state.
+	var unavailableSince time.Time
 	tick := time.NewTicker(hc.Interval.D())
 	defer tick.Stop()
 	for {
+		// The tick and the etcd reads below. Every bounded backend call
+		// after them beats again with its own bound (beat), so a backend
+		// stalled for longer than this budget does not starve the heartbeat
+		// (Incus: 90 s, 2026-10-21..23).
 		a.beat(hc.Interval.D() + 2*a.cfg.Fence.APITimeout.D())
 		select {
 		case <-t.op.Done():
@@ -806,6 +814,7 @@ func (t *termState) supervise() {
 		}
 		if tok, err := a.co.GetString(t.op, a.co.RefreshKey()); err == nil && tok != "" && tok != applied {
 			applied = tok
+			a.beat(UpTimeout)
 			pctx, cancel := context.WithTimeout(t.op, UpTimeout)
 			err := a.starter.Pull(pctx, a.member)
 			cancel()
@@ -827,6 +836,7 @@ func (t *termState) supervise() {
 			t.snapshotRound()
 			nextRound = a.now().Add(a.cfg.Replicate.Interval.D())
 		}
+		a.beat(a.cfg.Fence.APITimeout.D())
 		err := t.health()
 		if t.op.Err() != nil {
 			return
@@ -834,6 +844,7 @@ func (t *termState) supervise() {
 		if ttl, terr := a.cli.TimeToLive(t.op, t.lease); terr == nil {
 			a.m.SetGauge("pagurus_lease_remaining_seconds", float64(max(ttl.TTL, 0)))
 		}
+		hold := t.apiUnavailable(err, &unavailableSince)
 		switch {
 		case err == nil:
 			if !healthy {
@@ -856,6 +867,9 @@ func (t *termState) supervise() {
 					ackPending = ""
 				}
 			}
+		case hold:
+			// The backend did not answer, so nothing new is known about the
+			// workload: neither a failure nor health.
 		case a.now().Sub(startedAt) < hc.StartPeriod.D():
 			// still starting
 		default:
@@ -888,6 +902,34 @@ func (t *termState) supervise() {
 			t.audit()
 		}
 	}
+}
+
+// apiUnavailable tracks episodes in which the health check finds the backend
+// API unavailable (since: when the episode began, zero outside one), logging
+// each episode once at its start and once at its end. It reports whether
+// supervise holds instead of judging err: the episode is younger than
+// APIUnavailableMax. An older one counts as unhealthy, so a backend that
+// stays down still ends the term the usual way, a few minutes late.
+func (t *termState) apiUnavailable(err error, since *time.Time) bool {
+	a := t.a
+	now := a.now()
+	if err == nil || !errors.Is(err, backend.ErrAPIUnavailable) {
+		if !since.IsZero() {
+			t.log.Info("backend API answers again", "unavailable_for", now.Sub(*since).Round(100*time.Millisecond))
+			*since = time.Time{}
+			a.m.SetGauge("pagurus_api_unavailable_seconds", 0)
+		}
+		return false
+	}
+	if since.IsZero() {
+		*since = now
+		a.m.Inc("pagurus_api_unavailable_total")
+		t.log.Warn("backend API unavailable; holding the workload's state (no failure counted, no restart)",
+			"err", err, "hold_up_to", APIUnavailableMax)
+	}
+	d := now.Sub(*since)
+	a.m.SetGauge("pagurus_api_unavailable_seconds", d.Seconds())
+	return d < APIUnavailableMax
 }
 
 // releaseBackoff is how long to stay out of the campaign after giving the

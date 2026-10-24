@@ -5,7 +5,7 @@
 # workstation that reaches every member over ssh and etcd directly; pagurus
 # itself (move, audit) runs on $CTL, a member with the binary and config.
 #
-#   drill.sh [move|graceful|restart|crash|pause|partition]...   (default: all but partition, in that order)
+#   drill.sh [move|graceful|restart|crash|pause|stall|partition]...   (default: all but stall and partition, in that order)
 #   SVC=<service> HEALTH_PATH=<path> HEALTH_PORT=<port> CTL=<member> select the service, its probe path and port, the control member.
 #
 # Where the cluster is (required):
@@ -181,6 +181,42 @@ drill_pause() {
   on "$l" "${S}kill -CONT $pid 2>/dev/null || true"
   sleep 10
   [ "$(running_on)" = "$(leader)" ] || miss "after SIGCONT: running on $(running_on), leader $(leader)"
+}
+
+# The leader's incusd freezes for STALL seconds (SIGSTOP; the Incus cluster
+# database stalled the whole API for 90 s on 2026-10-21..23). The agent must
+# hold: same term, no restart in place, no watchdog starve. Run from a member
+# other than CTL, whose incus the drill itself needs: the service moves off
+# CTL first. Not in the default set: on a reboot-armed member a regression
+# reboots the host, so it is refused there unless ALLOW_REBOOT=1.
+drill_stall() {
+  local l e ipid since t0 out
+  l=$(leader)
+  if [ "$l" = "$CTL" ]; then
+    for p in "${members[@]}"; do [ "$p" != "$CTL" ] && { l=$p; break; }; done
+    P move -c "$cfg" --to "$l" >/dev/null 2>&1
+    wait_for 120 healthy_on "$l" >/dev/null || { miss "stall: could not move the service to $l first"; return; }
+  fi
+  refuse_armed "$l" stall && return
+  e=$(epoch); ipid=$(on "$l" "systemctl show -p MainPID --value incus")
+  [ -n "$ipid" ] && [ "$ipid" != 0 ] || { miss "stall: no incusd on $l"; return; }
+  since=$(on "$l" "date '+%F %T'")
+  log "== stall: SIGSTOP incusd on $l (pid $ipid, epoch $e) for ${STALL:-90}s"
+  trap 'on "$l" "${S}kill -CONT $ipid"; stop_audit; unhold' EXIT
+  on "$l" "${S}kill -STOP $ipid"; t0=$SECONDS
+  sleep "${STALL:-90}"
+  on "$l" "${S}kill -CONT $ipid"
+  trap 'stop_audit; unhold' EXIT
+  log "   incusd on $l resumed after $((SECONDS - t0))s"
+  wait_for 120 healthy_on "$l" >/dev/null || miss "stall: $l not healthy after the stall (leader=$(leader) running=$(running_on))"
+  [ "$(epoch)" = "$e" ] || miss "stall: the term changed (epoch $e -> $(epoch))"
+  out=$(agent_log "$l" "$since")
+  grep -m1 'backend API unavailable' <<<"$out" | sed 's/^/   /' || miss "stall: $l's agent never saw the API unavailable"
+  grep -m1 'backend API answers again' <<<"$out" | sed 's/^/   /'
+  for bad in 'restarting workload in place' 'watchdog-starve' 'heartbeat withheld' 'NOT FIT'; do
+    grep -q "$bad" <<<"$out" && miss "stall: $l logged \"$bad\": $(grep -m1 "$bad" <<<"$out")"
+  done
+  log "   $l kept its term (epoch $e): no restart, no starve"
 }
 
 online_in_incus() { incus cluster list --format csv -c ns 2>/dev/null | grep -qx "$1,ONLINE"; }

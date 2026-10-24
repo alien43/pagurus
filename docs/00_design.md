@@ -140,6 +140,11 @@ re-checks every instance's `location` after every `up`.
 
    This is `sbd`'s idea, using the conch lease as the quorum signal.
 
+   The term's heartbeat holds while the term keeps a progress deadline: before each call it may
+   block on, the term sets the deadline to that call's own bound plus 30 s. A call that waits on
+   a stalled backend until its timeout is progress; one stuck past its bound is a wedge, and
+   starves the watchdog (§ Backend stalls).
+
 ### The residual gap, stated plainly
 
 With `fence.unverified=proceed` and no reboot-armed watchdog, a violation needs **all** of
@@ -175,6 +180,37 @@ In the sim, a leader paused in step 1 while it lost the office no longer starts 
 (`TestPausedStart`; before the change, it started a second copy). A pause *inside* the launch
 call still lets a late copy start. The re-check stops it within milliseconds: in `TestPausedLaunchWindow`, 2 ms of overlap,
 against 57 ms without the re-check (and up to `audit_interval`, 30 s, before conch).
+
+## Backend stalls
+
+The Incus cluster database can stall every API call for 90 s (seen four times in three days on
+one cluster's database leader, during instance starts). A leader's agent then neither learns
+nor acts. Two rules keep it from making things worse:
+
+- **Unavailable is not unhealthy.** The Incus driver marks a read that Incus did not answer (the
+  caller's deadline passed, or the socket refused or dropped the connection) as
+  `backend.ErrAPIUnavailable`. A health check that gets it counts no failure and resets none,
+  restarts nothing and gives nothing up: the term holds its state. Each episode is logged once at
+  its start and once at its end, with `pagurus_api_unavailable_seconds` and
+  `pagurus_api_unavailable_total`. Anything Incus *answered*, an instance not Running or an HTTP
+  check that fails, counts as before.
+- **The hold is bounded.** After 3 min (`APIUnavailableMax`, twice the observed stall) of
+  unavailable checks, they count as unhealthy, so a dead incusd on the leader ends the term the
+  usual way (restart in place, then give the office up), a few minutes late. The bound does not
+  touch fencing: the lease is etcd's, and conch's self-fence runs on its loss whatever the Incus
+  API does. Its first fence (`incus-stop`) may then time out on the stalled API; `cgroup.kill`
+  needs no Incus (`TestIncusStallEtcdLostSelfFencesInTime`).
+- **The heartbeat outlives the stall.** A supervise iteration beats before each bounded call
+  (health check, each audited member, a snapshot round, a refresh pull, a start) with that call's
+  bound, so the gap between beats is one call, never the sum. With a 15 s API timeout and a 5 s
+  health interval the longest gap in a 90 s stall is one snapshot round (`interval + 2 ×
+  api_timeout`, then 15 s per volume for its cleanup), against a budget of that plus 30 s.
+  Before, one budget of `interval + 2 × api_timeout + 30 s` = 65 s covered the whole iteration
+  while a snapshot round alone could take 90 s (a 1 min `replicate.interval`): the stall starved
+  the watchdog at +65 s, 10 s from a forced reboot on a reboot-armed member.
+
+`TestIncusStall90sHoldsTheTerm`, `TestIncusStall200sHoldsUntilTheBound` and
+`TestIncusDeadEndsTheTermAfterTheBound` drive these in the sim at 1/15 of live timing.
 
 ## Timing
 

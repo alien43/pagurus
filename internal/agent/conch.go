@@ -28,8 +28,11 @@ func (a *Agent) heartbeatPath() string {
 func (a *Agent) termSocket() string { return filepath.Join(a.cfg.StateDir, a.cfg.Service+".term") }
 
 // heartbeatStale is conch's --watchdog-stale: the heartbeat is touched every
-// second while the term's progress deadline holds.
-const heartbeatStale = 5 * time.Second
+// heartbeatEvery while the term's progress deadline holds.
+var (
+	heartbeatStale = 5 * time.Second
+	heartbeatEvery = time.Second
+)
 
 // conchArgs is the `conch elect` command line for one campaign.
 func (a *Agent) conchArgs(delay time.Duration) []string {
@@ -191,15 +194,20 @@ func (a *Agent) heartbeat(ctx context.Context) {
 	if a.relay == nil {
 		return
 	}
-	t := time.NewTicker(time.Second)
+	t := time.NewTicker(heartbeatEvery)
 	defer t.Stop()
+	withheld := false
 	for {
 		a.mu.Lock()
 		ok := a.now().Before(a.progressDeadline)
 		a.mu.Unlock()
 		if ok {
 			a.touchHeartbeat()
+		} else if !withheld {
+			a.log.Error("term missed its progress deadline; heartbeat withheld", "member", a.member)
+			a.m.Inc("pagurus_heartbeat_withheld_total")
 		}
+		withheld = !ok
 		select {
 		case <-ctx.Done():
 			return

@@ -124,7 +124,10 @@ func (r *simRT) volOp(member string) error {
 	return nil
 }
 
-func (r *simRT) VolumeSnapshots(_ context.Context, member, vol string) ([]string, error) {
+func (r *simRT) VolumeSnapshots(ctx context.Context, member, vol string) ([]string, error) {
+	if err := r.stall(ctx, false); err != nil {
+		return nil, err
+	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	if err := r.volOp(member); err != nil {
@@ -133,7 +136,10 @@ func (r *simRT) VolumeSnapshots(_ context.Context, member, vol string) ([]string
 	return r.c.volume(member, vol).names(), nil
 }
 
-func (r *simRT) SnapshotVolume(_ context.Context, member, vol, snap string) error {
+func (r *simRT) SnapshotVolume(ctx context.Context, member, vol, snap string) error {
+	if err := r.stall(ctx, false); err != nil {
+		return err
+	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	if err := r.volOp(member); err != nil {
@@ -150,7 +156,10 @@ func (r *simRT) SnapshotVolume(_ context.Context, member, vol, snap string) erro
 	return nil
 }
 
-func (r *simRT) DeleteVolumeSnapshot(_ context.Context, member, vol, snap string) error {
+func (r *simRT) DeleteVolumeSnapshot(ctx context.Context, member, vol, snap string) error {
+	if err := r.stall(ctx, false); err != nil {
+		return err
+	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	if err := r.volOp(member); err != nil {

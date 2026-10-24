@@ -138,6 +138,9 @@ Every series carries `svc` and `member` labels; no label has unbounded values.
 | `pagurus_replica_snapshots_total{result}` | counter | replicate only: the leader's snapshot rounds, `ok\|failed` |
 | `pagurus_orphaned_volumes` | gauge | replicate only: `<vol>-orphaned-*` volumes on this member (rule 4) |
 | `pagurus_replica_stale_blocked` | gauge | replicate only: 1 while this member's last term refused to start on a stale copy |
+| `pagurus_api_unavailable_seconds` | gauge | how long the leader's health check has found the backend API unavailable (0 while it answers; design § Backend stalls) |
+| `pagurus_api_unavailable_total` | counter | episodes of that |
+| `pagurus_heartbeat_withheld_total` | counter | times a term missed its progress deadline, so its heartbeat to conch stopped (conch then logs `watchdog-starve`) |
 
 `deploy/grafana/pagurus-rules.yaml` holds Grafana rules for the four conditions that need a
 human, and two for replicating services: `PagurusReplicaStale` (a member's copy is over an hour old,

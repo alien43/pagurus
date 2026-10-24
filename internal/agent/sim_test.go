@@ -17,6 +17,7 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/alien43/pagurus/internal/backend"
 	"github.com/alien43/pagurus/internal/backend/incus"
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
@@ -92,6 +93,13 @@ type simMember struct {
 	// gets its context's error, as from a real API timeout (mqtt-lab
 	// 2026-10-18: "context deadline exceeded" at incus-api-stop's 15 s).
 	listDelay time.Duration
+	// frozenUntil: this member's incusd answers no API call until then (the
+	// 90 s cluster-database stall, asus 2026-10-21..23). A call waits for the
+	// freeze to end or for its context; reads then fail the way the Incus
+	// driver reports them (backend.ErrAPIUnavailable).
+	frozenUntil time.Time
+	// apiDown: this member's incusd is dead; every call through it is refused.
+	apiDown bool
 }
 
 func newSim(t *testing.T, members ...string) *simCluster {
@@ -187,12 +195,42 @@ func (r *simRT) clusterOp() error {
 	return nil
 }
 
+// stall waits out a freeze of r's own incusd (frozenUntil). read: the call
+// is a read, whose timeout the driver marks backend.ErrAPIUnavailable.
+func (r *simRT) stall(ctx context.Context, read bool) error {
+	r.c.mu.Lock()
+	until, down := r.c.m[r.me].frozenUntil, r.c.m[r.me].apiDown
+	r.c.mu.Unlock()
+	if down {
+		if read {
+			return errAPIDown
+		}
+		return errors.New("dial unix /var/lib/incus/unix.socket: connect: connection refused")
+	}
+	d := time.Until(until)
+	if d <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		if read {
+			return fmt.Errorf("%w: %w", backend.ErrAPIUnavailable, ctx.Err())
+		}
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
 func (r *simRT) Identity(context.Context) (string, string, error) { return r.me, "x86_64", r.gate() }
 func (r *simRT) CheckProject(context.Context, string) error       { return nil }
 func (r *simRT) CheckStart(context.Context, string) error         { return nil }
 func (r *simRT) CheckCgroup2() error                              { return nil }
 
-func (r *simRT) MemberOnline(_ context.Context, m string) (bool, error) {
+func (r *simRT) MemberOnline(ctx context.Context, m string) (bool, error) {
+	if err := r.stall(ctx, true); err != nil {
+		return false, err
+	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	if err := r.clusterOp(); err != nil {
@@ -202,6 +240,9 @@ func (r *simRT) MemberOnline(_ context.Context, m string) (bool, error) {
 }
 
 func (r *simRT) List(ctx context.Context, m string) ([]incus.Instance, error) {
+	if err := r.stall(ctx, true); err != nil {
+		return nil, err
+	}
 	r.c.mu.Lock()
 	if d := r.c.m[m].listDelay; d > 0 {
 		r.c.mu.Unlock()
@@ -251,7 +292,10 @@ func (r *simRT) pauseIf(m string, d *time.Duration) {
 	}
 }
 
-func (r *simRT) Prepare(_ context.Context, m string) error {
+func (r *simRT) Prepare(ctx context.Context, m string) error {
+	if err := r.stall(ctx, false); err != nil {
+		return err
+	}
 	r.pauseIf(m, &r.c.m[m].slowPause)
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
@@ -270,7 +314,10 @@ func (r *simRT) Prepare(_ context.Context, m string) error {
 	return nil
 }
 
-func (r *simRT) Pull(_ context.Context, m string) error {
+func (r *simRT) Pull(ctx context.Context, m string) error {
+	if err := r.stall(ctx, false); err != nil {
+		return err
+	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	if err := r.clusterOp(); err != nil {
@@ -280,7 +327,10 @@ func (r *simRT) Pull(_ context.Context, m string) error {
 	return nil
 }
 
-func (r *simRT) Start(_ context.Context, m string) error {
+func (r *simRT) Start(ctx context.Context, m string) error {
+	if err := r.stall(ctx, false); err != nil {
+		return err
+	}
 	r.c.mu.Lock()
 	unprepared := !r.c.m[m].prepared
 	r.c.mu.Unlock()
@@ -320,9 +370,17 @@ func (r *simRT) Start(_ context.Context, m string) error {
 	return nil
 }
 
-func (r *simRT) EnforceNoAutostart(context.Context, string) error { return r.clusterOp() }
+func (r *simRT) EnforceNoAutostart(ctx context.Context, _ string) error {
+	if err := r.stall(ctx, false); err != nil {
+		return err
+	}
+	return r.clusterOp()
+}
 
-func (r *simRT) Stop(_ context.Context, m string, _ time.Duration) error {
+func (r *simRT) Stop(ctx context.Context, m string, _ time.Duration) error {
+	if err := r.stall(ctx, false); err != nil {
+		return err
+	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
 	if err := r.clusterOp(); err != nil {
@@ -371,7 +429,12 @@ func (r *simRT) Kill(_ context.Context, m string) error {
 	return nil
 }
 
-func (r *simRT) IPv4(context.Context, string, string) (string, error) { return "192.0.2.1", nil }
+func (r *simRT) IPv4(ctx context.Context, _, _ string) (string, error) {
+	if err := r.stall(ctx, true); err != nil {
+		return "", err
+	}
+	return "192.0.2.1", nil
+}
 
 // -------------------------------------------------------- simulated watchdog -
 
@@ -383,6 +446,8 @@ type simDog struct {
 	onFire  func()
 	mu      sync.Mutex
 	fired   bool
+	// unfit: the longest the fitness predicate stayed false.
+	unfit time.Duration
 }
 
 func (d *simDog) Mode() string             { return "sim" }
@@ -393,9 +458,15 @@ func (d *simDog) Starving() (bool, string) { return false, "" }
 func (d *simDog) Run(ctx context.Context, fit watchdog.Fitness) {
 	last := time.Now()
 	for ctx.Err() == nil {
-		if ok, _ := fit(); ok {
+		ok, _ := fit()
+		if ok {
 			last = time.Now()
-		} else if time.Since(last) > d.timeout && d.reboot {
+		} else {
+			d.mu.Lock()
+			d.unfit = max(d.unfit, time.Since(last))
+			d.mu.Unlock()
+		}
+		if !ok && time.Since(last) > d.timeout && d.reboot {
 			d.mu.Lock()
 			d.fired = true
 			d.mu.Unlock()
