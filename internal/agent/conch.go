@@ -112,6 +112,27 @@ func (a *Agent) stopConch(reason string) {
 	}
 }
 
+// withdraw stops conch for a campaign that should not go on, unless a term
+// has begun meanwhile: it reports whether it signalled. follow decides to
+// withdraw after its own inTerm check, its ground-truth check and an etcd
+// read, and a term that starts in between has already cleared localStopped
+// (lead), so the verdict "not eligible: local instances not confirmed
+// stopped" was about the term itself; signalling would end it at once
+// (seen live 12 times in 7 days on asus and dell, and in the VM lab). The
+// check and the signal happen under a.mu, which serveTerm holds to start a
+// term, so no term begins between them.
+func (a *Agent) withdraw(reason string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	cmd := a.conch
+	if a.termActive || a.termRan || cmd == nil || cmd.Process == nil {
+		return false
+	}
+	a.log.Info("stopping conch", "member", a.member, "reason", reason)
+	_ = cmd.Process.Signal(syscall.SIGTERM)
+	return true
+}
+
 // exitWithdrawn is conch's exit after a SIGTERM while still campaigning
 // (stopConch on a withdrawal): nothing ran.
 const exitWithdrawn = 143

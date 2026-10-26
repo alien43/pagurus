@@ -835,8 +835,9 @@ func (a *Agent) follow(ctx context.Context) {
 				if reason == "" {
 					reason = fmt.Sprintf("campaign delay changed from %s to %s", running.delay, want.delay)
 				}
-				log.Info("withdrawing from the campaign", "reason", reason)
-				a.stopConch(reason)
+				if a.withdraw(reason) {
+					log.Info("withdrawing from the campaign", "reason", reason)
+				}
 			}
 		}
 
