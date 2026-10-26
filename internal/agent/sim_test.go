@@ -46,7 +46,8 @@ type simCluster struct {
 	overlapSince time.Time
 	maxOverlap   time.Duration
 
-	vol *simRepl // volumes (replica_sim_test.go), made on first use
+	vol      *simRepl        // volumes (replica_sim_test.go), made on first use
+	graceful []time.Duration // every graceful timeout a Stop was given
 }
 
 type simMember struct {
@@ -131,7 +132,7 @@ func (c *simCluster) check(what string) {
 	if c.vol != nil { // replication sims: each member's counter when it stopped
 		for name, m := range c.m {
 			if !m.running && slices.Contains(c.vol.wasRunning, name) {
-				c.vol.stopHead[name] = c.volume(name, "data").head
+				c.vol.stopHead[name] = c.volume(name, c.primary()).head
 			}
 		}
 		c.vol.wasRunning = on
@@ -354,14 +355,14 @@ func (r *simRT) Start(ctx context.Context, m string) error {
 	}
 	r.c.m[m].running = true
 	if r.c.vol != nil {
-		for _, v := range r.c.vol.vols[m] {
-			if !v.idmapped {
+		for name, v := range r.c.vol.vols[m] {
+			if _, inst := backend.ParseUnit(name); !inst && !v.idmapped {
 				r.c.vol.shifted[m]++
 				v.idmapped = true // Incus stamps it as it shifts
 			}
 		}
 	}
-	r.c.repl().startHead[m] = r.c.volume(m, "data").head
+	r.c.repl().startHead[m] = r.c.volume(m, r.c.primary()).head
 	r.c.check("up on " + m)
 	if sm := r.c.m[m]; sm.dieAfterUp > 0 {
 		sm.dieAfterUp--
@@ -377,12 +378,15 @@ func (r *simRT) EnforceNoAutostart(ctx context.Context, _ string) error {
 	return r.clusterOp()
 }
 
-func (r *simRT) Stop(ctx context.Context, m string, _ time.Duration) error {
+func (r *simRT) Stop(ctx context.Context, m string, graceful time.Duration) error {
 	if err := r.stall(ctx, false); err != nil {
 		return err
 	}
 	r.c.mu.Lock()
 	defer r.c.mu.Unlock()
+	if graceful > 0 {
+		r.c.graceful = append(r.c.graceful, graceful)
+	}
 	if err := r.clusterOp(); err != nil {
 		return err
 	}

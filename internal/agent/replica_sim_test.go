@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alien43/pagurus/internal/backend"
 	"github.com/alien43/pagurus/internal/config"
 	"github.com/alien43/pagurus/internal/coord"
 	"github.com/alien43/pagurus/internal/replica"
@@ -73,6 +74,17 @@ type simRepl struct {
 	snapFail   map[string]bool // volume name -> SnapshotVolume fails
 	refFail    map[string]bool // "<to>/<volume>" -> RefreshVolume into it fails
 	calls      int             // every volume call, any member
+	// primary is the unit the workload writes: "data", or an instance's
+	// unit for a service that replicates a whole instance.
+	primary string
+}
+
+// primary is the unit the workload writes. Callers hold c.mu.
+func (c *simCluster) primary() string {
+	if p := c.repl().primary; p != "" {
+		return p
+	}
+	return "data"
 }
 
 func (c *simCluster) repl() *simRepl {
@@ -102,9 +114,9 @@ func (c *simCluster) write() {
 	defer c.mu.Unlock()
 	for name, m := range c.m {
 		if m.running {
-			c.volume(name, "data").head++
+			c.volume(name, c.primary()).head++
 			for vol, v := range c.repl().vols[name] {
-				if vol != "data" && !strings.Contains(vol, "-orphaned-") {
+				if vol != c.primary() && !strings.Contains(vol, "-orphaned-") {
 					v.head++
 				}
 			}
@@ -227,7 +239,7 @@ func (r *simRT) RefreshVolume(ctx context.Context, from, to, vol string) error {
 	src.idmapped = rp.vols[to][vol] != nil && rp.vols[to][vol].idmapped
 	rp.vols[to][vol] = src
 	rp.refreshes[to]++
-	if vol == "data" {
+	if vol == r.c.primary() {
 		rp.pulled[to] = src.head
 	}
 	r.c.log = append(r.c.log, fmt.Sprintf("%s refresh %s <- %s: head %d, %d snapshots", time.Now().Format("05.000"), to, from, src.head, len(src.snaps)))
@@ -268,7 +280,7 @@ func (r *simRT) ListVolumes(_ context.Context, member string) ([]string, error) 
 	if err := r.volOp(member); err != nil {
 		return nil, err
 	}
-	r.c.volume(member, "data")
+	r.c.volume(member, r.c.primary())
 	var out []string
 	for n := range r.c.repl().vols[member] {
 		out = append(out, n)
@@ -325,7 +337,7 @@ func newReplHarness(t *testing.T, mutate func(*config.Config)) *harness {
 func (h *harness) head(m string) int64 {
 	h.sim.mu.Lock()
 	defer h.sim.mu.Unlock()
-	return h.sim.volume(m, "data").head
+	return h.sim.volume(m, h.sim.primary()).head
 }
 
 func (h *harness) stopHead(m string) int64 {
@@ -1064,4 +1076,129 @@ func TestReplicaCatchUpStopsAPreviousHolderTheFenceCouldNotSee(t *testing.T) {
 	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
 		t.Fatalf("dell started from %d, asus was stopped at %d: lost %d writes", got, old, old-got)
 	}
+}
+
+// ---------------------------------------------------------------- instances -
+//
+// A replicated instance (replicate.instances: a VM's root disk, which can't
+// live on a custom volume) is a replica unit like a volume, under the same
+// rules. Here the workload writes the instance's own unit, "instance/vm".
+
+func replicatedInstance(maxStale time.Duration) func(*config.Config) {
+	return func(c *config.Config) {
+		c.Compose = ""
+		c.Start = config.Start{Kind: "instances", Names: []string{"vm"}}
+		c.Replicate = &config.Replicate{Pool: "p", Instances: []string{"vm"}, Interval: config.Duration(500 * time.Millisecond),
+			MaxStaleness: config.Duration(maxStale), Keep: 3, CatchupTimeout: config.Duration(5 * time.Second)}
+	}
+}
+
+// newInstanceHarness is newReplHarness with the workload writing instance vm.
+func newInstanceHarness(t *testing.T, mutate func(*config.Config)) *harness {
+	h := newHarness(t, mutate)
+	h.sim.mu.Lock()
+	h.sim.repl().primary = backend.InstanceUnit("vm")
+	h.sim.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() {
+		for sleep(ctx, writeTick) {
+			h.sim.write()
+		}
+	}()
+	return h
+}
+
+// A planned move of a replicated instance: the target pulls the instance's
+// final state before it starts it. Nothing lost, nothing orphaned, and the
+// rounds are the instance's own snapshots (no volume is touched).
+func TestReplicaInstanceCleanMove(t *testing.T) {
+	h := newInstanceHarness(t, replicatedInstance(time.Minute))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	if err := h.coord().SetPin(context.Background(), "dell"); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRunning("dell", 15*time.Second)
+	_ = h.coord().SetPin(context.Background(), "")
+	if old, got := h.stopHead("asus"), h.startHead("dell"); got != old {
+		t.Fatalf("dell started vm from %d, asus stopped at %d: a clean move lost %d writes", got, old, old-got)
+	}
+	h.sim.mu.Lock()
+	snaps := h.sim.volume("dell", backend.InstanceUnit("vm")).names()
+	_, dataUsed := h.sim.repl().vols["dell"]["data"]
+	h.sim.mu.Unlock()
+	if len(replica.Sorted(snaps)) == 0 {
+		t.Fatalf("dell's vm has no pagurus snapshots: %v", snaps)
+	}
+	if dataUsed {
+		t.Error("a service replicating only an instance touched a volume named data")
+	}
+	for _, m := range []string{"asus", "dell", "rpi5"} {
+		if o := h.orphans(m); len(o) != 0 {
+			t.Errorf("%s orphaned %v after a clean move", m, o)
+		}
+	}
+	h.holdOne("dell", time.Second)
+}
+
+// The leader's host dies and every follower's copy of the instance is older
+// than max_staleness: nobody starts it until an operator accepts the loss.
+func TestReplicaInstanceStaleFollowerDoesNotStart(t *testing.T) {
+	h := newInstanceHarness(t, both(proceed, replicatedInstance(2*time.Second)))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("followers pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") && h.pulledFromLeader("rpi5") })
+	// The followers hold a real copy (blocked for its age, not for having none).
+	h.sim.mu.Lock()
+	copied := len(replica.Sorted(h.sim.volume("dell", backend.InstanceUnit("vm")).names()))
+	h.sim.mu.Unlock()
+	if copied == 0 {
+		t.Fatal("dell recorded a pull but its vm has no pagurus snapshot")
+	}
+	h.powerOff("asus")
+	h.waitRunning("", 2*time.Second)
+	h.holdNobody(25 * time.Second)
+	if v := h.nodes["dell"].agent.m.Get("pagurus_replica_stale_blocked"); v != 1 {
+		t.Errorf("pagurus_replica_stale_blocked on dell = %v, want 1", v)
+	}
+	if err := h.coord().SetAcceptStale(context.Background(), coord.AcceptStale{Member: "dell", By: "test", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	h.waitRunning("dell", 30*time.Second)
+	if got := h.startHead("dell"); got == 0 {
+		t.Fatal("dell started vm from an empty copy, not its stale one")
+	}
+}
+
+// The old leader comes back after a failover: its instance holds writes the
+// new leader never had. Rule 4 keeps them as a stopped instance
+// vm-orphaned-<epoch>-<UTC> before the resync; it is never overwritten, and
+// never started (the starter starts only start.names).
+func TestReplicaInstanceOldLeaderReturnsOrphaned(t *testing.T) {
+	h := newInstanceHarness(t, both(proceed, replicatedInstance(time.Minute)))
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	h.waitFor("dell pulled", 10*time.Second, func() bool { return h.pulledFromLeader("dell") })
+	dead := h.powerOff("asus")
+	h.waitRunning("dell", 30*time.Second)
+	h.powerOn("asus")
+	h.waitFor("asus resynced from dell", 15*time.Second, func() bool { return h.pulledFromLeader("asus") })
+	o := h.orphans("asus")
+	if len(o) != 1 {
+		t.Fatalf("asus orphans %v, want exactly one", o)
+	}
+	for n, v := range o {
+		if !regexp.MustCompile(`^instance/vm-orphaned-\d+-\d{8}T\d{9}Z$`).MatchString(n) {
+			t.Errorf("orphan %q: want the instance unit vm-orphaned-<epoch>-<UTC>", n)
+		}
+		if v != dead {
+			t.Fatalf("orphan %s holds %d, asus died at %d", n, v, dead)
+		}
+	}
+	if v := h.nodes["asus"].agent.m.Get("pagurus_orphaned_volumes"); v != 1 {
+		t.Errorf("pagurus_orphaned_volumes on asus = %v, want 1", v)
+	}
+	h.holdOne("dell", 2*time.Second)
 }

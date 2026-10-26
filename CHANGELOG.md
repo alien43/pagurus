@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Whole-instance replication: `replicate.instances` replicates instances (root disk, config and
+  devices, a VM's included) under the same rules as volumes (rounds, catch-up, staleness gate,
+  orphans, `keep`). Only with `start.kind=instances`, each one in `start.names`. `pagurus
+  provision` seeds a member that lacks one with a stopped copy. A volumes-only config hashes as
+  before. See docs/02_replication.md § Instances.
+- `provision` no longer refuses a plan whose replicated instance exists nowhere yet: it creates the
+  projects and prints a `[todo]`.
+- Fix: a term that started while the follow loop was deciding to withdraw was ended at once ("not
+  eligible: local instances not confirmed stopped" right after "won the office"; 12 times in 7
+  days on one cluster). A withdrawal now never signals conch once a term has begun.
+
 ## v0.1.1
 
 - A stalled or dead backend API is no longer a sick workload. A health check that Incus does not

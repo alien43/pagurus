@@ -138,3 +138,28 @@ func TestListRefusesAnUnreadableProject(t *testing.T) {
 		t.Fatalf("err %v", err)
 	}
 }
+
+// A leader's start while a follower pulls the instance (`incus copy
+// --refresh` holds the source busy) is retried, not failed: in the VM lab a
+// restart in place hit it and gave the office up. Any other error is not.
+func TestStartInstancesRetriesABusyInstance(t *testing.T) {
+	defer func(d time.Duration) { incus.BusyRetry = d }(incus.BusyRetry)
+	incus.BusyRetry = 10 * time.Millisecond
+	api := fencetest.NewFakeIncus("asus")
+	api.AddInstance("svc-asus", incus.Instance{Name: "vm", Status: incus.StatusStopped, Location: "asus", Type: "virtual-machine"})
+	api.StartBusy = 3
+	drv := incus.New(incus.Options{ProjectPrefix: "svc", API: api})
+	if err := drv.StartInstances(context.Background(), "asus", []string{"vm"}); err != nil {
+		t.Fatalf("start after 3 busy refusals: %v", err)
+	}
+	api.StartBusy = 1000
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := drv.StartInstances(ctx, "asus", []string{"vm"}); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("still busy at the deadline: err %v, want the busy error", err)
+	}
+	api.StartBusy = 0
+	if err := drv.StartInstances(context.Background(), "asus", []string{"ghost"}); err == nil {
+		t.Fatal("a missing instance was retried into success")
+	}
+}

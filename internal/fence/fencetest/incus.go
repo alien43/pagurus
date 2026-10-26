@@ -2,6 +2,7 @@ package fencetest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -31,6 +32,8 @@ type FakeIncus struct {
 	Vols  map[string][]string
 	// VolCfg holds custom volumes' config by the same key as Vols.
 	VolCfg map[string]map[string]string
+	// InstSnaps holds instance snapshot names by "<project>/<instance>".
+	InstSnaps map[string][]string
 
 	// Hang makes every call block until its context ends.
 	Hang bool
@@ -42,6 +45,9 @@ type FakeIncus struct {
 	// projects: ProjectConfig is refused (403) and Instances is an empty
 	// list, not an error, which is what the real server does.
 	Forbidden map[string]bool
+	// StartBusy: the next StartBusy Start calls fail as Incus does while
+	// another operation (a follower's pull) holds the instance.
+	StartBusy int
 	// OnStop / OnStart run after an instance changes state (e.g. to update a
 	// FakeCgroupFS the way the kernel would).
 	OnStop, OnStart func(project, name string)
@@ -54,7 +60,7 @@ type FakeIncus struct {
 func NewFakeIncus(members ...string) *FakeIncus {
 	f := &FakeIncus{ServerName: members[0], Archs: []string{"x86_64"}, Members: map[string]string{}, Groups: map[string][]string{},
 		Projects: map[string]map[string]string{}, Insts: map[string][]incus.Instance{}, Addrs: map[string]map[string][]incus.Address{},
-		Pools: map[string]bool{"default": true}, Vols: map[string][]string{}}
+		Pools: map[string]bool{"default": true}, Vols: map[string][]string{}, InstSnaps: map[string][]string{}}
 	for _, m := range members {
 		f.Members[m] = "Online"
 		f.Groups["host-"+m] = []string{m}
@@ -249,6 +255,11 @@ func (f *FakeIncus) Start(ctx context.Context, project, name string) error {
 	if in == nil {
 		f.mu.Unlock()
 		return fmt.Errorf("instance %s/%s not found", project, name)
+	}
+	if f.StartBusy > 0 {
+		f.StartBusy--
+		f.mu.Unlock()
+		return errors.New(`Failed to create instance start operation: Instance is busy running a "migrate" operation`)
 	}
 	f.mutations++
 	in.Status = incus.StatusRunning
@@ -460,6 +471,62 @@ func (f *FakeIncus) DeleteVolumeSnapshot(ctx context.Context, project, pool, mem
 	}
 	f.mutations++
 	f.Vols[k] = slices.DeleteFunc(snaps, func(s string) bool { return s == snap })
+	return nil
+}
+
+// instance checks that project has instance name. Callers hold f.mu.
+func (f *FakeIncus) instance(project, name string) error {
+	if !slices.ContainsFunc(f.Insts[project], func(in incus.Instance) bool { return in.Name == name }) {
+		return notFound("instance " + name)
+	}
+	return nil
+}
+
+func (f *FakeIncus) InstanceSnapshots(ctx context.Context, project, name string) ([]string, error) {
+	if err := f.gate(ctx); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.instance(project, name); err != nil {
+		return nil, err
+	}
+	return slices.Clone(f.InstSnaps[project+"/"+name]), nil
+}
+
+func (f *FakeIncus) CreateInstanceSnapshot(ctx context.Context, project, name, snap string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.instance(project, name); err != nil {
+		return err
+	}
+	k := project + "/" + name
+	if slices.Contains(f.InstSnaps[k], snap) {
+		return api.StatusErrorf(http.StatusConflict, "snapshot %s already exists", snap)
+	}
+	f.mutations++
+	f.InstSnaps[k] = append(f.InstSnaps[k], snap)
+	return nil
+}
+
+func (f *FakeIncus) DeleteInstanceSnapshot(ctx context.Context, project, name, snap string) error {
+	if err := f.gate(ctx); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k := project + "/" + name
+	if err := f.instance(project, name); err != nil {
+		return err
+	}
+	if !slices.Contains(f.InstSnaps[k], snap) {
+		return notFound("snapshot " + snap)
+	}
+	f.mutations++
+	f.InstSnaps[k] = slices.DeleteFunc(f.InstSnaps[k], func(s string) bool { return s == snap })
 	return nil
 }
 

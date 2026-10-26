@@ -29,11 +29,13 @@ import (
 )
 
 // Replicator is the storage side of replication: snapshot a member's
-// volumes, ship them to another member, keep a copy aside, and prepare a
-// volume for its first use. The rules (rounds, catch-up, staleness, orphans)
-// are the agent's, below. Today the volumes are Incus custom volumes on the
-// configured pool, in a member's project, on that member (*incus.Driver);
-// tests substitute the simulated cluster.
+// replica units, ship them to another member, keep a copy aside, and prepare
+// a volume for its first use. The rules (rounds, catch-up, staleness, orphans)
+// are the agent's, below. A unit (the "vol" arguments) is a custom volume's
+// name, or an instance as backend.InstanceUnit(name): its root disk and
+// config. Today the units live in a member's Incus project on that member,
+// volumes on the configured pool (*incus.Driver); tests substitute the
+// simulated cluster.
 type Replicator interface {
 	// VolumeSnapshots lists the snapshot names of vol in member's project.
 	VolumeSnapshots(ctx context.Context, member, vol string) ([]string, error)
@@ -43,9 +45,11 @@ type Replicator interface {
 	// volume copy --refresh`, run where `to` is): the target ends with
 	// exactly the source's snapshots and state, whatever it had before.
 	RefreshVolume(ctx context.Context, from, to, vol string) error
-	// CopyVolume copies vol to a new volume dst, both in member's project.
+	// CopyVolume copies vol to a new unit dst, both in member's project. An
+	// instance's copy is stopped and never starts at boot.
 	CopyVolume(ctx context.Context, member, vol, dst string) error
-	// ListVolumes lists the custom volumes in member's project.
+	// ListVolumes lists the units in member's project: its custom volumes,
+	// and its instances as backend.InstanceUnit names.
 	ListVolumes(ctx context.Context, member string) ([]string, error)
 	// Exec runs argv in an instance of member's project.
 	Exec(ctx context.Context, member, instance string, argv []string) error
@@ -64,7 +68,7 @@ var errPrevRunning = errors.New("the previous holder's copy still runs")
 
 func (a *Agent) replicating() bool { return a.cfg.Replicate != nil }
 
-// preflightReplica: the runtime can replicate and every volume exists here.
+// preflightReplica: the runtime can replicate and every unit exists here.
 func (a *Agent) preflightReplica(ctx context.Context) error {
 	if !a.replicating() {
 		return nil
@@ -77,8 +81,12 @@ func (a *Agent) preflightReplica(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("replicate: listing volumes: %w", err)
 	}
-	for _, vol := range a.cfg.Replicate.Volumes {
+	for _, vol := range a.cfg.Replicate.Units() {
 		if !slices.Contains(have, vol) {
+			if name, inst := backend.ParseUnit(vol); inst {
+				return fmt.Errorf("replicate: instance %s is missing from project %s (run `pagurus provision`: it copies it from a member that has it)",
+					name, a.cfg.Project(a.member))
+			}
 			return fmt.Errorf("replicate: volume %s is missing from project %s on pool %s (run `pagurus provision`)",
 				vol, a.cfg.Project(a.member), a.cfg.Replicate.Pool)
 		}
@@ -160,7 +168,7 @@ func (a *Agent) replicaMetrics(ctx context.Context) {
 // replicaAge is the age of the stalest volume's newest pagurus snapshot.
 func (a *Agent) replicaAge(ctx context.Context) (time.Duration, bool) {
 	var oldest time.Time
-	for _, vol := range a.cfg.Replicate.Volumes {
+	for _, vol := range a.cfg.Replicate.Units() {
 		names, err := a.repl.VolumeSnapshots(ctx, a.member, vol)
 		if err != nil {
 			return 0, false
@@ -205,7 +213,7 @@ func (a *Agent) pullOnce(ctx context.Context) {
 		mine = &coord.ReplicaCopy{}
 	}
 	pulled := false
-	for _, vol := range a.cfg.Replicate.Volumes {
+	for _, vol := range a.cfg.Replicate.Units() {
 		local, err := a.repl.VolumeSnapshots(pctx, a.member, vol)
 		if err != nil {
 			return
@@ -412,7 +420,7 @@ func (t *termState) catchUp(prev string, prevEpoch, myLed int64) error {
 	if mine == nil {
 		mine = &coord.ReplicaCopy{}
 	}
-	for _, vol := range a.cfg.Replicate.Volumes {
+	for _, vol := range a.cfg.Replicate.Units() {
 		local, err := a.repl.VolumeSnapshots(ctx, a.member, vol)
 		if err != nil {
 			return err
@@ -514,9 +522,10 @@ func (a *Agent) acceptStaleFor(ctx context.Context) bool {
 // so no volume carries a name the others lack (a lone -final would read as
 // a clean handover to rule 4).
 func (a *Agent) snapshotAll(ctx context.Context, member, snap string) error {
-	for i, vol := range a.cfg.Replicate.Volumes {
+	units := a.cfg.Replicate.Units()
+	for i, vol := range units {
 		if err := a.repl.SnapshotVolume(ctx, member, vol, snap); err != nil {
-			for _, done := range a.cfg.Replicate.Volumes[:i] {
+			for _, done := range units[:i] {
 				dctx, cancel := context.WithTimeout(context.Background(), a.cfg.Fence.APITimeout.D())
 				_ = a.repl.DeleteVolumeSnapshot(dctx, member, done, snap)
 				cancel()
@@ -591,7 +600,7 @@ func (a *Agent) drain(epoch int64, lease clientv3.LeaseID, log *slog.Logger) {
 func (a *Agent) localRound(ctx context.Context) (round replica.Snap, ok, mixed bool) {
 	var common map[string]bool
 	newest := ""
-	for i, vol := range a.cfg.Replicate.Volumes {
+	for i, vol := range a.cfg.Replicate.Units() {
 		names, err := a.repl.VolumeSnapshots(ctx, a.member, vol)
 		if err != nil {
 			return replica.Snap{}, false, false
@@ -673,7 +682,7 @@ func (a *Agent) haveFinal(ctx context.Context, prevEpoch int64) (string, bool) {
 	if !ok || !s.Final || s.Epoch != prevEpoch {
 		return "", false
 	}
-	for _, vol := range a.cfg.Replicate.Volumes {
+	for _, vol := range a.cfg.Replicate.Units() {
 		local, err := a.repl.VolumeSnapshots(ctx, a.member, vol)
 		if err != nil || !slices.Contains(local, mine.Snapshot) {
 			return "", false
@@ -689,7 +698,7 @@ func (t *termState) snapshotRound() string {
 	r := a.cfg.Replicate
 	budget := r.Interval.D() + 2*a.cfg.Fence.APITimeout.D()
 	// The round's ctx, then snapshotAll's cleanup (one API timeout per volume).
-	a.beat(budget + time.Duration(len(r.Volumes))*a.cfg.Fence.APITimeout.D())
+	a.beat(budget + time.Duration(len(r.Units()))*a.cfg.Fence.APITimeout.D())
 	ctx, cancel := context.WithTimeout(t.op, budget)
 	defer cancel()
 	if h := r.PreHook; h != nil {
@@ -711,7 +720,7 @@ func (t *termState) snapshotRound() string {
 		name = ""
 	}
 	a.m.SetGauge("pagurus_replica_age_seconds", 0)
-	for _, vol := range r.Volumes {
+	for _, vol := range r.Units() {
 		names, err := a.repl.VolumeSnapshots(ctx, a.member, vol)
 		if err != nil {
 			continue

@@ -138,8 +138,8 @@ func main() {
 	api := incus.NewClient(incus.ClientOptions{Socket: cfg.Incus.Socket, URL: cfg.Incus.URL,
 		ClientCert: cfg.Incus.ClientCert, ClientKey: cfg.Incus.ClientKey, ServerCert: cfg.Incus.ServerCert})
 	dopts := incus.Options{ProjectPrefix: cfg.ProjectPrefix, API: api}
-	if cfg.Replicate != nil {
-		dopts.Pool = cfg.Replicate.Pool
+	if cfg.Replicate != nil && len(cfg.Replicate.Volumes) > 0 {
+		dopts.Pool = cfg.Replicate.Pool // none: instances only, no volume calls
 	}
 	drv := incus.New(dopts)
 	rt := &runtime{Driver: drv, Starter: newStarter(cfg, drv)}
@@ -425,7 +425,7 @@ func replicaStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, co
 			pull = fmt.Sprintf("%s from epoch %d, %s ago", rc.Snapshot, rc.SourceEpoch, time.Since(rc.At).Round(time.Second))
 		}
 		var newest, orphans []string
-		for _, v := range cfg.Replicate.Volumes {
+		for _, v := range cfg.Replicate.Units() {
 			names, err := rt.VolumeSnapshots(ctx, m, v)
 			switch n, ok := replica.Newest(names); {
 			case err != nil:
@@ -782,7 +782,12 @@ func targetFor(ctx context.Context, cfg *config.Config, rt *incus.Driver, member
 func cmdProvision(ctx context.Context, cfg *config.Config, api incus.API, dryRun, yes bool) error {
 	var vols provision.Volumes
 	if r := cfg.Replicate; r != nil {
-		vols = provision.Volumes{Pool: r.Pool, Names: r.Volumes}
+		vols = provision.Volumes{Pool: r.Pool, Names: r.Volumes, Instances: r.Instances,
+			Copy: func(ctx context.Context, fromProject, toProject, toMember, name string) error {
+				_, err := incus.Run(ctx, "incus", "copy", name, name, "--project", fromProject, "--target-project", toProject,
+					"--target", toMember, "--stateless", "-c", "boot.autostart=false")
+				return err
+			}}
 	}
 	plan, err := provision.Make(ctx, api, cfg.Service, cfg.ProjectPrefix, cfg.Members, vols)
 	if err != nil {
@@ -793,6 +798,9 @@ func cmdProvision(ctx context.Context, cfg *config.Config, api incus.API, dryRun
 	}
 	for _, a := range plan.Actions {
 		fmt.Println("[new] " + a.Command)
+	}
+	for _, t := range plan.Todo {
+		fmt.Println("[todo] " + t)
 	}
 	if len(plan.Actions) == 0 || dryRun {
 		if dryRun && len(plan.Actions) > 0 {

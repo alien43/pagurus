@@ -56,8 +56,10 @@ func TestDriverVolumes(t *testing.T) {
 	if !slices.Equal(calls, want) {
 		t.Fatalf("CLI calls:\n%s\nwant:\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
 	}
-	if _, err := incus.New(incus.Options{ProjectPrefix: "svc", API: api}).ListVolumes(ctx, "asus"); err == nil {
-		t.Fatal("a driver without a pool listed volumes")
+	// Without a pool (an instances-only service) a volume call is refused;
+	// ListVolumes then lists instances only (TestDriverInstanceUnits).
+	if _, err := incus.New(incus.Options{ProjectPrefix: "svc", API: api}).VolumeSnapshots(ctx, "asus", "data"); err == nil {
+		t.Fatal("a driver without a pool read a volume")
 	}
 }
 
@@ -111,5 +113,56 @@ func TestEnsureVolumeIdmap(t *testing.T) {
 	_, drv = setup(ct("app-1", m1), ct("app-2", "[different]"))
 	if _, err := drv.EnsureVolumeIdmap(ctx, "asus", "data"); err == nil {
 		t.Fatal("containers with different maps: no error")
+	}
+}
+
+// A replicated instance is the unit "instance/<name>": its snapshots go
+// through the instance API, its pull and orphan copy through `incus copy`
+// (stateless, boot.autostart pinned false), and with no pool configured (an
+// instances-only service) no volume call is made at all.
+func TestDriverInstanceUnits(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus", "dell")
+	api.AddInstance("svc-asus", incus.Instance{Name: "vm", Location: "asus", Type: "virtual-machine"})
+	api.AddInstance("svc-dell", incus.Instance{Name: "vm", Location: "dell", Type: "virtual-machine"})
+	var calls []string
+	drv := incus.New(incus.Options{ProjectPrefix: "svc", API: api,
+		RunCLI: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			calls = append(calls, name+" "+strings.Join(args, " "))
+			return nil, nil
+		}})
+	ctx := context.Background()
+	if vs, err := drv.ListVolumes(ctx, "asus"); err != nil || !slices.Equal(vs, []string{"instance/vm"}) {
+		t.Fatalf("ListVolumes = %v, %v; want [instance/vm] with no pool", vs, err)
+	}
+	if err := drv.SnapshotVolume(ctx, "asus", "instance/vm", "pagurus-7-20261026T120000000Z"); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := drv.VolumeSnapshots(ctx, "asus", "instance/vm"); err != nil || !slices.Equal(s, []string{"pagurus-7-20261026T120000000Z"}) {
+		t.Fatalf("VolumeSnapshots = %v, %v", s, err)
+	}
+	if s, _ := drv.VolumeSnapshots(ctx, "dell", "instance/vm"); len(s) != 0 {
+		t.Fatalf("dell's vm lists asus's snapshot: %v", s)
+	}
+	if err := drv.DeleteVolumeSnapshot(ctx, "asus", "instance/vm", "pagurus-7-20261026T120000000Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := drv.VolumeSnapshots(ctx, "asus", "instance/nope"); !incus.IsNotFound(err) {
+		t.Fatalf("a missing instance: err %v, want not found", err)
+	}
+	if err := drv.RefreshVolume(ctx, "asus", "dell", "instance/vm"); err != nil {
+		t.Fatal(err)
+	}
+	if err := drv.CopyVolume(ctx, "dell", "instance/vm", "instance/vm-orphaned-7-20261026T120000000Z"); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := drv.EnsureVolumeIdmap(ctx, "dell", "instance/vm"); err != nil || s != "" {
+		t.Fatalf("EnsureVolumeIdmap on an instance = %q, %v; want a no-op", s, err)
+	}
+	want := []string{
+		"incus copy vm vm --project svc-asus --target-project svc-dell --refresh --stateless -c boot.autostart=false",
+		"incus copy vm vm-orphaned-7-20261026T120000000Z --project svc-dell --target dell --stateless -c boot.autostart=false",
+	}
+	if !slices.Equal(calls, want) {
+		t.Fatalf("CLI calls:\n%s\nwant:\n%s", strings.Join(calls, "\n"), strings.Join(want, "\n"))
 	}
 }

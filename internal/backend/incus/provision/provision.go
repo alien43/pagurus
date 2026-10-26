@@ -54,13 +54,22 @@ type Action struct {
 type Plan struct {
 	Actions []Action
 	OK      []string
+	// Todo is what provisioning cannot do and an operator must, before a
+	// second run finishes the job (a replicated instance no member has yet).
+	Todo []string
 }
 
 // Volumes are the replicated custom volumes to create, on Pool (none for a
-// service without replication).
+// service without replication), and the replicated instances to seed.
 type Volumes struct {
 	Pool  string
 	Names []string
+	// Instances must exist in at least one member's project already (made by
+	// an operator); each member that lacks one gets a stopped copy of it
+	// with boot.autostart=false, from the first member in order that has it.
+	// An existing one is never touched. Copy runs the copy (`incus copy`).
+	Instances []string
+	Copy      func(ctx context.Context, fromProject, toProject, toMember, name string) error
 }
 
 // Make plans provisioning of projectPrefix-<member> for members. It returns an
@@ -131,7 +140,56 @@ func Make(ctx context.Context, api incus.API, service, projectPrefix string, mem
 			return nil, err
 		}
 	}
+	if err := planInstances(ctx, api, p, projectPrefix, members, vols); err != nil {
+		return nil, err
+	}
 	return p, nil
+}
+
+// planInstances seeds each replicated instance on the members that lack it,
+// copied from the first member in order that has it. It runs after the
+// projects are planned: a new project has no instances.
+func planInstances(ctx context.Context, api incus.API, p *Plan, projectPrefix string, members []string, vols Volumes) error {
+	if len(vols.Instances) == 0 {
+		return nil
+	}
+	have := map[string][]string{} // member -> instance names
+	for _, m := range members {
+		insts, err := api.Instances(ctx, projectPrefix+"-"+m)
+		if err != nil && !incus.IsNotFound(err) {
+			return fmt.Errorf("instances of %s-%s: %w", projectPrefix, m, err)
+		}
+		for _, in := range insts {
+			have[m] = append(have[m], in.Name)
+		}
+	}
+	for _, name := range vols.Instances {
+		src := slices.IndexFunc(members, func(m string) bool { return slices.Contains(have[m], name) })
+		if src < 0 {
+			// The projects may be created by this very run: say what to do
+			// next rather than refuse the plan.
+			p.Todo = append(p.Todo, fmt.Sprintf("replicated instance %s exists in no member's project: create it in one (stopped, boot.autostart=false), then run provision again to copy it to the others", name))
+			continue
+		}
+		from := projectPrefix + "-" + members[src]
+		for _, m := range members {
+			project := projectPrefix + "-" + m
+			if slices.Contains(have[m], name) {
+				p.OK = append(p.OK, fmt.Sprintf("instance %s in %s", name, project))
+				continue
+			}
+			if vols.Copy == nil {
+				return fmt.Errorf("instance %s: %s lacks it and this provisioner cannot copy instances", name, project)
+			}
+			to, member, n := project, m, name
+			p.Actions = append(p.Actions, Action{
+				Command: fmt.Sprintf("incus copy %s %s --project %s --target-project %s --target %s --stateless -c boot.autostart=false", n, n, from, to, member),
+				apply: func(ctx context.Context, api incus.API) error {
+					return vols.Copy(ctx, from, to, member, n)
+				}})
+		}
+	}
+	return nil
 }
 
 // planMarker marks an existing project with ServiceKey and drops oldMarker.

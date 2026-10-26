@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/alien43/pagurus/internal/backend"
 	"github.com/alien43/pagurus/internal/fence"
 	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -240,6 +241,11 @@ type Replicate struct {
 	Pool string `json:"pool"`
 	// Volumes are custom volumes of the same name in every member's project.
 	Volumes []string `json:"volumes"`
+	// Instances are whole instances (root disk and config, a VM's included)
+	// of the same name in every member's project, replicated by the same
+	// rules as Volumes. Only with start.kind=instances, each one in
+	// start.names; `pagurus provision` seeds the copies.
+	Instances []string `json:"instances,omitempty"`
 	// Interval: the leader snapshots every volume this often; it bounds the
 	// data lost when the leader dies unreachable (plus one copy time).
 	Interval Duration `json:"interval"`
@@ -255,6 +261,20 @@ type Replicate struct {
 	// before each snapshot (an application-consistent point).
 	PreHook *Hook `json:"pre_hook,omitempty"`
 }
+
+// Units are the replicated units in the order they are snapshotted and
+// pulled: the volumes, then the instances as backend.InstanceUnit names.
+func (r *Replicate) Units() []string {
+	out := slices.Clone(r.Volumes)
+	for _, n := range r.Instances {
+		out = append(out, backend.InstanceUnit(n))
+	}
+	return out
+}
+
+// maxReplicatedInstance leaves 43 of Incus's 63-character instance names for
+// a rule 4 orphan's "-orphaned-<epoch>-<UTC>" (37 with a 7-digit epoch).
+const maxReplicatedInstance = 20
 
 // Hook is a command run inside an instance.
 type Hook struct {
@@ -309,10 +329,17 @@ type Config struct {
 	Etcd       Etcd      `json:"etcd"`
 	Lease      Lease     `json:"lease"`
 	SelfFence  SelfFence `json:"self_fence"`
-	Fences     Fences    `json:"fences"`
-	Fence      Fence     `json:"fence"`
-	Health     Health    `json:"health"`
-	Watchdog   Watchdog  `json:"watchdog"`
+	// StopTimeout: a planned release (move, unhealthy give-up, agent
+	// shutdown) asks the workload to shut down cleanly for this long before
+	// forcing it. A VM guest needs its own shutdown time (Home Assistant OS:
+	// ~47 s); the fences' budgets are for a member that lost its lease and
+	// stay short. The agent's systemd TimeoutStopSec must exceed it plus the
+	// drain (30 s).
+	StopTimeout Duration `json:"stop_timeout"`
+	Fences      Fences   `json:"fences"`
+	Fence       Fence    `json:"fence"`
+	Health      Health   `json:"health"`
+	Watchdog    Watchdog `json:"watchdog"`
 	// Replicate, if set, replicates the service's volumes (opt-in).
 	Replicate *Replicate `json:"replicate,omitempty"`
 
@@ -383,6 +410,7 @@ func (c *Config) applyDefaults() {
 		c.StateDir = "/run/pagurus"
 	}
 	def(&c.Grace, 10*time.Second)
+	def(&c.StopTimeout, 5*time.Second)
 	def(&c.EligibleInterval, 5*time.Second)
 	def(&c.AuditInterval, 30*time.Second)
 	def(&c.Etcd.DialTimeout, 3*time.Second)
@@ -590,8 +618,8 @@ func (c *Config) Validate() error {
 		if r.Pool == "" {
 			bad("replicate.pool: required")
 		}
-		if len(r.Volumes) == 0 {
-			bad("replicate.volumes: at least one volume (omit the replicate block to replicate nothing)")
+		if len(r.Volumes) == 0 && len(r.Instances) == 0 {
+			bad("replicate.volumes: at least one volume or instance (omit the replicate block to replicate nothing)")
 		}
 		vs := map[string]bool{}
 		for _, v := range r.Volumes {
@@ -602,6 +630,25 @@ func (c *Config) Validate() error {
 				bad("replicate.volumes: %q listed twice", v)
 			}
 			vs[v] = true
+		}
+		is := map[string]bool{}
+		for _, n := range r.Instances {
+			if !nameRE.MatchString(n) {
+				bad("replicate.instances: %q must match %s", n, nameRE)
+			}
+			if len(n) > maxReplicatedInstance {
+				bad("replicate.instances: %q is longer than %d characters: its rule 4 orphan, <name>-orphaned-<epoch>-<UTC>, must fit Incus's 63", n, maxReplicatedInstance)
+			}
+			if is[n] {
+				bad("replicate.instances: %q listed twice", n)
+			}
+			is[n] = true
+			// Compose recreates its instances on every start, which would
+			// destroy the replica; and the instances starter with no names
+			// starts every instance in the project, a kept orphan included.
+			if c.Start.Kind != "instances" || !slices.Contains(c.Start.Names, n) {
+				bad("replicate.instances: %q needs start.kind=instances with %q in start.names", n, n)
+			}
 		}
 		if r.Interval <= 0 || r.CatchupTimeout <= 0 {
 			bad("replicate.interval and replicate.catchup_timeout must be > 0")

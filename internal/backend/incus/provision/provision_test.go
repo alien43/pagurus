@@ -2,9 +2,12 @@ package provision_test
 
 import (
 	"context"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/alien43/pagurus/internal/backend/incus"
 	"github.com/alien43/pagurus/internal/backend/incus/provision"
 	"github.com/alien43/pagurus/internal/fence/fencetest"
 )
@@ -154,5 +157,43 @@ func TestServiceMarker(t *testing.T) {
 	}
 	if _, err := provision.Make(ctx, api, "other", "svc", []string{"asus"}, provision.Volumes{}); err == nil || !strings.Contains(err.Error(), "Not changing it") {
 		t.Fatalf("a project of another service: %v", err)
+	}
+}
+
+// Replicated instances: a member that lacks one gets a stopped copy from the
+// first member that has it; an existing one is left alone; none anywhere is
+// a to-do for the operator (provision never creates the workload itself).
+func TestReplicatedInstancesSeeded(t *testing.T) {
+	api := fencetest.NewFakeIncus("asus", "dell", "rpi5")
+	for _, m := range []string{"asus", "dell", "rpi5"} {
+		api.Projects["svc-"+m] = map[string]string{"restricted.cluster.groups": "host-" + m}
+	}
+	api.AddInstance("svc-dell", incus.Instance{Name: "vm", Location: "dell", Type: "virtual-machine"})
+	var copies []string
+	vols := provision.Volumes{Instances: []string{"vm"},
+		Copy: func(_ context.Context, from, to, member, name string) error {
+			copies = append(copies, fmt.Sprintf("%s %s->%s on %s", name, from, to, member))
+			api.AddInstance(to, incus.Instance{Name: name, Location: member, Type: "virtual-machine"})
+			return nil
+		}}
+	p, err := provision.Make(ctx, api, "svc", "svc", []string{"asus", "dell", "rpi5"}, vols)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Apply(ctx, api); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"vm svc-dell->svc-asus on asus", "vm svc-dell->svc-rpi5 on rpi5"}
+	if !slices.Equal(copies, want) {
+		t.Fatalf("copies %v, want %v", copies, want)
+	}
+	again, err := provision.Make(ctx, api, "svc", "svc", []string{"asus", "dell", "rpi5"}, vols)
+	if err != nil || len(again.Actions) != 0 {
+		t.Fatalf("second run: %d actions, err %v", len(again.Actions), err)
+	}
+	// One that exists nowhere: the rest of the plan stands, plus a to-do.
+	ghost, err := provision.Make(ctx, api, "svc", "svc", []string{"asus"}, provision.Volumes{Instances: []string{"ghost"}, Copy: vols.Copy})
+	if err != nil || len(ghost.Actions) != 0 || len(ghost.Todo) != 1 || !strings.Contains(ghost.Todo[0], "ghost") {
+		t.Fatalf("an instance that exists nowhere: actions %v, todo %v, err %v", ghost.Actions, ghost.Todo, err)
 	}
 }

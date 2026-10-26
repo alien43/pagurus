@@ -53,6 +53,12 @@ type API interface {
 	// (volatile keys included, e.g. volatile.idmap.last).
 	VolumeConfig(ctx context.Context, project, pool, member, vol string) (map[string]string, error)
 	SetVolumeConfig(ctx context.Context, project, pool, member, vol, key, value string) error
+
+	// Instance snapshots (replicated instances). A missing instance is
+	// reported with IsNotFound.
+	InstanceSnapshots(ctx context.Context, project, name string) ([]string, error)
+	CreateInstanceSnapshot(ctx context.Context, project, name, snap string) error
+	DeleteInstanceSnapshot(ctx context.Context, project, name, snap string) error
 }
 
 // Address is one address of an instance interface.
@@ -274,6 +280,40 @@ func (c *Client) Stop(ctx context.Context, project, name string, timeout time.Du
 
 func (c *Client) Start(ctx context.Context, project, name string) error {
 	return c.state(ctx, project, name, api.InstanceStatePut{Action: "start"})
+}
+
+func (c *Client) InstanceSnapshots(ctx context.Context, project, name string) ([]string, error) {
+	s, err := c.project(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetInstanceSnapshotNames(name)
+}
+
+// CreateInstanceSnapshot takes a disk-only snapshot (not stateful): of a
+// running VM too, crash-consistent, as standby-sync's hourly ones of asus-haos.
+func (c *Client) CreateInstanceSnapshot(ctx context.Context, project, name, snap string) error {
+	s, err := c.project(ctx, project)
+	if err != nil {
+		return err
+	}
+	op, err := s.CreateInstanceSnapshot(name, api.InstanceSnapshotsPost{Name: snap})
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
+}
+
+func (c *Client) DeleteInstanceSnapshot(ctx context.Context, project, name, snap string) error {
+	s, err := c.project(ctx, project)
+	if err != nil {
+		return err
+	}
+	op, err := s.DeleteInstanceSnapshot(name, snap)
+	if err != nil {
+		return err
+	}
+	return op.WaitContext(ctx)
 }
 
 // IsNotFound reports an Incus 404.

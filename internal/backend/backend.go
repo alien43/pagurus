@@ -3,7 +3,10 @@
 // implementation of every seam is internal/backend/incus.
 package backend
 
-import "errors"
+import (
+	"errors"
+	"strings"
+)
 
 // ErrAPIUnavailable marks a read the backend's API did not answer in time,
 // or refused to connect for: the daemon is stalled or down, so the answer
@@ -44,4 +47,20 @@ func Running(insts []Instance) []string {
 		}
 	}
 	return out
+}
+
+// instancePrefix marks an instance among replica units (a replicated custom
+// volume's name or an instance). Volume names cannot contain "/".
+const instancePrefix = "instance/"
+
+// InstanceUnit is the replica unit of instance name.
+func InstanceUnit(name string) string { return instancePrefix + name }
+
+// ParseUnit splits a replica unit: an instance's name and true, or the
+// volume's name and false.
+func ParseUnit(u string) (string, bool) {
+	if n, ok := strings.CutPrefix(u, instancePrefix); ok {
+		return n, true
+	}
+	return u, false
 }

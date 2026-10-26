@@ -452,15 +452,43 @@ func (d *Driver) CheckCgroup2() error {
 	return nil
 }
 
-// StartInstances starts the named instances of member's project.
+// StartInstances starts the named instances of member's project. A start
+// refused because another operation holds the instance is retried every
+// BusyRetry until ctx ends: a follower pulling a replicated instance (`incus
+// copy --refresh`) holds the source busy, so a leader's restart in place
+// during a pull failed and gave the office up (VM lab, 2026-10-26).
 func (d *Driver) StartInstances(ctx context.Context, member string, names []string) error {
 	var errs []error
 	for _, n := range names {
-		if err := d.o.API.Start(ctx, d.Project(member), n); err != nil {
-			errs = append(errs, fmt.Errorf("start %s/%s: %w", d.Project(member), n, err))
+		for {
+			err := d.o.API.Start(ctx, d.Project(member), n)
+			if err == nil {
+				break
+			}
+			if !isBusy(err) || !sleepCtx(ctx, BusyRetry) {
+				errs = append(errs, fmt.Errorf("start %s/%s: %w", d.Project(member), n, err))
+				break
+			}
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// BusyRetry paces StartInstances' retries of a busy instance.
+var BusyRetry = 2 * time.Second
+
+// isBusy: Incus refused because another operation runs on the instance.
+func isBusy(err error) bool { return strings.Contains(err.Error(), "Instance is busy running") }
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
 
 // ServerVersion is the Incus server's version.

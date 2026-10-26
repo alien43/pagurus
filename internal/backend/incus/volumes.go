@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
+	"github.com/alien43/pagurus/internal/backend"
 )
 
-// Replication (agent.Volumes): custom volumes on Options.Pool, in member's
-// project, on member. Snapshots go through the API; copies and exec through
-// the incus CLI, as standby-sync runs them (proven live since 2026-09), with
-// the source and destination members always named: the pool is
-// member-local, and without --target the CLI looks for the volume on the
+// Replication (agent.Replicator): custom volumes on Options.Pool, in member's
+// project, on member; and whole instances in member's project, as replica
+// units backend.InstanceUnit(name). Snapshots go through the API; copies and
+// exec through the incus CLI, as standby-sync runs them (proven live since
+// 2026-09), with the source and destination members always named: the pool
+// is member-local, and without --target the CLI looks for the volume on the
 // member it talks to.
 
 func (d *Driver) pool() (string, error) {
@@ -22,6 +25,9 @@ func (d *Driver) pool() (string, error) {
 
 // VolumeSnapshots lists the snapshot names of vol in member's project.
 func (d *Driver) VolumeSnapshots(ctx context.Context, member, vol string) ([]string, error) {
+	if name, ok := backend.ParseUnit(vol); ok {
+		return d.o.API.InstanceSnapshots(ctx, d.Project(member), name)
+	}
 	p, err := d.pool()
 	if err != nil {
 		return nil, err
@@ -30,6 +36,9 @@ func (d *Driver) VolumeSnapshots(ctx context.Context, member, vol string) ([]str
 }
 
 func (d *Driver) SnapshotVolume(ctx context.Context, member, vol, snap string) error {
+	if name, ok := backend.ParseUnit(vol); ok {
+		return d.o.API.CreateInstanceSnapshot(ctx, d.Project(member), name, snap)
+	}
 	p, err := d.pool()
 	if err != nil {
 		return err
@@ -38,6 +47,9 @@ func (d *Driver) SnapshotVolume(ctx context.Context, member, vol, snap string) e
 }
 
 func (d *Driver) DeleteVolumeSnapshot(ctx context.Context, member, vol, snap string) error {
+	if name, ok := backend.ParseUnit(vol); ok {
+		return d.o.API.DeleteInstanceSnapshot(ctx, d.Project(member), name, snap)
+	}
 	p, err := d.pool()
 	if err != nil {
 		return err
@@ -45,20 +57,44 @@ func (d *Driver) DeleteVolumeSnapshot(ctx context.Context, member, vol, snap str
 	return d.o.API.DeleteVolumeSnapshot(ctx, d.Project(member), p, member, vol, snap)
 }
 
-// ListVolumes lists the custom volumes in member's project on member.
+// ListVolumes lists the replica units in member's project: the custom
+// volumes on member (none without a pool: a service that replicates
+// instances only), then the instances as backend.InstanceUnit names.
 func (d *Driver) ListVolumes(ctx context.Context, member string) ([]string, error) {
-	p, err := d.pool()
+	var out []string
+	if d.o.Pool != "" {
+		vs, err := d.o.API.Volumes(ctx, d.Project(member), d.o.Pool, member)
+		if err != nil {
+			return nil, err
+		}
+		out = vs
+	}
+	insts, err := d.o.API.Instances(ctx, d.Project(member))
 	if err != nil {
 		return nil, err
 	}
-	return d.o.API.Volumes(ctx, d.Project(member), p, member)
+	for _, in := range insts {
+		out = append(out, backend.InstanceUnit(in.Name))
+	}
+	return out, nil
 }
 
 // RefreshVolume pulls vol from from's project into to's: `incus storage
 // volume copy --refresh` (an incremental ZFS send; a forced receive on the
 // target, tasks/results/pagurus-replica-spike.md). Cancelling ctx kills the
 // CLI.
+//
+// An instance is pulled with `incus copy --refresh --stateless` (of a running
+// VM too, as standby-sync's asus-haos copy), boot.autostart pinned "false" on
+// the copy: the instances starter requires it, and a copy that started at
+// the host's boot would be a second running one. It needs the target to
+// exist (`pagurus provision` seeds it), so the CLI places it by its location.
 func (d *Driver) RefreshVolume(ctx context.Context, from, to, vol string) error {
+	if name, ok := backend.ParseUnit(vol); ok {
+		_, err := d.o.RunCLI(ctx, "incus", "copy", name, name, "--project", d.Project(from),
+			"--target-project", d.Project(to), "--refresh", "--stateless", "-c", "boot.autostart=false")
+		return err
+	}
 	p, err := d.pool()
 	if err != nil {
 		return err
@@ -70,7 +106,15 @@ func (d *Driver) RefreshVolume(ctx context.Context, from, to, vol string) error 
 }
 
 // CopyVolume copies vol to a new volume dst in member's project, on member.
+// An instance's copy (a rule 4 orphan) is stopped, with boot.autostart
+// "false"; the instances starter only starts the names it is given.
 func (d *Driver) CopyVolume(ctx context.Context, member, vol, dst string) error {
+	if name, ok := backend.ParseUnit(vol); ok {
+		dname, _ := backend.ParseUnit(dst)
+		_, err := d.o.RunCLI(ctx, "incus", "copy", name, dname, "--project", d.Project(member),
+			"--target", member, "--stateless", "-c", "boot.autostart=false")
+		return err
+	}
 	p, err := d.pool()
 	if err != nil {
 		return err
@@ -103,6 +147,9 @@ const IdmapLastKey = "volatile.idmap.last"
 // instances exist (Prepare) and before they start. No container (VMs only):
 // nothing to stamp. Containers with different maps: an error, for a human.
 func (d *Driver) EnsureVolumeIdmap(ctx context.Context, member, vol string) (string, error) {
+	if _, ok := backend.ParseUnit(vol); ok {
+		return "", nil // an instance's root disk is its own
+	}
 	p, err := d.pool()
 	if err != nil {
 		return "", err

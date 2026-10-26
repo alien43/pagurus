@@ -106,6 +106,34 @@ differ by the seconds between two pulls. An application that needs its volumes f
 - a pending `accept-stale`;
 - per member: the last epoch it led, its last pull, its newest snapshot's age, and its orphans.
 
+## Instances
+
+A service started by the instances starter can replicate whole instances: a VM whose state lives on
+its own root disk (Home Assistant OS partitions it itself) can't move its data to a custom volume.
+
+```json
+"start": {"kind": "instances", "names": ["vm"]},
+"replicate": {"instances": ["vm"], "interval": "2m", "max_staleness": "30m"},
+"fences": {"self": [{"kind": "incus-stop", "budget": "4s"}, {"kind": "qemu-kill", "budget": "3s"}]}
+```
+
+An instance is one more unit next to the volumes, under every rule above. A round is an instance
+snapshot (disk only, `pagurus-<epoch>-<UTC>`; Incus's own scheduled snapshots are neither counted
+nor pruned, though they travel with a copy). A pull is `incus copy --refresh --stateless`, with
+`boot.autostart=false` pinned on the copy. A rule 4 orphan is a stopped instance
+`<name>-orphaned-<epoch>-<UTC>`, so the name is capped at 20 characters. The starter never starts it:
+every replicated instance must be in `start.names`, and `compose` is refused (it recreates its
+instances). The instance must exist in every member's project: make it in one (stopped,
+`boot.autostart=false`) and `pagurus provision` copies it to the others.
+
+**The MAC.** A plain `incus copy` gives the copy a new `volatile.eth0.hwaddr`; a `--refresh` carries
+the source's (Incus 7.5.1, measured). So from the first pull on, every member's copy answers on the
+leader's MAC (and, with DHCP by MAC, its address). Before the first pull, a provisioned copy has
+its own: pin `hwaddr` on the NIC device if even that first window matters.
+
+Measured on a 512 MiB Alpine VM, asus ↔ dell: first copy 7 s; a handover round 7–8 s; the `-final`
+catch-up ~10 s; a planned move about 25 s end to end, the guest's marker file intact.
+
 **Bandwidth.** A pull is a ZFS send from the leader's member. Uncapped, it fills the link that etcd
 shares, so every member that can lead needs an egress cap toward the others. That is outside
 pagurus.

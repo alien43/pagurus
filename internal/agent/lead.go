@@ -113,10 +113,13 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 func (a *Agent) release(epoch int64, lease clientv3.LeaseID, reason string, backoff time.Duration, drain bool, log *slog.Logger) bool {
 	log.Info("releasing the office", "reason", reason, "backoff", backoff)
 	bg := context.Background()
-	// The self-fence chain's budget (fences.self or the old self_fence), and
-	// never less than the 5 s graceful stop plus the forced stop after it.
-	sctx, cancel := context.WithTimeout(bg, max(a.cfg.SelfFenceLead(), 4*time.Second)+5*time.Second)
-	err := a.site.Stop(sctx, a.member, 5*time.Second)
+	// The graceful stop (stop_timeout, 5 s by default), then the forced stop
+	// within the self-fence chain's budget (fences.self or the old
+	// self_fence), never less than 4 s.
+	budget := max(a.cfg.SelfFenceLead(), 4*time.Second) + a.cfg.StopTimeout.D()
+	a.beat(budget + a.cfg.Fence.APITimeout.D())
+	sctx, cancel := context.WithTimeout(bg, budget)
+	err := a.site.Stop(sctx, a.member, a.cfg.StopTimeout.D())
 	cancel()
 	running, lerr := a.observer.LocalRunning(a.member)
 	ok := err == nil && lerr == nil && len(running) == 0
