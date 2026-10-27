@@ -1,5 +1,9 @@
 # pagurus — one copy of a service, failing over across an Incus cluster
 
+[![Go Test Status](https://github.com/alien43/pagurus/actions/workflows/test.yml/badge.svg)](https://github.com/alien43/pagurus/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/alien43/pagurus.svg)](https://pkg.go.dev/github.com/alien43/pagurus)
+[![codecov](https://codecov.io/gh/alien43/pagurus/graph/badge.svg)](https://codecov.io/gh/alien43/pagurus)
+
 A hermit crab lives in one shell at a time and moves when it has to. `pagurus` keeps a container
 workload (an incus-compose stack, or plain Incus containers) running on **at most one** member of an
 Incus cluster at any instant, and on **some** member whenever a quorum is up. When the member
