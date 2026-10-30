@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.2
 
 - Whole-instance replication: `replicate.instances` replicates instances (root disk, config and
   devices, a VM's included) under the same rules as volumes (rounds, catch-up, staleness gate,
@@ -9,6 +9,12 @@
   before. See docs/02_replication.md § Instances.
 - `provision` no longer refuses a plan whose replicated instance exists nowhere yet: it creates the
   projects and prints a `[todo]`.
+- `stop_timeout` (default 5 s): how long a planned release (move, unhealthy give-up, agent
+  shutdown) lets the workload shut down cleanly before forcing it. It used to be a fixed 5 s, a
+  power cut for a VM guest. The agent's systemd `TimeoutStopSec` must exceed it plus the 30 s drain.
+- The instances starter retries a busy start every 2 s within the start's bound. A follower pulling
+  a replicated instance holds the source busy, and a restart in place used to fail and give the
+  office up.
 - Fix: a term that started while the follow loop was deciding to withdraw was ended at once ("not
   eligible: local instances not confirmed stopped" right after "won the office"; 12 times in 7
   days on one cluster). A withdrawal now never signals conch once a term has begun.
