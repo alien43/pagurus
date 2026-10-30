@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.1.3
+
+- `pagurus-term`: conch's child for a term is now its own binary, linking only the standard
+  library (`internal/termshim`). One runs per leading service, and as `pagurus term` each paid
+  for the big binary's package init()s (grpc, etcd client, zap, incus): ~3.3 MB of anon per
+  process. Install it next to `pagurus` (the release ships `pagurus-term-linux-<arch>`). The
+  agent runs it from the directory of its own executable; when it is missing, the agent logs a
+  warning ("falling back") and runs `pagurus term`, which stays as an alias. Behaviour and exit
+  codes are unchanged.
 ## v0.1.2
 
 - Whole-instance replication: `replicate.instances` replicates instances (root disk, config and

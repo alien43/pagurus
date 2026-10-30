@@ -17,6 +17,8 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/alien43/pagurus/internal/termshim"
 )
 
 // ------------------------------------------------------------------ conch --
@@ -303,17 +305,6 @@ func (r *notifyRelay) Close() {
 
 // ------------------------------------------------------------------ terms --
 
-// termHello is what `pagurus term` sends: conch's view of the term it won.
-type termHello struct {
-	Rev   int64  `json:"rev"`
-	Lease string `json:"lease"` // hex, as CONCH_LEASE
-	PID   int    `json:"pid"`
-}
-
-type termBye struct {
-	Exit int `json:"exit"`
-}
-
 type termServer struct{ ln net.Listener }
 
 func (s *termServer) Close() { _ = s.ln.Close() }
@@ -348,7 +339,7 @@ func (a *Agent) serveTerm(ctx context.Context, c net.Conn) {
 	_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
 	line, err := rd.ReadBytes('\n')
 	_ = c.SetReadDeadline(time.Time{})
-	var h termHello
+	var h termshim.Hello
 	if err != nil || json.Unmarshal(line, &h) != nil || h.Rev <= 0 {
 		a.log.Error("bad term handshake", "err", err)
 		return
@@ -388,41 +379,6 @@ func (a *Agent) serveTerm(ctx context.Context, c net.Conn) {
 	}()
 
 	code := a.lead(ctx, lost, h.Rev, clientv3.LeaseID(lease))
-	b, _ := json.Marshal(termBye{Exit: code})
+	b, _ := json.Marshal(termshim.Bye{Exit: code})
 	_, _ = c.Write(append(b, '\n'))
-}
-
-// RunTermShim is `pagurus term --socket PATH`: conch's child for a term. It
-// hands conch's term (CONCH_REV, CONCH_LEASE) to the agent and exits with
-// the code the agent gives back. It exits early if conch dies.
-func RunTermShim(socket string) int {
-	rev, err := strconv.ParseInt(os.Getenv("CONCH_REV"), 10, 64)
-	if err != nil || os.Getenv("CONCH_LEASE") == "" {
-		fmt.Fprintln(os.Stderr, "pagurus term: run by conch elect (CONCH_REV, CONCH_LEASE unset)")
-		return 64
-	}
-	c, err := net.Dial("unix", socket)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "pagurus term:", err)
-		return 69
-	}
-	defer c.Close()
-	b, _ := json.Marshal(termHello{Rev: rev, Lease: os.Getenv("CONCH_LEASE"), PID: os.Getpid()})
-	if _, err := c.Write(append(b, '\n')); err != nil {
-		return 69
-	}
-	parent := os.Getppid()
-	go func() { // conch gone (killed outright): drop the term
-		for range time.Tick(500 * time.Millisecond) {
-			if os.Getppid() != parent {
-				os.Exit(70)
-			}
-		}
-	}()
-	line, err := bufio.NewReader(c).ReadBytes('\n')
-	var bye termBye
-	if err != nil || json.Unmarshal(line, &bye) != nil {
-		return 70
-	}
-	return bye.Exit
 }

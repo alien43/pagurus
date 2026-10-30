@@ -33,10 +33,12 @@ a service opts into replication (`02_replication.md`).
 One systemd unit per service and host runs the pagurus daemon (the unit's main process). The
 daemon keeps the local ground truth, and while this member is eligible it runs
 `conch elect <office> --fence 'pagurus fence-self …' --watchdog --campaign-after <rank × grace>
--- pagurus term`. conch ([`docs/03_elect.md`](https://github.com/alien43/conch/blob/main/docs/03_elect.md)) owns the election, the lease, the lease's
+-- pagurus-term`. conch ([`docs/03_elect.md`](https://github.com/alien43/conch/blob/main/docs/03_elect.md)) owns the election, the lease, the lease's
 local validity bound, the fence before expiry, and the watchdog fitness of a term. When conch
-wins, its child `pagurus term` hands the term (CONCH_REV, CONCH_LEASE) back to the daemon over a
-unix socket, and the daemon runs it in-process.
+wins, its child `pagurus-term` hands the term (CONCH_REV, CONCH_LEASE) back to the daemon over a
+unix socket, and the daemon runs it in-process. `pagurus-term` is a separate binary that links only
+the standard library (one runs per leading service, so its size counts); install it next to
+`pagurus`. Without it the daemon warns and runs `pagurus term`, the same code in the big binary.
 
 - **Watchdog.** conch is given `NOTIFY_SOCKET` pointing at a relay in the daemon. The daemon is
   the only process that pets systemd (`NotifyAccess=main`). While conch runs, the daemon pets

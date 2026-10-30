@@ -46,6 +46,8 @@ bin=$(mktemp -d)
 trap 'rm -rf "$bin"' EXIT
 if [ -n "${PAGURUS_BIN:-}" ]; then cp "$PAGURUS_BIN" "$bin/pagurus"; else
   log "building pagurus"; CGO_ENABLED=0 go build -o "$bin/pagurus" ./cmd/pagurus; fi
+if [ -n "${PAGURUS_TERM_BIN:-}" ]; then cp "$PAGURUS_TERM_BIN" "$bin/pagurus-term"; else
+  CGO_ENABLED=0 go build -o "$bin/pagurus-term" ./cmd/pagurus-term; fi
 if [ -n "${CONCH_BIN:-}" ]; then cp "$CONCH_BIN" "$bin/conch"; else
   log "building conch (the version pinned in go.mod)"; CGO_ENABLED=0 go build -o "$bin/conch" github.com/alien43/conch/cmd/conch; fi
 
@@ -74,7 +76,7 @@ setup_member() {
     curl -fsSL https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-$goarch.tar.gz | tar -xz -C /usr/local/bin --strip-components=1 etcd-$ETCD_VERSION-linux-$goarch/etcd etcd-$ETCD_VERSION-linux-$goarch/etcdctl
     v=${INCUS_COMPOSE_VERSION#v}
     curl -fsSL https://github.com/lxc/incus-compose/releases/download/$INCUS_COMPOSE_VERSION/incus-compose_\${v}_linux_$goarch.tar.gz | tar -xz -C /usr/local/bin incus-compose"
-  incus file push "$bin/pagurus" "$bin/conch" "$m/usr/local/bin/" --mode 0755
+  incus file push "$bin/pagurus-term" "$bin/pagurus" "$bin/conch" "$m/usr/local/bin/" --mode 0755
 }
 for m in "${members[@]}"; do log "installing on $m (incus, etcd $ETCD_VERSION, incus-compose $INCUS_COMPOSE_VERSION, pagurus, conch)"; setup_member "$m" & done
 wait

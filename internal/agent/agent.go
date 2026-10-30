@@ -193,8 +193,8 @@ type Options struct {
 	// Conch is the conch argv prefix (default: config conch.path).
 	Conch []string
 	// FenceCmd runs this member's self chain: `pagurus fence-self -c <cfg>`;
-	// the agent appends --member <member>. TermCmd is `pagurus term
-	// --socket`; the agent appends the socket path.
+	// the agent appends --member <member>. TermCmd is `pagurus-term
+	// --socket` (or `pagurus term --socket`); the agent appends the socket path.
 	FenceCmd, TermCmd []string
 	// ProcOutput receives conch's (and its children's) output (default stderr).
 	ProcOutput io.Writer

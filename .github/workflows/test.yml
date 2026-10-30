@@ -29,7 +29,7 @@ jobs:
         run: go vet ./...
 
       - name: Build
-        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o pagurus ./cmd/pagurus
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o . ./cmd/pagurus ./cmd/pagurus-term
 
       - name: Run unit, integration and simulation tests (race)
         run: go test -race -timeout 30m ./...

@@ -33,6 +33,7 @@ import (
 	"github.com/alien43/pagurus/internal/fence"
 	"github.com/alien43/pagurus/internal/metrics"
 	"github.com/alien43/pagurus/internal/replica"
+	"github.com/alien43/pagurus/internal/termshim"
 	"github.com/alien43/pagurus/internal/versions"
 	"github.com/alien43/pagurus/internal/watchdog"
 )
@@ -76,7 +77,9 @@ run by conch (the agent passes these to ` + "`conch elect`" + `; not for operato
   fence-self  this member's self chain, as conch's --fence:
               pagurus fence-self -c cfg --member <member>
   term        conch's child while it holds the office; hands the term to
-              the agent: pagurus term --socket <path>
+              the agent: pagurus term --socket <path>. The agent runs the
+              sibling pagurus-term binary (the same code, stdlib only, a
+              smaller process) and falls back to this when it is missing
 `
 
 func main() {
@@ -89,7 +92,7 @@ func main() {
 		tfs := flag.NewFlagSet(cmd, flag.ExitOnError)
 		sock := tfs.String("socket", "", "the agent's term socket")
 		_ = tfs.Parse(args)
-		os.Exit(agent.RunTermShim(*sock))
+		os.Exit(termshim.Run(*sock))
 	}
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	cfgPath := fs.String("c", "", "config file")
@@ -271,7 +274,7 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backe
 	}
 	ms := metrics.New(cfg.Service, self)
 	a := agent.New(agent.Options{Config: cfg, Backend: be, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log),
-		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: []string{exe, "term", "--socket"}, Metrics: ms,
+		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: termCmd(exe, log), Metrics: ms,
 		StartLock: filepath.Join(cfg.StateDir, "start.lock")})
 	if metricsAddr != "" {
 		mux := http.NewServeMux()
@@ -824,6 +827,17 @@ func cmdProvision(ctx context.Context, cfg *config.Config, api incus.API, dryRun
 	}
 	fmt.Printf("applied %d change(s)\n", len(plan.Actions))
 	return nil
+}
+
+// termCmd is conch's child for a term: the pagurus-term binary next to
+// exe, else (a missing file costs memory, never a term) `pagurus term`.
+func termCmd(exe string, log *slog.Logger) []string {
+	shim := filepath.Join(filepath.Dir(exe), "pagurus-term")
+	if fi, err := os.Stat(shim); err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0 {
+		return []string{shim, "--socket"}
+	}
+	log.Warn("pagurus-term not found next to pagurus: falling back to `pagurus term`", "want", shim)
+	return []string{exe, "term", "--socket"}
 }
 
 // toolVersions reads the Incus server version and, with the compose

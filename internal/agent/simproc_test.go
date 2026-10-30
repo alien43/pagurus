@@ -14,13 +14,14 @@ import (
 	"time"
 
 	"github.com/alien43/pagurus/internal/fence"
+	"github.com/alien43/pagurus/internal/termshim"
 )
 
 // The sim runs the real conch (the version pinned in go.mod, built here) for
 // every member's office. conch's two children are this test binary in a
 // helper mode:
 //
-//	sim-term <socket>                      `pagurus term`, unchanged
+//	sim-term <socket>                      `pagurus-term`, unchanged
 //	sim-fence <host socket> --member <m>   `pagurus fence-self`, but the self
 //	                                       chain runs on the simulated host,
 //	                                       which lives in the test process
@@ -30,7 +31,7 @@ func TestMain(m *testing.M) {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "sim-term":
-			os.Exit(RunTermShim(os.Args[2]))
+			os.Exit(termshim.Run(os.Args[2]))
 		case "sim-fence":
 			os.Exit(simFence(os.Args[2], os.Args[len(os.Args)-1]))
 		case "sim-pet": // a conch that pets n times, then stays alive, silent

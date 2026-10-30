@@ -74,6 +74,6 @@ The same lab runs in CI on every push (`.github/workflows/lab.yml`).
 
 In production on the author's three-member cluster since October 2026 (stateless and replicated
 services). Releases: [GitHub releases](https://github.com/alien43/pagurus/releases) (static
-linux amd64/arm64). Interfaces may still change before 1.0; see [`CHANGELOG.md`](CHANGELOG.md).
+linux amd64/arm64; install `pagurus-term` next to `pagurus`). Interfaces may still change before 1.0; see [`CHANGELOG.md`](CHANGELOG.md).
 
 License: see [`LICENSE`](LICENSE). Security reports: [`SECURITY.md`](SECURITY.md).
