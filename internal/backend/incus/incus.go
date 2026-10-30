@@ -110,7 +110,7 @@ const SlowRun = 30 * time.Second
 // TimedRun is Run, but it keeps every line the command printed (stdout and
 // stderr) with the time since it started, and logs them when the command took
 // longer than SlowRun: a start once spent ~100 s inside `incus-compose up` with
-// incusd logging nothing (tasks/pagurus-slow-start-asus.md).
+// incusd logging nothing.
 func TimedRun(ctx context.Context, name string, args ...string) ([]byte, error) {
 	start := time.Now()
 	cmd := exec.CommandContext(ctx, name, args...)

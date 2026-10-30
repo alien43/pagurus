@@ -81,11 +81,11 @@ func (d *Driver) ListVolumes(ctx context.Context, member string) ([]string, erro
 
 // RefreshVolume pulls vol from from's project into to's: `incus storage
 // volume copy --refresh` (an incremental ZFS send; a forced receive on the
-// target, tasks/results/pagurus-replica-spike.md). Cancelling ctx kills the
+// target). Cancelling ctx kills the
 // CLI.
 //
 // An instance is pulled with `incus copy --refresh --stateless` (of a running
-// VM too, as standby-sync's asus-haos copy), boot.autostart pinned "false" on
+// VM too), boot.autostart pinned "false" on
 // the copy: the instances starter requires it, and a copy that started at
 // the host's boot would be a second running one. It needs the target to
 // exist (`pagurus provision` seeds it), so the CLI places it by its location.

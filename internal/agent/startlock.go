@@ -13,7 +13,7 @@ import (
 // deploy restarts every agent on a host at once, and six concurrent `up`s each
 // made every peer's incusd restart its dnsmasq for the new DNS records; the
 // restarts collided ("Address already in use") and an `up` stalled ~2 min
-// (asus, 2026-10-18, homarr-ha down 113 s, deploy rolled back twice). It waits
+// (2026-10-18: a stack down 113 s, a deploy rolled back twice). It waits
 // until ctx ends; the returned func releases it (the kernel does too if the
 // agent dies). An empty path is no lock (tests).
 func hostStartLock(ctx context.Context, path string, priority bool) (release func(), waited time.Duration, err error) {

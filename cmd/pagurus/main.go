@@ -195,8 +195,8 @@ func fatal(err error) {
 // network uses it. The pagurus@ unit maps it to a clean stop
 // (SuccessExitStatus + RestartPreventExitStatus): the unit ends inactive, not
 // failed, so a reboot-armed host's FailureAction does not fire. A config that
-// can't load is the same on every boot, so a reboot only loops (2026-10-20,
-// dell: docs/incident-2026-10-20-dell-reboot-loop-and-mqtt-outages.md).
+// can't load is the same on every boot, so a reboot only loops (seen live,
+// 2026-10-20).
 const exitConfig = 78
 
 func fatalConfig(cmd, path string, err error) {

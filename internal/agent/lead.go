@@ -429,8 +429,8 @@ func (t *termState) start() (err error) {
 	uctx, cancel := context.WithTimeout(t.op, UpTimeout)
 	defer cancel()
 	// One line per start with each step's wall time, failed starts included:
-	// a start on asus once spent ~95 s before Incus started the container
-	// with nothing logged in between (tasks/pagurus-slow-start-asus.md).
+	// a start once spent ~95 s before Incus started the container with
+	// nothing logged in between.
 	var steps []any
 	began, mark := time.Now(), time.Now()
 	step := func(name string) {
@@ -547,7 +547,7 @@ const layoutRechecks = 3
 // confirmCgroupLayout tells an unrecognised cgroup layout (errMisplaced: 1 h
 // backoff and an alert) from a workload that died right after `up`. Both look
 // alike for a moment: Incus still lists the dead container Running while its
-// payload cgroup is already gone (asus, 2026-10-18 08:15:16, a container init
+// payload cgroup is already gone (seen 2026-10-18, a container init
 // killed mid-restart). A container that stops while re-reading is a start
 // failure, retried like any other; one that stays Running with no payload
 // cgroup is the layout problem.

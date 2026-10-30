@@ -118,7 +118,7 @@ func (a *Agent) stopConch(reason string) {
 // read, and a term that starts in between has already cleared localStopped
 // (lead), so the verdict "not eligible: local instances not confirmed
 // stopped" was about the term itself; signalling would end it at once
-// (seen live 12 times in 7 days on asus and dell, and in the VM lab). The
+// (seen live 12 times in 7 days on two members, and in the VM lab). The
 // check and the signal happen under a.mu, which serveTerm holds to start a
 // term, so no term begins between them.
 func (a *Agent) withdraw(reason string) bool {

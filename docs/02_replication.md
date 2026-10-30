@@ -131,7 +131,7 @@ the source's (Incus 7.5.1, measured). So from the first pull on, every member's 
 leader's MAC (and, with DHCP by MAC, its address). Before the first pull, a provisioned copy has
 its own: pin `hwaddr` on the NIC device if even that first window matters.
 
-Measured on a 512 MiB Alpine VM, asus ↔ dell: first copy 7 s; a handover round 7–8 s; the `-final`
+Measured on a 512 MiB Alpine VM between two members: first copy 7 s; a handover round 7–8 s; the `-final`
 catch-up ~10 s; a planned move about 25 s end to end, the guest's marker file intact.
 
 **Bandwidth.** A pull is a ZFS send from the leader's member. Uncapped, it fills the link that etcd

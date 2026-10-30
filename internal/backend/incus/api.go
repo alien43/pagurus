@@ -291,7 +291,7 @@ func (c *Client) InstanceSnapshots(ctx context.Context, project, name string) ([
 }
 
 // CreateInstanceSnapshot takes a disk-only snapshot (not stateful): of a
-// running VM too, crash-consistent, as standby-sync's hourly ones of asus-haos.
+// running VM too, crash-consistent, as a host-level standby copy takes them.
 func (c *Client) CreateInstanceSnapshot(ctx context.Context, project, name, snap string) error {
 	s, err := c.project(ctx, project)
 	if err != nil {

@@ -27,7 +27,7 @@
 # transient unit that removes itself after CUT seconds. Port 22 and container
 # traffic are never matched. The member self-fences by cgroup.kill, which on
 # Incus 7.5 leaks the instance volume's mount refcount in its incusd
-# (tasks/pagurus-fenced-member-recovery.md); the drill then moves the service
+# (an Incus bug); the drill then moves the service
 # back to it and reports whether it can host. HOLD=<members> keeps those
 # members' agents stopped for the drill (e.g. a member already poisoned).
 set -uo pipefail
