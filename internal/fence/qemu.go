@@ -1,16 +1,12 @@
 package fence
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"time"
 
+	"github.com/alien43/pagurus/internal/qemuproc"
 	"golang.org/x/sys/unix"
 )
 
@@ -53,82 +49,38 @@ func (f QemuKill) Applies(t Target) bool {
 
 func (f QemuKill) root() string {
 	if f.RunRoot == "" {
-		return "/run/incus"
+		return qemuproc.DefaultRunRoot
 	}
 	return f.RunRoot
 }
 
-// qemuProc is one live, verified qemu of the target's project.
-type qemuProc struct {
-	pidfile string
-	pid     int
-	fd      int // pidfd; the caller closes it
-}
-
 // live returns the target project's verified, live qemu processes, each with
-// an open pidfd.
-func (f QemuKill) live(t Target) ([]qemuProc, error) {
-	files, err := filepath.Glob(filepath.Join(f.root(), t.Project+"_*", "qemu.pid"))
-	if err != nil {
-		return nil, err
-	}
-	var out []qemuProc
-	for _, pf := range files {
-		b, err := os.ReadFile(pf)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return out, err
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-		if err != nil || pid <= 1 {
-			continue
-		}
-		fd, err := unix.PidfdOpen(pid, 0)
-		if err != nil {
-			continue // ESRCH: gone
-		}
-		// Verify after opening the pidfd: if the PID was reused before the
-		// open, the cmdline no longer matches; after it, the pidfd pins it.
-		cmd, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		isQemu := bytes.Contains(cmd, []byte("qemu-system")) || bytes.Contains(cmd, []byte("qemu-kvm"))
-		if err != nil || !isQemu || !bytes.Contains(cmd, []byte(pf)) {
-			unix.Close(fd)
-			continue
-		}
-		out = append(out, qemuProc{pidfile: pf, pid: pid, fd: fd})
-	}
-	return out, nil
-}
-
-func closeAll(ps []qemuProc) {
-	for _, p := range ps {
-		unix.Close(p.fd)
-	}
+// an open pidfd (qemuproc.Live).
+func (f QemuKill) live(t Target) ([]qemuproc.Proc, error) {
+	return qemuproc.Live(f.root(), t.Project)
 }
 
 func (f QemuKill) Run(ctx context.Context, t Target) error {
 	ps, err := f.live(t)
-	defer closeAll(ps)
+	defer qemuproc.CloseAll(ps)
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, p := range ps {
-		if err := unix.PidfdSendSignal(p.fd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
-			errs = append(errs, fmt.Errorf("SIGKILL qemu %d (%s): %w", p.pid, p.pidfile, err))
+		if err := unix.PidfdSendSignal(p.FD, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+			errs = append(errs, fmt.Errorf("SIGKILL qemu %d (%s): %w", p.PID, p.PIDFile, err))
 		}
 	}
 	// Wait for the processes to go (a pidfd turns readable when it exits).
 	for _, p := range ps {
 		for {
-			n, err := unix.Poll([]unix.PollFd{{Fd: int32(p.fd), Events: unix.POLLIN}}, 50)
+			n, err := unix.Poll([]unix.PollFd{{Fd: int32(p.FD), Events: unix.POLLIN}}, 50)
 			if n > 0 || (err != nil && !errors.Is(err, unix.EINTR)) {
 				break
 			}
 			if ctx.Err() != nil {
-				errs = append(errs, fmt.Errorf("qemu %d still alive: %w", p.pid, ctx.Err()))
+				errs = append(errs, fmt.Errorf("qemu %d still alive: %w", p.PID, ctx.Err()))
 				break
 			}
 		}
@@ -139,7 +91,7 @@ func (f QemuKill) Run(ctx context.Context, t Target) error {
 // Confirm: no live, verified qemu of the project is left.
 func (f QemuKill) Confirm(_ context.Context, t Target) (bool, error) {
 	ps, err := f.live(t)
-	defer closeAll(ps)
+	defer qemuproc.CloseAll(ps)
 	if err != nil {
 		return false, err
 	}

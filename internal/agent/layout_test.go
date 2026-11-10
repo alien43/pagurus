@@ -42,7 +42,10 @@ func TestPreflightRefusesAnUnrecognisedCgroupLayout(t *testing.T) {
 		"Incus Running, no payload cgroup (renamed layout)": {&layoutRT{insts: []incus.Instance{running}}, true},
 		"Incus Running, cgroup seen":                        {&layoutRT{insts: []incus.Instance{running}, local: []string{"svc-1"}}, false},
 		"nothing running":                                   {&layoutRT{insts: []incus.Instance{{Name: "svc-1", Status: incus.StatusStopped, Type: "container"}}}, false},
-		"a running VM (no payload cgroup by design)":        {&layoutRT{insts: []incus.Instance{{Name: "vm", Status: incus.StatusRunning, Type: "virtual-machine"}}}, false},
+		// A VM has no payload cgroup; LocalRunning sees it by its qemu. One it
+		// can't see would be "stopped" to every self-check.
+		"Incus Running VM, no qemu seen": {&layoutRT{insts: []incus.Instance{{Name: "vm", Status: incus.StatusRunning, Type: "virtual-machine"}}}, true},
+		"Incus Running VM, qemu seen":    {&layoutRT{insts: []incus.Instance{{Name: "vm", Status: incus.StatusRunning, Type: "virtual-machine"}}, local: []string{"vm"}}, false},
 	} {
 		cfg := testConfig(t, nil)
 		a := New(Options{Config: cfg, Backend: simBackend(cfg, c.rt)})

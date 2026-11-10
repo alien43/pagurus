@@ -249,7 +249,7 @@ seams named for what they mean, all wired once in `cmd/pagurus` (`agent.Backend`
 |---|---|---|
 | `Site` | a member's place to run the workload: check, list, stop, no autostart, address | `*incus.Driver`: a project pinned to the member |
 | `Starter` | bring the member's copy up: check, prepare, pull, start | `start.Compose` (incus-compose), `start.Instances` |
-| `Observer` | does the workload run on this host, without the daemon or quorum | `*incus.Driver`: cgroupfs `lxc.payload.<project>_*` |
+| `Observer` | does the workload run on this host, without the daemon or quorum | `*incus.Driver`: cgroupfs `lxc.payload.<project>_*` for containers, `<run root>/<project>_*/qemu.pid` with a verified live qemu for VMs (`internal/qemuproc`) |
 | `Membership` | this host's member name; is member *m* online | `*incus.Driver`: Incus cluster member state |
 | `Fences` | the member's self and peer fence chains | `fence.Configured` over `*incus.Driver` (kinds below) |
 | `Replicator` | snapshot, ship, keep aside, prepare a volume for first use | `*incus.Driver`: custom volumes on a ZFS pool |

@@ -30,6 +30,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/alien43/pagurus/internal/backend"
+	"github.com/alien43/pagurus/internal/qemuproc"
 )
 
 // Instance and its statuses are the backend-neutral types, re-exported.
@@ -44,6 +45,9 @@ type Options struct {
 	ProjectPrefix string
 	// CgroupRoot is the cgroup2 mount (default /sys/fs/cgroup).
 	CgroupRoot string
+	// RunRoot is Incus's run directory, holding each VM's qemu.pid
+	// (default /run/incus).
+	RunRoot string
 	// ProcRoot is procfs (default /proc), where Kill finds the proxy-device
 	// processes of the containers it killed.
 	ProcRoot string
@@ -339,10 +343,31 @@ func (d *Driver) payloadPrefix(member string) string {
 	return "lxc.payload." + d.Project(member) + "_"
 }
 
-// LocalRunning lists this member's project containers that still have live
-// processes, read straight from cgroupfs. It needs no Incus daemon and no
-// cluster quorum, which makes it the ground truth for the self-fence.
+// LocalRunning lists this member's project instances that are running here:
+// containers with live processes in their lxc.payload cgroup, and VMs with a
+// live, verified qemu (qemuproc). It needs no Incus daemon and no cluster
+// quorum, which makes it the ground truth for the self-fence, the startup
+// fence and the stray guard.
 func (d *Driver) LocalRunning(member string) ([]string, error) {
+	out, err := d.localContainers(member)
+	if err != nil {
+		return nil, err
+	}
+	vms, err := qemuproc.Live(d.o.RunRoot, d.Project(member))
+	qemuproc.CloseAll(vms)
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range vms {
+		out = append(out, v.Instance)
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
+// localContainers is LocalRunning's cgroupfs half: the project's containers
+// whose payload cgroup is populated.
+func (d *Driver) localContainers(member string) ([]string, error) {
 	ents, err := os.ReadDir(d.o.CgroupRoot)
 	if err != nil {
 		return nil, err
@@ -382,9 +407,10 @@ func cgroupPopulated(dir string) (bool, error) {
 }
 
 // Kill SIGKILLs every process of this member's project containers via
-// cgroup.kill and waits until the cgroups are empty or ctx ends.
+// cgroup.kill and waits until the cgroups are empty or ctx ends. Containers
+// only: a VM's qemu is not in a payload cgroup (fence qemu-kill stops it).
 func (d *Driver) Kill(ctx context.Context, member string) error {
-	names, err := d.LocalRunning(member)
+	names, err := d.localContainers(member)
 	if err != nil {
 		return err
 	}
@@ -401,7 +427,7 @@ func (d *Driver) Kill(ctx context.Context, member string) error {
 		}
 	}
 	for {
-		left, err := d.LocalRunning(member)
+		left, err := d.localContainers(member)
 		if err == nil && len(left) == 0 {
 			d.killProxies(killed)
 			return nil

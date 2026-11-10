@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.4
+
+- VMs are now visible to the agent's local check. `LocalRunning` (the startup fence, the stray guard while not leading,
+  the watchdog's "nothing of ours runs here", and `pagurus_local_running`) read only containers' `lxc.payload`
+  cgroups. A VM's qemu runs in `incus.service`'s cgroup, so a running VM read as stopped: a leading VM reported
+  `pagurus_local_running 0`, and a VM started by hand on a follower was neither stopped nor kept the watchdog
+  unfed. It now also counts a VM whose `<run root>/<project>_<name>/qemu.pid` names a live, verified qemu, the
+  check `qemu-kill` already used (now `internal/qemuproc`). The preflight's layout check covers VMs too: Incus
+  reporting a VM Running that this can't see is refused, as for containers. `cgroup-kill` stays containers-only.
+
 ## v0.1.3
 
 - `pagurus-term`: conch's child for a term is now its own binary, linking only the standard

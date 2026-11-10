@@ -125,7 +125,7 @@ Every series carries `svc` and `member` labels; no label has unbounded values.
 | :--- | :--- | :--- |
 | `pagurus_role` | gauge | 1 while this member holds the office and runs its term |
 | `pagurus_conch_running` | gauge | 1 while this member's `conch elect` runs |
-| `pagurus_local_running` | gauge | containers of this member's project with live processes, **from cgroupfs** every health interval: each member's own ground truth, independent of the office |
+| `pagurus_local_running` | gauge | instances of this member's project running here, every health interval, without Incus: containers with live processes **from cgroupfs**, VMs with a live, verified qemu behind their pidfile. Each member's own ground truth, independent of the office |
 | `pagurus_fit` | gauge | 1 while the agent pets its watchdog backend |
 | `pagurus_lease_remaining_seconds` | gauge | server-side TTL left on the holder's lease (0 when not holding) |
 | `pagurus_fence_blocked` | gauge | 1 while this leader waits on a member it cannot fence (`block`) |

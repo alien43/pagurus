@@ -52,7 +52,9 @@ detection (TTL/2 at the default TTL) + that budget + 1s < TTL. At TTL 20s the ch
 under 8s; a longer chain needs a longer `lease.ttl`. `pagurus validate` checks this.
 
 `incus-stop` and `cgroup-kill` skip VMs, because they confirm from cgroupfs, which cannot see
-qemu. `qemu-kill` is the Incus-free VM self-fence:
+qemu. (The agent's own local check, `LocalRunning`, does see VMs since v0.1.4, by the same
+pidfile check as `qemu-kill`. So the startup fence, the stray guard and the watchdog cover a VM
+as they cover a container.) `qemu-kill` is the Incus-free VM self-fence:
 - it reads `/run/incus/<project>_<name>/qemu.pid` and opens a pidfd;
 - it accepts the process only if its cmdline is qemu (`qemu-system`/`qemu-kvm`) and names that
   pidfile, as Incus checks its own PID (`driver_qemu.go:6517`);

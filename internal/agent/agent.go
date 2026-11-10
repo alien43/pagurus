@@ -590,19 +590,21 @@ func (a *Agent) selfTarget() fence.Target {
 	return fence.Target{Member: a.member, Project: a.cfg.Project(a.member), Types: slices.Clone(a.types)}
 }
 
-// errCgroupLayout: Incus says a container runs here but cgroupfs shows no
-// payload cgroup for it. LocalRunning would then report a running member as
-// stopped, which every self-check and self-fence relies on, so the agent
+// errCgroupLayout: Incus says an instance runs here but LocalRunning can't
+// see it (a container without a live payload cgroup, a VM without a verified
+// qemu behind its pidfile). LocalRunning would then report a running member
+// as stopped, which every self-check and self-fence relies on, so the agent
 // refuses rather than fall back to "nothing running".
 var errCgroupLayout = errors.New("cgroup layout not recognised")
 
-// checkCgroupLayout requires that every container Incus reports Running in
-// this member's project has a live payload cgroup (lxc.payload.<project>_<name>)
-// that LocalRunning sees. VMs have no payload cgroup and are not checked here.
+// checkCgroupLayout requires that every instance Incus reports Running in this
+// member's project is one LocalRunning sees: a container by its live payload
+// cgroup (lxc.payload.<project>_<name>), a VM by its qemu
+// (<run root>/<project>_<name>/qemu.pid).
 func (a *Agent) checkCgroupLayout(insts []backend.Instance) error {
 	var running []string
 	for _, in := range insts {
-		if in.Status == backend.StatusRunning && (in.Type == "" || in.Type == "container") {
+		if in.Status == backend.StatusRunning {
 			running = append(running, in.Name)
 		}
 	}
@@ -611,14 +613,25 @@ func (a *Agent) checkCgroupLayout(insts []backend.Instance) error {
 	}
 	local, err := a.observer.LocalRunning(a.member)
 	if err != nil {
-		return fmt.Errorf("%w: reading cgroupfs: %v", errCgroupLayout, err)
+		return fmt.Errorf("%w: reading cgroupfs and qemu pidfiles: %v", errCgroupLayout, err)
+	}
+	types := map[string]string{}
+	for _, in := range insts {
+		types[in.Name] = in.Type
 	}
 	for _, n := range running {
-		if !slices.Contains(local, n) {
-			return fmt.Errorf("%w: Incus reports container %s of project %s Running, but cgroupfs has no live lxc.payload.%s_%s; "+
-				"is this a liblxc/Incus version with a different payload cgroup name? Refusing: the self-fence would see it as stopped",
-				errCgroupLayout, n, a.cfg.Project(a.member), a.cfg.Project(a.member), n)
+		if slices.Contains(local, n) {
+			continue
 		}
+		p := a.cfg.Project(a.member)
+		if types[n] == "virtual-machine" {
+			return fmt.Errorf("%w: Incus reports VM %s of project %s Running, but no live qemu names %s_%s/qemu.pid under Incus's run directory; "+
+				"is this an Incus version with a different run directory or pidfile? Refusing: the self-fence would see it as stopped",
+				errCgroupLayout, n, p, p, n)
+		}
+		return fmt.Errorf("%w: Incus reports container %s of project %s Running, but cgroupfs has no live lxc.payload.%s_%s; "+
+			"is this a liblxc/Incus version with a different payload cgroup name? Refusing: the self-fence would see it as stopped",
+			errCgroupLayout, n, p, p, n)
 	}
 	return nil
 }

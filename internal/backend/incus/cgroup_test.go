@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -16,7 +17,12 @@ import (
 )
 
 func cgDriver(cg *fencetest.CgroupFS) *incus.Driver {
-	return incus.New(incus.Options{ProjectPrefix: "p", CgroupRoot: cg.Root, API: fencetest.NewFakeIncus("asus")})
+	return runDriver(cg, filepath.Join(cg.Root, "no-incus-run"))
+}
+
+// runDriver: a driver whose Incus run directory (qemu pidfiles) is runRoot.
+func runDriver(cg *fencetest.CgroupFS, runRoot string) *incus.Driver {
+	return incus.New(incus.Options{ProjectPrefix: "p", CgroupRoot: cg.Root, RunRoot: runRoot, API: fencetest.NewFakeIncus("asus")})
 }
 
 // TestLocalRunningReadsOnlyThisProjectsPopulatedCgroups: the self-fence's
@@ -185,5 +191,72 @@ func TestKillSucceedsWhenProxyCleanupFails(t *testing.T) {
 	defer cancel()
 	if err := d.Kill(ctx, "asus"); err != nil {
 		t.Fatalf("Kill = %v: a failed proxy cleanup failed the fence", err)
+	}
+}
+
+// TestLocalRunningSeesVMs: a VM's qemu has no payload cgroup (it runs in
+// incus.service's), so cgroupfs alone reported a running VM as stopped: the
+// startup fence and the stray guard were blind to it, and
+// pagurus_local_running read 0 for a leading VM.
+func TestLocalRunningSeesVMs(t *testing.T) {
+	cg := fencetest.FakeCgroupFS(t)
+	cg.Run(t, "p-asus", "web")
+	run := t.TempDir()
+	fencetest.FakeQemu(t, run, "p-asus", "vm")
+	fencetest.FakeQemu(t, run, "p-dell", "vm") // another member's project
+	// A pidfile left pointing at a process that is not qemu (PID reuse).
+	plain := exec.Command("sleep", "1000")
+	if err := plain.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plain.Process.Kill(); _, _ = plain.Process.Wait() })
+	stale := filepath.Join(run, "p-asus_old")
+	if err := os.MkdirAll(stale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stale, "qemu.pid"), []byte(strconv.Itoa(plain.Process.Pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := runDriver(cg, run).LocalRunning("asus")
+	if err != nil || !slices.Equal(got, []string{"vm", "web"}) {
+		t.Fatalf("LocalRunning = %v %v, want [vm web]", got, err)
+	}
+}
+
+// TestLocalRunningVMGone: once its qemu exits, the VM is not running, even
+// though Incus may not have removed the pidfile yet.
+func TestLocalRunningVMGone(t *testing.T) {
+	cg := fencetest.FakeCgroupFS(t)
+	run := t.TempDir()
+	q := fencetest.FakeQemu(t, run, "p-asus", "vm")
+	_ = q.Cmd.Process.Kill()
+	for deadline := time.Now().Add(5 * time.Second); q.Alive(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("fake qemu did not die")
+		}
+	}
+	got, err := runDriver(cg, run).LocalRunning("asus")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("LocalRunning = %v %v, want nothing", got, err)
+	}
+}
+
+// TestKillLeavesVMsToQemuKill: cgroup-kill has no cgroup to kill a VM by, so
+// it must neither wait on one nor touch it (qemu-kill is the VM fence).
+func TestKillLeavesVMsToQemuKill(t *testing.T) {
+	cg := fencetest.FakeCgroupFS(t)
+	cg.Run(t, "p-asus", "web")
+	run := t.TempDir()
+	q := fencetest.FakeQemu(t, run, "p-asus", "vm")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := runDriver(cg, run).Kill(ctx, "asus"); err != nil {
+		t.Fatalf("Kill = %v, want the containers killed and the VM left alone", err)
+	}
+	if !cg.Killed("p-asus", "web") {
+		t.Fatal("container not killed")
+	}
+	if !q.Alive() {
+		t.Fatal("cgroup-kill killed a VM's qemu")
 	}
 }
