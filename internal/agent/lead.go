@@ -606,6 +606,9 @@ func (t *termState) allRunning(ctx context.Context) bool {
 var (
 	errMisplaced = errors.New("refusing to run")
 	errDeposed   = errors.New("deposed")
+	// errNotRunning: the instances are gone or not Running. That is never a
+	// workload still starting, so start_period does not cover it.
+	errNotRunning = errors.New("not running")
 )
 
 // authorised is the last check before anything may run: the term is still
@@ -648,11 +651,11 @@ func (t *termState) health() error {
 		return err
 	}
 	if len(insts) == 0 {
-		return errors.New("no instances")
+		return fmt.Errorf("%w: no instances", errNotRunning)
 	}
 	for _, in := range insts {
 		if in.Status != backend.StatusRunning {
-			return fmt.Errorf("%s is %s", in.Name, in.Status)
+			return fmt.Errorf("%w: %s is %s", errNotRunning, in.Name, in.Status)
 		}
 	}
 	if a.cfg.Health.HTTP == "" {
@@ -873,8 +876,10 @@ func (t *termState) supervise() {
 		case hold:
 			// The backend did not answer, so nothing new is known about the
 			// workload: neither a failure nor health.
-		case a.now().Sub(startedAt) < hc.StartPeriod.D():
-			// still starting
+		case !errors.Is(err, errNotRunning) && a.now().Sub(startedAt) < hc.StartPeriod.D():
+			// still starting (a stopped workload is not: Z2M crashed 5 s
+			// after its first healthy check on 2026-11-11 and sat Stopped
+			// for the rest of its 90 s start period)
 		default:
 			healthy = false
 			failures++

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.5
+
+- A workload that is not Running (instances Stopped, Error, or gone) counts as unhealthy at once, also inside
+  `start_period`. The start period is for a workload that runs but doesn't answer yet; a stopped one is not
+  starting. A container that crashed seconds after its first healthy check used to sit Stopped for the rest of a
+  90 s start period before the in-place restart.
+
 ## v0.1.4
 
 - VMs are now visible to the agent's local check. `LocalRunning` (the startup fence, the stray guard while not leading,

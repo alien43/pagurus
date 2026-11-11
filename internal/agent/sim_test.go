@@ -1112,6 +1112,37 @@ func TestUnhealthyLeaderGivesUp(t *testing.T) {
 	h.holdOne("dell", 2*time.Second)
 }
 
+// start_period is for a workload that has not answered yet. One that was
+// healthy and then stopped is restarted in place at once (2026-11-11: Z2M
+// crashed 5 s after its first healthy check and sat Stopped for the rest of
+// its 90 s start period).
+func TestWorkloadStoppedAfterHealthyRestartsWithinTheStartPeriod(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Health.StartPeriod = config.Duration(30 * time.Second) })
+	h.startAll()
+	h.waitRunning("asus", 10*time.Second)
+	for deadline := time.Now().Add(10 * time.Second); h.memberStates()["asus"].Reason != "healthy"; time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("asus never reported healthy")
+		}
+	}
+	h.sim.set("asus", func(m *simMember) { m.running = false })
+	took := h.waitRunning("asus", 10*time.Second)
+	t.Logf("restarted in place %s after the workload stopped", took.Round(100*time.Millisecond))
+}
+
+// A workload that is not Running right after its start is not slow to start
+// either: it is restarted without waiting out start_period.
+func TestWorkloadDeadAtStartRestartsWithinTheStartPeriod(t *testing.T) {
+	h := newHarness(t, func(c *config.Config) { c.Health.StartPeriod = config.Duration(30 * time.Second) })
+	h.sim.set("asus", func(m *simMember) { m.dieAfterUp = 1 })
+	h.startAll()
+	took := h.waitRunning("asus", 10*time.Second)
+	t.Logf("asus serving %s after start (first start died at once)", took.Round(100*time.Millisecond))
+	if n := h.prepares("asus"); n < 2 {
+		t.Fatalf("asus started %d times, want a restart in place", n)
+	}
+}
+
 // Two members whose Incus cannot create the workload (2026-10-14: both
 // cgroup-kill fenced, both leaking the volume's mount refcount) must not
 // starve the third. With a fixed backoff shorter than a failed tenure the
