@@ -34,6 +34,21 @@ func TestComposeArgv(t *testing.T) {
 	}
 }
 
+// Pull passes no --no-healthd (incus-compose 1.4 refuses it on pull) and
+// keeps 1.3 off healthd through the environment.
+func TestComposePullLeavesHealthdAloneWithoutTheFlag(t *testing.T) {
+	dir := t.TempDir()
+	bin := fencetest.FakeBin(t, dir, "incus-compose", `echo "INCUS_COMPOSE_NO_HEALTHD=$INCUS_COMPOSE_NO_HEALTHD" >> "$0.calls"`)
+	c := start.Compose{Run: incus.Run, Bin: bin.Path, Project: project, File: "/x/compose.yaml"}
+	if err := c.Pull(context.Background(), "asus"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-p p-asus -f /x/compose.yaml pull", "INCUS_COMPOSE_NO_HEALTHD=true"}
+	if got := bin.Calls(t); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("calls\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestComposeFailurePropagates(t *testing.T) {
 	bin := fencetest.FakeBin(t, t.TempDir(), "incus-compose", "echo boom >&2; exit 2")
 	c := start.Compose{Run: incus.Run, Bin: bin.Path, Project: project, File: "f"}

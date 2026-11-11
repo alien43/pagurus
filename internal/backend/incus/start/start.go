@@ -99,10 +99,14 @@ func (c Compose) Prepare(ctx context.Context, member string) error {
 	return err
 }
 
-// Pull is `incus-compose pull --no-healthd`: new images into the project's
-// store; no instance changes until the next Prepare.
+// Pull is `incus-compose pull`: new images into the project's store; no
+// instance changes until the next Prepare. Healthd is left alone through the
+// environment, not --no-healthd: incus-compose 1.3 reads
+// INCUS_COMPOSE_NO_HEALTHD, and 1.4 dropped the flag from pull (it no longer
+// touches healthd there) and refuses it.
 func (c Compose) Pull(ctx context.Context, member string) error {
-	_, err := c.Run(ctx, c.bin(), append(c.base(member), "pull", "--no-healthd")...)
+	args := append([]string{"INCUS_COMPOSE_NO_HEALTHD=true", c.bin()}, append(c.base(member), "pull")...)
+	_, err := c.Run(ctx, "env", args...)
 	return err
 }
 

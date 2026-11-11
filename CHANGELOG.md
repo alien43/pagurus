@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.7
+
+- `pull` no longer passes `--no-healthd`, which incus-compose 1.4 refuses on `pull` (it stopped touching healthd
+  there). It sets `INCUS_COMPOSE_NO_HEALTHD=true` in the environment instead, which incus-compose 1.3 reads, so
+  refreshes work on both.
+
 ## v0.1.6
 
 - `start_priority` is a level, 0..9, as Incus's `boot.autostart.priority`: on the host-wide start lock higher levels
