@@ -16,7 +16,7 @@ func TestHostStartLock(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			release, _, err := hostStartLock(context.Background(), path, false)
+			release, _, err := hostStartLock(context.Background(), path, 0)
 			if err != nil {
 				t.Error(err)
 				return
@@ -37,17 +37,17 @@ func TestHostStartLock(t *testing.T) {
 		t.Fatalf("%d holders at once, want 1", maxIn.Load())
 	}
 
-	release, _, err := hostStartLock(context.Background(), path, false)
+	release, _, err := hostStartLock(context.Background(), path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if _, waited, err := hostStartLock(ctx, path, false); err == nil || waited < 250*time.Millisecond {
+	if _, waited, err := hostStartLock(ctx, path, 0); err == nil || waited < 250*time.Millisecond {
 		t.Fatalf("second taker: err %v after %s, want a context error after ~300ms", err, waited)
 	}
-	if r, _, err := hostStartLock(context.Background(), "", false); err != nil {
+	if r, _, err := hostStartLock(context.Background(), "", 0); err != nil {
 		t.Fatal(err)
 	} else {
 		r()
@@ -58,12 +58,12 @@ func TestHostStartLock(t *testing.T) {
 // lock first when the holder releases (mqtt-ha behind five services, 2026-10-20).
 func TestStartLockPriorityGoesFirst(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "start.lock")
-	hold, _, err := hostStartLock(context.Background(), path, false)
+	hold, _, err := hostStartLock(context.Background(), path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	order := make(chan string, 2)
-	take := func(name string, prio bool) {
+	take := func(name string, prio int) {
 		release, _, err := hostStartLock(context.Background(), path, prio)
 		if err != nil {
 			t.Error(err)
@@ -73,9 +73,9 @@ func TestStartLockPriorityGoesFirst(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		release()
 	}
-	go take("ordinary", false)
+	go take("ordinary", 0)
 	time.Sleep(300 * time.Millisecond) // the ordinary one is already waiting
-	go take("priority", true)
+	go take("priority", 1)
 	time.Sleep(300 * time.Millisecond)
 	hold()
 	if first := <-order; first != "priority" {
@@ -83,5 +83,34 @@ func TestStartLockPriorityGoesFirst(t *testing.T) {
 	}
 	if second := <-order; second != "ordinary" {
 		t.Fatalf("then %s, want ordinary", second)
+	}
+}
+
+// Higher levels go first, whatever order they start waiting in.
+func TestStartLockLevelsGoHighestFirst(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "start.lock")
+	hold, _, err := hostStartLock(context.Background(), path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := make(chan int, 4)
+	for _, l := range []int{0, 1, 3, 2} { // lowest waits first
+		go func() {
+			release, _, err := hostStartLock(context.Background(), path, l)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			order <- l
+			time.Sleep(50 * time.Millisecond)
+			release()
+		}()
+		time.Sleep(150 * time.Millisecond)
+	}
+	hold()
+	for _, want := range []int{3, 2, 1, 0} {
+		if got := <-order; got != want {
+			t.Fatalf("level %d got the lock, want %d", got, want)
+		}
 	}
 }

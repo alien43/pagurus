@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.6
+
+- `start_priority` is a level, 0..9, as Incus's `boot.autostart.priority`: on the host-wide start lock higher levels
+  go first, 0 (the default) last. `true` still reads as 1 and `false` as 0, so existing configs are unchanged.
+  Level 1 keeps the lock file the boolean used (`<lock>.prio`), so a v0.1.5 agent and a v0.1.6 one agree on it while a host
+  is half deployed. Use it to bring the broker up first and what a house needs next, ahead of everything else,
+  after a host-wide fence or a deploy.
+
 ## v0.1.5
 
 - A workload that is not Running (instances Stopped, Error, or gone) counts as unhealthy at once, also inside

@@ -351,10 +351,35 @@ type Config struct {
 	StateDir string `json:"state_dir"`
 	// AlertURL, if set, receives a POST for every event that needs a human.
 	AlertURL string `json:"alert_url"`
-	// StartPriority: this service's starts go ahead of the other services'
-	// on the host-wide start lock (the MQTT broker). Per service, not a
-	// safety field: left out of SafetyHash and FenceHash.
-	StartPriority bool `json:"start_priority,omitempty"`
+	// StartPriority orders this service's starts on the host-wide start lock:
+	// higher goes first, 0 (the default) last, as Incus's
+	// boot.autostart.priority. 0..MaxStartPriority; true reads as 1 (the
+	// boolean it was). Per service, not a safety field: left out of
+	// SafetyHash and FenceHash.
+	StartPriority StartPriority `json:"start_priority,omitempty"`
+}
+
+// MaxStartPriority bounds start_priority: one lock file per level.
+const MaxStartPriority = 9
+
+// StartPriority is start_priority: a level, or the boolean it used to be.
+type StartPriority int
+
+func (p *StartPriority) UnmarshalJSON(b []byte) error {
+	var on bool
+	if err := json.Unmarshal(b, &on); err == nil {
+		*p = 0
+		if on {
+			*p = 1
+		}
+		return nil
+	}
+	var n int
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("start_priority: want 0..%d or a boolean: %w", MaxStartPriority, err)
+	}
+	*p = StartPriority(n)
+	return nil
 }
 
 var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
@@ -502,6 +527,9 @@ func (c *Config) Validate() error {
 
 	if !nameRE.MatchString(c.Service) {
 		bad("service %q: must match %s", c.Service, nameRE)
+	}
+	if c.StartPriority < 0 || c.StartPriority > MaxStartPriority {
+		bad("start_priority %d: must be 0..%d", c.StartPriority, MaxStartPriority)
 	}
 	switch c.Start.Kind {
 	case "compose":
