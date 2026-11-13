@@ -50,6 +50,12 @@ the standard library (one runs per leading service, so its size counts); install
   window keeps the office. The member the office is pinned to (`move`) uses 0.
 - **No lease resume.** A killed agent's term ends with it. The restarted agent's startup fence
   stops the orphaned copy, and the office comes back once the dead lease expires.
+- **In-place upgrade is not a resume.** An upgrade `exec()`s the new binary in the daemon's own
+  process ([`01_operations.md`](01_operations.md) § In-place upgrade). conch and the term shim
+  are not touched: the lease never leaves conch, and the term is the same one, carried on by
+  the new image. The safety argument does not change. While the new image is not up, nobody
+  pets systemd and the term's heartbeat goes stale, which is point 5's wedged agent: the
+  watchdog acts, and a restarted agent fences at startup.
 - One conch run is one term. The daemon starts a new conch for each campaign, so eligibility,
   backoff after giving up, and pins stay with the daemon.
 

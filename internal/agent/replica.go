@@ -143,7 +143,11 @@ func (a *Agent) followReplica(ctx context.Context) {
 	}
 	for sleep(ctx, a.cfg.EligibleInterval.D()) {
 		a.replicaMetrics(ctx)
+		// A pull is one step of the gate: an in-place exec waits for it
+		// (the copy would go on server-side without anyone holding pullMu).
+		a.gate.RLock()
 		a.pullOnce(ctx)
+		a.gate.RUnlock()
 	}
 }
 

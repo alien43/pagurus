@@ -168,6 +168,7 @@ TimeoutStopSec=60s
 KillMode=mixed
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 ExecStart=/usr/local/bin/pagurus run -c /etc/pagurus/%i.json --self $m
+ExecReload=/usr/local/bin/pagurus reexec -c /etc/pagurus/%i.json --pid \$MAINPID -- /usr/local/bin/pagurus run -c /etc/pagurus/%i.json --self $m
 [Install]
 WantedBy=multi-user.target
 EOF

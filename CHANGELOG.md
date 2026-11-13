@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.1.8
+
+- In-place upgrade: `pagurus reexec` (the unit's `ExecReload`) hands a running agent the unit's new
+  command line, and the agent `exec()`s it in its own process with its term handed over. The office,
+  epoch, lease and member stay and the workload never stops; a pagurus deploy no longer bounces every
+  service. A safety change (`SafetyHash`/`FenceHash`), `watchdog.mode: device`, or an agent too old to
+  take it restarts the agent instead, as before. See `docs/01_operations.md` § In-place upgrade.
+  Add `ExecReload=` to your unit (see `lab/up.sh`) and use `systemctl reload` for upgrades.
+- conch's `--fence` command and term child are now scripts in `state_dir`
+  (`<service>.fence-self`, `<service>.term-cmd`, run through `/bin/sh`) that every agent rewrites, so a
+  conch that outlives an upgrade runs the current binary and config.
+- conch's output must be a file (`ProcOutput`), not a pipe into the agent: conch outlives an exec.
+
 ## v0.1.7
 
 - `pull` no longer passes `--no-healthd`, which incus-compose 1.4 refuses on `pull` (it stopped touching healthd

@@ -15,8 +15,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -24,6 +24,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -140,7 +141,7 @@ type Agent struct {
 	conchCmd  []string // conch binary (argv prefix)
 	fenceCmd  []string // `pagurus fence-self -c <cfg>` (argv prefix; --member is appended)
 	termCmd   []string // `pagurus term --socket` (argv prefix; the socket is appended)
-	procOut   io.Writer
+	procOut   *os.File
 
 	member string
 	arch   string
@@ -171,6 +172,22 @@ type Agent struct {
 	termActive       bool      // conch holds the office and its term runs here
 	termPID          int       // the `pagurus term` process of the active term
 	termRan          bool      // this conch's term has run: it is resigning, not campaigning
+	termConn         *net.UnixConn
+	term             *termState  // the active term's state (parked in supervise during an exec)
+	conchExit        *conchExit  // conch has exited and conchExited has not handled it yet
+	refreshSeen      *string     // followRefreshes: the refresh last pulled (nil: not seeded)
+	execing          bool        // an in-place exec is under way: conch is not reaped
+	fl               followState // follow's campaign, read by an exec while it is parked
+	terms            *termServer
+
+	// gate: each loop holds it (read) while it acts and lets go while it
+	// waits; an in-place exec takes it (write), so it happens only while
+	// every loop is parked (inplace.go).
+	gate    sync.RWMutex
+	resumed *handover // the old image's state, when this one was exec'd in place
+	exec    func(argv0 string, argv, env []string) error
+	// stopPetting ends the watchdog loop (tests: what exec() does to it).
+	stopPetting context.CancelFunc
 
 	localMu sync.Mutex // serialises guardLocal against the start of a term
 	fenceMu sync.Mutex // serialises self-fences
@@ -196,8 +213,9 @@ type Options struct {
 	// the agent appends --member <member>. TermCmd is `pagurus-term
 	// --socket` (or `pagurus term --socket`); the agent appends the socket path.
 	FenceCmd, TermCmd []string
-	// ProcOutput receives conch's (and its children's) output (default stderr).
-	ProcOutput io.Writer
+	// ProcOutput receives conch's (and its children's) output (default
+	// stderr). A file: conch writes to it directly, across an in-place exec.
+	ProcOutput *os.File
 	// Metrics, if set, receives the agent's metrics (else a private set).
 	Metrics *metrics.Set
 	// StartLock is the host-wide start lock file shared by every service's
@@ -244,7 +262,17 @@ func New(o Options) *Agent {
 		agentID:   fmt.Sprintf("%s/%d/%d", host, os.Getpid(), time.Now().UnixNano()),
 		now:       time.Now,
 		role:      roleStarting,
+		exec:      syscall.Exec,
 	}
+}
+
+// followState is follow's current campaign: conch's exit channel (nil while
+// none runs), its delay, when it was spawned, and the quick exits in a row.
+type followState struct {
+	done      chan conchExit
+	delay     time.Duration
+	spawnedAt time.Time
+	failures  int
 }
 
 func (a *Agent) Member() string { return a.member }
@@ -389,7 +417,8 @@ func (a *Agent) Preflight(ctx context.Context) error {
 }
 
 // Run is the agent's lifetime. It returns when ctx ends, after a held term
-// has been released and conch has exited.
+// has been released and conch has exited. After an in-place exec (Restore)
+// it carries on with the old image's sockets, conch and term.
 func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 	a.wd = wd
 	if len(a.fenceCmd) == 0 || len(a.termCmd) == 0 {
@@ -398,13 +427,34 @@ func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 	if err := os.MkdirAll(a.cfg.StateDir, 0o700); err != nil {
 		return fmt.Errorf("state dir: %w", err)
 	}
+	// Setup is one step of the gate: no exec until follow parks.
+	a.gate.RLock()
+	setup := true
+	defer func() {
+		if setup {
+			a.gate.RUnlock()
+		}
+	}()
 	a.typesMu.Lock()
 	a.persistTypes = true // validate runs Preflight unprivileged; only Run records
 	a.typesMu.Unlock()
 	if err := WriteTypes(a.cfg, a.selfTarget().Types); err != nil {
 		return fmt.Errorf("recording instance types for fence-self: %w", err)
 	}
-	if wd.Mode() != config.WatchdogOff {
+	if err := a.writeWrappers(); err != nil {
+		return fmt.Errorf("conch's commands: %w", err)
+	}
+	h := a.resumed
+	var ln *net.UnixListener
+	if h != nil {
+		var err error
+		if ln, err = a.takeSockets(h); err != nil {
+			return err
+		}
+		if a.relay != nil {
+			defer a.relay.Close()
+		}
+	} else if wd.Mode() != config.WatchdogOff {
 		r, err := listenNotify(filepath.Join(a.cfg.StateDir, a.cfg.Service+".notify"), a.relayFreshness)
 		if err != nil {
 			return err
@@ -412,34 +462,70 @@ func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 		defer r.Close()
 		a.relay = r
 	}
-	ts, err := a.listenTerms(ctx)
+	var tc *net.UnixConn
+	if h != nil {
+		a.mu.Lock()
+		if h.Conch != nil {
+			a.adoptConch(h.Conch)
+		}
+		var err error
+		if h.Term != nil {
+			tc, err = a.adoptTerm(h.Term)
+		}
+		a.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	ts, err := a.listenTerms(ctx, ln)
 	if err != nil {
 		return err
 	}
 	defer ts.Close()
 
-	a.mu.Lock()
-	a.unfitAfter = a.now().Add(a.cfg.SelfFenceLead() + 30*time.Second)
-	a.mu.Unlock()
+	if h == nil {
+		a.mu.Lock()
+		a.unfitAfter = a.now().Add(a.cfg.SelfFenceLead() + 30*time.Second)
+		a.mu.Unlock()
+	}
+	if tc != nil {
+		// At once: conch reads the term's heartbeat file.
+		go a.resumeTerm(ctx, tc, h.Term)
+	}
 	wctx, wcancel := context.WithCancel(context.Background())
+	a.stopPetting = wcancel // the sim's exec: the old image stops petting
 	wdDone := make(chan struct{})
 	go func() { defer close(wdDone); wd.Run(wctx, a.fitness) }()
 	go a.sampleLocal(wctx)
 	defer func() { wcancel(); <-wdDone }()
 
 	log := a.log.With("member", a.member)
-	log.Info("agent starting", "version", a.version, "agent_id", a.agentID, "watchdog", wd.Mode(),
-		"watchdog_timeout", wd.Timeout(), "fences_by_reboot", wd.FencesByReboot(),
-		"ttl", a.cfg.Lease.TTL.D(), "unverified_policy", a.cfg.Fence.Unverified, "office", a.co.Office())
+	if h != nil {
+		log.Info("agent resumed in place", "version", a.version, "agent_id", a.agentID, "watchdog", wd.Mode(),
+			"term", h.Term != nil, "conch", h.Conch != nil, "office", a.co.Office())
+	} else {
+		log.Info("agent starting", "version", a.version, "agent_id", a.agentID, "watchdog", wd.Mode(),
+			"watchdog_timeout", wd.Timeout(), "fences_by_reboot", wd.FencesByReboot(),
+			"ttl", a.cfg.Lease.TTL.D(), "unverified_policy", a.cfg.Fence.Unverified, "office", a.co.Office())
+	}
 
 	regReady := make(chan struct{})
 	go a.registerLoop(ctx, regReady)
-	<-regReady
+	if h == nil {
+		<-regReady
+	}
 	go a.followRefreshes(ctx)
 	go a.followReplica(ctx)
-	a.startupFence(ctx)
+	if h == nil {
+		a.startupFence(ctx)
+		a.setRole(roleFollower)
+	} else if h.Term == nil {
+		a.setRole(roleFollower)
+	}
 	watchdog.Ready()
-	a.setRole(roleFollower)
+	a.writeAdvert()
+	setup = false
+	a.gate.RUnlock()
 	a.follow(ctx)
 	watchdog.Stopping()
 	return nil
@@ -451,7 +537,6 @@ func (a *Agent) Run(ctx context.Context, wd watchdog.Watchdog) error {
 // leaves the followers on the old one (a rollback by failover). A follower
 // never recreates or starts anything here.
 func (a *Agent) followRefreshes(ctx context.Context) {
-	seen, seeded := "", false
 	tick := time.NewTicker(a.cfg.EligibleInterval.D())
 	defer tick.Stop()
 	for {
@@ -460,27 +545,37 @@ func (a *Agent) followRefreshes(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		done, err := a.co.GetString(ctx, a.co.RefreshDoneKey())
-		if err != nil {
-			continue
-		}
-		if !seeded { // what was done before this agent started is not news
-			seen, seeded = done, true
-			continue
-		}
-		if done == seen || a.inTerm() {
-			continue
-		}
-		pctx, cancel := context.WithTimeout(ctx, UpTimeout)
-		err = a.starter.Pull(pctx, a.member)
-		cancel()
-		if err != nil {
-			a.log.Warn("pull after the leader's refresh failed; retrying", "member", a.member, "token", done, "err", err)
-			continue
-		}
-		a.log.Info("pulled after the leader's refresh", "member", a.member, "token", done)
-		seen = done
+		a.gate.RLock()
+		a.followRefresh(ctx)
+		a.gate.RUnlock()
 	}
+}
+
+func (a *Agent) followRefresh(ctx context.Context) {
+	done, err := a.co.GetString(ctx, a.co.RefreshDoneKey())
+	if err != nil {
+		return
+	}
+	a.mu.Lock()
+	seen := a.refreshSeen
+	if seen == nil { // what was done before this agent started is not news
+		a.refreshSeen = &done
+	}
+	a.mu.Unlock()
+	if seen == nil || done == *seen || a.inTerm() {
+		return
+	}
+	pctx, cancel := context.WithTimeout(ctx, UpTimeout)
+	err = a.starter.Pull(pctx, a.member)
+	cancel()
+	if err != nil {
+		a.log.Warn("pull after the leader's refresh failed; retrying", "member", a.member, "token", done, "err", err)
+		return
+	}
+	a.log.Info("pulled after the leader's refresh", "member", a.member, "token", done)
+	a.mu.Lock()
+	a.refreshSeen = &done
+	a.mu.Unlock()
 }
 
 // registerLoop keeps reg/<member> (config hash, caps, versions) under a lease
@@ -797,6 +892,9 @@ func (a *Agent) desired(ctx context.Context) campaign {
 
 // follow guards the local ground truth and keeps `conch elect` running while
 // this member should campaign. It returns when ctx ends and conch is gone.
+//
+// Its state (fl) lives on the agent, so that an in-place exec, which happens
+// while follow is parked between two steps, can hand it over.
 func (a *Agent) follow(ctx context.Context) {
 	log := a.log.With("member", a.member)
 	lastWhy := ""
@@ -806,16 +904,13 @@ func (a *Agent) follow(ctx context.Context) {
 			lastWhy = s
 		}
 	}
-	var (
-		done      chan error // conch's exit, while it runs
-		running   campaign
-		spawnedAt time.Time
-		failures  int
-	)
+	fl := &a.fl
 	tick := time.NewTicker(a.cfg.EligibleInterval.D())
 	defer tick.Stop()
+	a.gate.RLock()
+	defer a.gate.RUnlock()
 	for {
-		if done == nil {
+		if fl.done == nil {
 			if ctx.Err() != nil {
 				return
 			}
@@ -825,12 +920,11 @@ func (a *Agent) follow(ctx context.Context) {
 				why(want.why)
 			} else {
 				lastWhy = ""
-				var err error
-				if done, err = a.spawnConch(want.delay); err != nil {
+				done, err := a.spawnConch(want.delay)
+				if err != nil {
 					log.Error("cannot start conch", "err", err)
-					done = nil
 				} else {
-					running, spawnedAt = want, a.now()
+					fl.done, fl.delay, fl.spawnedAt = done, want.delay, a.now()
 				}
 			}
 		} else if a.inTerm() {
@@ -843,10 +937,10 @@ func (a *Agent) follow(ctx context.Context) {
 			a.stopConch("agent shutdown")
 		} else {
 			a.guardLocal(ctx)
-			if want := a.desired(ctx); want.why != "" || want.delay != running.delay {
+			if want := a.desired(ctx); want.why != "" || want.delay != fl.delay {
 				reason := want.why
 				if reason == "" {
-					reason = fmt.Sprintf("campaign delay changed from %s to %s", running.delay, want.delay)
+					reason = fmt.Sprintf("campaign delay changed from %s to %s", fl.delay, want.delay)
 				}
 				if a.withdraw(reason) {
 					log.Info("withdrawing from the campaign", "reason", reason)
@@ -858,25 +952,33 @@ func (a *Agent) follow(ctx context.Context) {
 		if ctx.Err() == nil {
 			ctxDone = ctx.Done()
 		}
+		var exited *conchExit
+		cancelled := false
+		a.gate.RUnlock() // parked
 		select {
-		case err := <-done:
-			a.conchExited(err)
-			done = nil
-			if a.now().Sub(spawnedAt) < 2*time.Second {
-				failures++
-			} else {
-				failures = 0
-			}
-			if failures > 0 {
-				d := min(time.Duration(failures)*a.cfg.EligibleInterval.D(), 30*time.Second)
-				log.Warn("conch exited quickly; backing off", "err", err, "for", d)
-				sleep(ctx, d)
-			}
+		case ex := <-fl.done:
+			exited = &ex
 		case <-tick.C:
 		case <-ctxDone:
-			if done == nil {
-				return
+			cancelled = true
+		}
+		a.gate.RLock()
+		switch {
+		case exited != nil:
+			a.conchExited(*exited)
+			fl.done = nil
+			if a.now().Sub(fl.spawnedAt) < 2*time.Second {
+				fl.failures++
+			} else {
+				fl.failures = 0
 			}
+			if fl.failures > 0 {
+				d := min(time.Duration(fl.failures)*a.cfg.EligibleInterval.D(), 30*time.Second)
+				log.Warn("conch exited quickly; backing off", "code", exited.Code, "err", exited.Err, "for", d)
+				sleep(ctx, d)
+			}
+		case cancelled && fl.done == nil:
+			return
 		}
 	}
 }

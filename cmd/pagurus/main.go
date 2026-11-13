@@ -72,6 +72,10 @@ commands:
               --fence <1-based index> --i-know
   audit       watch every member's project and report any moment with more
               than one member running the workload (drill tool)
+  reexec      the unit's ExecReload: upgrade the running agent in place
+              (it exec()s the new command line, keeping its term) or, if it
+              cannot, stop it for systemd to restart:
+              pagurus reexec -c cfg --pid $MAINPID -- <the unit's ExecStart>
 
 run by conch (the agent passes these to ` + "`conch elect`" + `; not for operators):
   fence-self  this member's self chain, as conch's --fence:
@@ -109,6 +113,14 @@ func main() {
 	iKnow := fs.Bool("i-know", false, "fence-run: confirm that this really stops the member's workload")
 	endpoints := fs.String("etcd", "", "override etcd.endpoints (comma-separated; drill harness)")
 	metricsAddr := fs.String("metrics-addr", "", "run: serve Prometheus metrics on this address (e.g. :9478); off by default")
+	mainPID := fs.Int("pid", 0, "reexec: the running agent's PID ($MAINPID)")
+	var hup chan os.Signal
+	if cmd == "run" {
+		// Before anything slow: SIGHUP's default action would kill the
+		// agent, and `pagurus reexec` may send it once the advert is up.
+		hup = make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+	}
 	_ = fs.Parse(args)
 	if *cfgPath == "" {
 		fmt.Fprint(os.Stderr, usage)
@@ -153,7 +165,9 @@ func main() {
 	case "validate":
 		err = cmdValidate(ctx, cfg, rt, be)
 	case "run":
-		err = cmdRun(ctx, cfg, rt, be, log, *self, *cfgPath, *metricsAddr)
+		err = cmdRun(ctx, cfg, rt, be, log, *self, *cfgPath, *metricsAddr, hup)
+	case "reexec":
+		err = cmdReexec(cfg, *mainPID, fs.Args())
 	case "fence-self":
 		os.Exit(cmdFenceSelf(cfg, drv, *member, log))
 	case "status":
@@ -255,10 +269,19 @@ func cmdValidate(ctx context.Context, cfg *config.Config, rt *runtime, be agent.
 	return nil
 }
 
-func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backend, log *slog.Logger, self, cfgPath, metricsAddr string) error {
+func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backend, log *slog.Logger, self, cfgPath, metricsAddr string, hup <-chan os.Signal) error {
 	if os.Geteuid() != 0 {
 		return errors.New("run must be root (cgroup.kill, watchdog)")
 	}
+	agent.Unadvertise(cfg) // until this image is ready for a request
+	resumed, err := agent.Resume()
+	if err != nil {
+		// The old image is gone and its state with it: a crash, as far as
+		// safety goes. systemd restarts us; that run fences at startup.
+		return err
+	}
+	ctx, restart := context.WithCancel(ctx)
+	defer restart()
 	cli, err := newEtcd(cfg)
 	if err != nil {
 		return err
@@ -273,7 +296,11 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backe
 		return err
 	}
 	ms := metrics.New(cfg.Service, self)
-	a := agent.New(agent.Options{Config: cfg, Backend: be, Etcd: cli, Log: log, Version: version, Member: self, Versions: toolVersions(ctx, cfg, rt.Driver, log),
+	var tools map[string]string
+	if resumed == nil { // a resumed image keeps the old one's (no Incus call before it pets)
+		tools = toolVersions(ctx, cfg, rt.Driver, log)
+	}
+	a := agent.New(agent.Options{Config: cfg, Backend: be, Etcd: cli, Log: log, Version: version, Member: self, Versions: tools,
 		FenceCmd: []string{exe, "fence-self", "-c", abs}, TermCmd: termCmd(exe, log), Metrics: ms,
 		StartLock: filepath.Join(cfg.StateDir, "start.lock")})
 	if metricsAddr != "" {
@@ -288,7 +315,22 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backe
 		defer srv.Close()
 		log.Info("serving metrics", "addr", ln.Addr().String())
 	}
-	if err := a.Preflight(ctx); err != nil {
+	go func() {
+		for range hup {
+			req, err := a.TakeRequest()
+			if err != nil {
+				log.Error("SIGHUP without an in-place upgrade request; ignoring", "err", err)
+				continue
+			}
+			if err := a.Reexec(req); errors.Is(err, agent.ErrRestart) {
+				restart() // release as on SIGTERM; exit 0; systemd starts the new command line
+			}
+		}
+	}()
+	if resumed != nil {
+		// The old image ran Preflight under the same safety config.
+		a.Restore(resumed)
+	} else if err := a.Preflight(ctx); err != nil {
 		// No lease is held by a starting agent, so nothing may run here. If
 		// the local Incus is what failed, cgroup.kill still works: use it,
 		// then exit non-zero and let systemd retry.
@@ -319,6 +361,27 @@ func cmdRun(ctx context.Context, cfg *config.Config, rt *runtime, be agent.Backe
 	running, lerr := rt.LocalRunning(a.Member())
 	wd.Close(ok && lerr == nil && len(running) == 0)
 	return err
+}
+
+// cmdReexec is the unit's ExecReload. An agent that advertises in-place
+// upgrades gets the unit's current command line and environment (SIGHUP); it
+// decides itself whether it can apply them in place. Any other (an older
+// binary, one still starting) is stopped for systemd to restart: it releases
+// its term as on `systemctl restart`.
+func cmdReexec(cfg *config.Config, pid int, argv []string) error {
+	if pid <= 0 || len(argv) == 0 {
+		return errors.New("reexec: --pid <MAINPID> -- <command line> required")
+	}
+	if ad, ok := agent.ReadAdvert(cfg); !ok || ad.PID != pid {
+		fmt.Printf("pagurus reexec: agent %d does not take in-place upgrades; stopping it for systemd to restart\n", pid)
+		return syscall.Kill(pid, syscall.SIGTERM)
+	}
+	req := agent.Request{Argv: argv, Env: os.Environ(), SafetyHash: cfg.SafetyHash(), FenceHash: cfg.FenceHash()}
+	if err := agent.WriteRequest(cfg, req); err != nil {
+		return err
+	}
+	fmt.Printf("pagurus reexec: asked agent %d to upgrade in place\n", pid)
+	return syscall.Kill(pid, syscall.SIGHUP)
 }
 
 func cmdStatus(ctx context.Context, cfg *config.Config, rt *incus.Driver, cli *clientv3.Client) error {

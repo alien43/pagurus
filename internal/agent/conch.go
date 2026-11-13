@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -17,6 +17,7 @@ import (
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"golang.org/x/sys/unix"
 
 	"github.com/alien43/pagurus/internal/termshim"
 )
@@ -75,12 +76,20 @@ func (a *Agent) conchEnv() []string {
 	return env
 }
 
+// conchExit is how conch ended: Code is its exit status, -1 if a signal
+// killed it.
+type conchExit struct {
+	Code int    `json:"code"`
+	Err  string `json:"err,omitempty"`
+}
+
 // spawnConch starts `conch elect` for this campaign. The returned channel
 // receives its exit.
-func (a *Agent) spawnConch(delay time.Duration) (chan error, error) {
+func (a *Agent) spawnConch(delay time.Duration) (chan conchExit, error) {
 	argv := a.conchArgs(delay)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = a.conchEnv()
+	// A file, not a pipe into this process: conch outlives an in-place exec.
 	cmd.Stdout, cmd.Stderr = a.procOut, a.procOut
 	// Its own process group, so a crash test can kill conch and the term
 	// together, and a signal to the agent's group is not sent to conch twice.
@@ -93,13 +102,56 @@ func (a *Agent) spawnConch(delay time.Duration) (chan error, error) {
 		return nil, err
 	}
 	a.mu.Lock()
-	a.conch, a.termRan = cmd, false
+	a.conch, a.termRan, a.conchExit = cmd, false, nil
 	a.mu.Unlock()
 	a.m.Bool("pagurus_conch_running", true)
 	a.log.Info("campaigning", "member", a.member, "office", a.co.Office(), "campaign_after", delay, "conch_pid", cmd.Process.Pid)
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	done := make(chan conchExit, 1)
+	go a.waitConch(cmd.Process.Pid, done)
 	return done, nil
+}
+
+// waitConch reaps conch and reports its exit on done (and in a.conchExit,
+// which an in-place exec hands over until conchExited has seen it). It
+// waits on a pidfd instead of in wait4, so that while an exec is pending it
+// can hold off reaping: the new image adopts conch by its PID.
+func (a *Agent) waitConch(pid int, done chan<- conchExit) {
+	pfd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		// Not our live child: nothing to reap.
+		ex := conchExit{Code: -1, Err: "pidfd: " + err.Error()}
+		a.mu.Lock()
+		a.conchExit = &ex
+		a.mu.Unlock()
+		done <- ex
+		return
+	}
+	defer unix.Close(pfd)
+	for {
+		n, err := unix.Poll([]unix.PollFd{{Fd: int32(pfd), Events: unix.POLLIN}}, 1000)
+		if n <= 0 || err != nil {
+			continue
+		}
+		a.mu.Lock()
+		if a.execing {
+			a.mu.Unlock()
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		var ws unix.WaitStatus
+		_, err = unix.Wait4(pid, &ws, unix.WNOHANG, nil)
+		ex := conchExit{Code: ws.ExitStatus()}
+		switch {
+		case err != nil:
+			ex = conchExit{Code: -1, Err: err.Error()}
+		case ws.Signaled():
+			ex = conchExit{Code: -1, Err: "killed by " + ws.Signal().String()}
+		}
+		a.conchExit = &ex
+		a.mu.Unlock()
+		done <- ex
+		return
+	}
 }
 
 // stopConch asks conch to stop (SIGTERM). Holding, it ends the term first:
@@ -141,14 +193,10 @@ const exitWithdrawn = 143
 
 // conchExited records conch's exit. A term still running here has lost its
 // conch (and with it the lease and the fence): end it now.
-func (a *Agent) conchExited(err error) {
-	code := 0
-	var ee *exec.ExitError
-	if errors.As(err, &ee) {
-		code = ee.ExitCode()
-	}
+func (a *Agent) conchExited(ex conchExit) {
+	code := ex.Code
 	a.mu.Lock()
-	a.conch = nil
+	a.conch, a.conchExit = nil, nil
 	termPID := a.termPID
 	if !a.localStopped {
 		a.unfitAfter = a.now().Add(a.cfg.SelfFenceLead() + 2*a.cfg.EligibleInterval.D())
@@ -174,7 +222,7 @@ func (a *Agent) conchExited(err error) {
 	case 71:
 		a.alerter.Alert("conch-fence-failed", "conch's self-fence did not confirm; the lease was left to expire", "member", a.member)
 	default:
-		a.log.Warn("conch exited", "member", a.member, "code", code, "err", err)
+		a.log.Warn("conch exited", "member", a.member, "code", code, "err", ex.Err)
 	}
 }
 
@@ -223,8 +271,11 @@ func (a *Agent) heartbeat(ctx context.Context) {
 	for {
 		a.mu.Lock()
 		ok := a.now().Before(a.progressDeadline)
+		execing := a.execing
 		a.mu.Unlock()
-		if ok {
+		if execing {
+			// The image is being replaced: the new one beats from here.
+		} else if ok {
 			a.touchHeartbeat()
 		} else if !withheld {
 			a.log.Error("term missed its progress deadline; heartbeat withheld", "member", a.member)
@@ -259,9 +310,14 @@ func listenNotify(path string, freshness func() time.Duration) (*notifyRelay, er
 	if err != nil {
 		return nil, fmt.Errorf("watchdog relay: %w", err)
 	}
+	return newRelay(path, conn, freshness), nil
+}
+
+// newRelay serves conn (bound to path), fresh or inherited across an exec.
+func newRelay(path string, conn *net.UnixConn, freshness func() time.Duration) *notifyRelay {
 	r := &notifyRelay{path: path, conn: conn, freshness: freshness}
 	go r.serve()
-	return r, nil
+	return r
 }
 
 func (r *notifyRelay) serve() {
@@ -305,21 +361,25 @@ func (r *notifyRelay) Close() {
 
 // ------------------------------------------------------------------ terms --
 
-type termServer struct{ ln net.Listener }
+type termServer struct{ ln *net.UnixListener }
 
 func (s *termServer) Close() { _ = s.ln.Close() }
 
 // listenTerms accepts the `pagurus term` process conch starts on winning.
-// The socket is in the root-only state dir.
-func (a *Agent) listenTerms(ctx context.Context) (*termServer, error) {
-	_ = os.Remove(a.termSocket())
-	ln, err := net.Listen("unix", a.termSocket())
-	if err != nil {
-		return nil, fmt.Errorf("term socket: %w", err)
-	}
-	if err := os.Chmod(a.termSocket(), 0o600); err != nil {
-		ln.Close()
-		return nil, err
+// The socket is in the root-only state dir. ln, if set, is the socket an
+// old image handed over.
+func (a *Agent) listenTerms(ctx context.Context, ln *net.UnixListener) (*termServer, error) {
+	if ln == nil {
+		_ = os.Remove(a.termSocket())
+		l, err := net.Listen("unix", a.termSocket())
+		if err != nil {
+			return nil, fmt.Errorf("term socket: %w", err)
+		}
+		ln = l.(*net.UnixListener)
+		if err := os.Chmod(a.termSocket(), 0o600); err != nil {
+			ln.Close()
+			return nil, err
+		}
 	}
 	go func() {
 		for {
@@ -330,7 +390,8 @@ func (a *Agent) listenTerms(ctx context.Context) (*termServer, error) {
 			go a.serveTerm(ctx, c)
 		}
 	}()
-	return &termServer{ln: ln}, nil
+	a.terms = &termServer{ln: ln}
+	return a.terms, nil
 }
 
 func (a *Agent) serveTerm(ctx context.Context, c net.Conn) {
@@ -350,12 +411,17 @@ func (a *Agent) serveTerm(ctx context.Context, c net.Conn) {
 		return
 	}
 
+	// The whole term, up to the reply, is one step of the gate (an
+	// in-place exec waits for it to park in supervise).
+	a.gate.RLock()
+	defer a.gate.RUnlock()
 	// The term starts only between two ground-truth checks, never during one.
 	a.localMu.Lock()
 	a.mu.Lock()
 	ok := a.conch != nil && !a.termActive
 	if ok {
 		a.termActive, a.termPID, a.termRan = true, h.PID, true
+		a.termConn, _ = c.(*net.UnixConn)
 	}
 	a.mu.Unlock()
 	a.localMu.Unlock()
@@ -363,9 +429,22 @@ func (a *Agent) serveTerm(ctx context.Context, c net.Conn) {
 		a.log.Error("term handshake while no campaign of ours runs (or a term already does); refusing", "rev", h.Rev)
 		return
 	}
+	a.runTerm(ctx, c, rd, h.Rev, clientv3.LeaseID(lease), nil)
+}
+
+// resumeTerm carries on a term an old image handed over (adoptTerm).
+func (a *Agent) resumeTerm(ctx context.Context, c *net.UnixConn, th *termHandover) {
+	defer c.Close()
+	a.gate.RLock()
+	defer a.gate.RUnlock()
+	a.runTerm(ctx, c, bufio.NewReader(c), th.Epoch, clientv3.LeaseID(th.Lease), th)
+}
+
+// runTerm leads the term and answers the term process with its exit code.
+func (a *Agent) runTerm(ctx context.Context, c net.Conn, rd io.ByteReader, epoch int64, lease clientv3.LeaseID, resumed *termHandover) {
 	defer func() {
 		a.mu.Lock()
-		a.termActive, a.termPID = false, 0
+		a.termActive, a.termPID, a.termConn = false, 0, nil
 		a.mu.Unlock()
 	}()
 
@@ -378,7 +457,7 @@ func (a *Agent) serveTerm(ctx context.Context, c net.Conn) {
 		markLost()
 	}()
 
-	code := a.lead(ctx, lost, h.Rev, clientv3.LeaseID(lease))
+	code := a.lead(ctx, lost, epoch, lease, resumed)
 	b, _ := json.Marshal(termshim.Bye{Exit: code})
 	_, _ = c.Write(append(b, '\n'))
 }

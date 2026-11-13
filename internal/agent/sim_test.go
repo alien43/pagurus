@@ -87,6 +87,7 @@ type simMember struct {
 	prepared  bool
 	prepares  int // Prepare calls: each recreates the instance (stopped)
 	pulls     int // Pull calls
+	starts    int // Start calls
 	// launchPause pauses inside the launch itself (the residual window).
 	launchPause time.Duration
 	// listDelay: the cluster takes this long to answer a List of this member
@@ -345,6 +346,7 @@ func (r *simRT) Start(ctx context.Context, m string) error {
 	if err := r.clusterOp(); err != nil {
 		return err
 	}
+	r.c.m[m].starts++
 	if r.c.m[m].upFail {
 		return errors.New("up failed")
 	}
@@ -585,12 +587,16 @@ func logger(t *testing.T, name string) *slog.Logger {
 
 func verbose() bool { return os.Getenv("SINGLETON_TEST_LOG") != "" }
 
-func procOutput() io.Writer {
+// procOutput is conch's output: a file, as the agent requires (conch writes
+// to it directly, across an in-place exec).
+func procOutput() *os.File {
 	if verbose() {
 		return os.Stderr
 	}
-	return io.Discard
+	return devNull
 }
+
+var devNull, _ = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 
 // fencesOver is cfg's fence chains over a fake backend, wired the way
 // cmd/pagurus wires them over *incus.Driver.
@@ -632,16 +638,25 @@ func (h *harness) start(name string, dog *simDog) *node {
 		pxs, addrs = append(pxs, px), append(addrs, px.Addr())
 	}
 	cfg.Etcd.Endpoints = addrs // conch too: a partition cuts it off
+	return h.launch(name, &cfg, pxs, dog, nil)
+}
+
+// launch runs member's agent on its network (pxs), fresh or, with hd, as the
+// new image of an in-place exec.
+func (h *harness) launch(name string, cfg *config.Config, pxs []*testutil.Proxy, dog *simDog, hd *handover) *node {
+	addrs := cfg.Etcd.Endpoints
 	cli := testutil.Client(h.t, addrs[0], addrs[1:]...)
 	rt := &simRT{c: h.sim, me: name}
 	self, err := os.Executable()
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	a := New(Options{Config: &cfg, Backend: simBackend(&cfg, rt), Etcd: cli, Log: logger(h.t, name), Version: "test",
+	a := New(Options{Config: cfg, Backend: simBackend(cfg, rt), Etcd: cli, Log: logger(h.t, name), Version: "test",
 		Conch: []string{conchBin}, FenceCmd: []string{self, "sim-fence", h.host}, TermCmd: []string{self, "sim-term"},
 		ProcOutput: procOutput()})
-	if err := a.Preflight(h.t.Context()); err != nil {
+	if hd != nil {
+		a.Restore(hd)
+	} else if err := a.Preflight(h.t.Context()); err != nil {
 		h.t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())

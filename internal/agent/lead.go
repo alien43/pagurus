@@ -27,9 +27,16 @@ import (
 //   - ctx, the agent's lifetime. Its end asks for a graceful release.
 //   - lost, ended when the term process goes (conch lost the lease or died).
 //     Its end means "stop acting now": conch's fence stops the workload.
-func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.LeaseID) int {
+//
+// resumed, if set, is the same term handed over by an old image (in-place
+// upgrade): it goes straight back to supervising, with the old image's
+// counters.
+func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.LeaseID, resumed *termHandover) int {
 	log := a.log.With("member", a.member, "epoch", epoch)
 	acquired := a.now()
+	if resumed != nil {
+		acquired = resumed.Acquired
+	}
 	a.mu.Lock()
 	// From here on the workload may run here: only a confirmed stop may set
 	// localStopped again.
@@ -37,7 +44,9 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 	a.mu.Unlock()
 	a.m.Bool("pagurus_role", true)
 	defer a.setRole(roleFollower)
-	a.beat(time.Minute)
+	if resumed == nil {
+		a.beat(time.Minute)
+	}
 	hctx, stopHB := context.WithCancel(context.Background())
 	defer stopHB()
 	go a.heartbeat(hctx)
@@ -48,8 +57,20 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 	defer stopAfter()
 
 	t := &termState{a: a, lease: lease, epoch: epoch, acquired: acquired, log: log, op: op}
-	log.Info("won the office", "lease", fmt.Sprintf("%x", int64(lease)))
-	a.m.Inc("pagurus_terms_total")
+	a.mu.Lock()
+	a.term = t
+	a.mu.Unlock()
+	defer func() {
+		a.mu.Lock()
+		a.term = nil
+		a.mu.Unlock()
+	}()
+	if resumed != nil {
+		log.Info("term resumed in place", "lease", fmt.Sprintf("%x", int64(lease)), "healthy", resumed.Sv.Healthy)
+	} else {
+		log.Info("won the office", "lease", fmt.Sprintf("%x", int64(lease)))
+		a.m.Inc("pagurus_terms_total")
+	}
 	defer a.m.SetGauge("pagurus_lease_remaining_seconds", 0)
 
 	finish := func() int {
@@ -72,6 +93,11 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 		return 1
 	}
 
+	if resumed != nil {
+		t.verified, t.sv = resumed.Verified, resumed.Sv
+		t.supervise(true)
+		return finish()
+	}
 	if err := a.co.Guarded(op, epoch, lease, a.co.OpPutLeader(coord.LeaderRecord{
 		Member: a.member, Epoch: epoch, AgentID: a.agentID, Acquired: acquired.UTC(),
 	}, lease)); err != nil {
@@ -102,7 +128,7 @@ func (a *Agent) lead(ctx, lost context.Context, epoch int64, lease clientv3.Leas
 		log.Warn("cannot record may-run; not starting", "err", err)
 		return finish()
 	}
-	t.supervise()
+	t.supervise(false)
 	return finish()
 }
 
@@ -161,6 +187,26 @@ type termState struct {
 
 	// verified: members a fence confirmed stopped this term by looking.
 	verified map[string]bool
+	sv       superviseState
+}
+
+// superviseState is supervise's working state, kept on the term so that an
+// in-place exec (while supervise is parked between two ticks) can hand it
+// over.
+type superviseState struct {
+	Restarts    int    `json:"restarts"`
+	Failures    int    `json:"failures"`
+	Healthy     bool   `json:"healthy"`
+	EverHealthy bool   `json:"ever_healthy"`
+	Applied     string `json:"applied"`     // the refresh request this term has applied
+	AckPending  string `json:"ack_pending"` // a refresh to acknowledge once healthy
+	// NextRound: replication's next snapshot round.
+	NextRound time.Time `json:"next_round"`
+	StartedAt time.Time `json:"started_at"`
+	LastAudit time.Time `json:"last_audit"`
+	// UnavailableSince: since when the health check has found the backend
+	// API unavailable (zero: it answers).
+	UnavailableSince time.Time `json:"unavailable_since"`
 }
 
 func (t *termState) giveUp(reason string, backoff time.Duration) {
@@ -719,11 +765,11 @@ func notRetryable(err error) bool {
 }
 
 // supervise starts the workload and keeps it healthy for the rest of the term.
-func (t *termState) supervise() {
+// resumed: the workload runs already, under this term (an in-place exec).
+func (t *termState) supervise(resumed bool) {
 	a := t.a
 	hc := a.cfg.Health
-	restarts, failures := 0, 0
-	healthy, everHealthy := false, false
+	sv := &t.sv
 	// startOnce starts the workload; false means the term is over. A start
 	// that fails is retried one health interval later, within the same
 	// max_restarts budget as unhealthy restarts, and then the office is
@@ -752,15 +798,15 @@ func (t *termState) supervise() {
 				t.giveUp(err.Error(), 0)
 				return false
 			}
-			if restarts >= hc.MaxRestarts || notRetryable(err) {
-				backoff, streak := a.releaseBackoff(everHealthy)
+			if sv.Restarts >= hc.MaxRestarts || notRetryable(err) {
+				backoff, streak := a.releaseBackoff(sv.EverHealthy)
 				a.alerter.Alert("unhealthy", "workload does not start; giving the office up", "member", a.member, "err", err.Error(),
 					"backoff", backoff, "failed_terms", streak)
 				t.giveUp("start failed: "+err.Error(), backoff)
 				return false
 			}
-			restarts++
-			t.log.Warn("retrying the start", "attempt", restarts)
+			sv.Restarts++
+			t.log.Warn("retrying the start", "attempt", sv.Restarts)
 			if !sleep(t.op, hc.Interval.D()) {
 				return false
 			}
@@ -770,20 +816,17 @@ func (t *termState) supervise() {
 	// starts from the image already in this member's project (a refresh that
 	// failed over must leave the new leader on the old image), and it is not
 	// acknowledged, so `pagurus refresh` reports the failure.
-	applied, _ := a.co.GetString(t.op, a.co.RefreshKey())
-	ackPending := ""
-	if !startOnce() {
-		return
+	if !resumed {
+		sv.Applied, _ = a.co.GetString(t.op, a.co.RefreshKey())
+		if !startOnce() {
+			return
+		}
+		if a.replicating() {
+			t.snapshotRound()
+			sv.NextRound = a.now().Add(a.cfg.Replicate.Interval.D())
+		}
+		sv.StartedAt = a.now()
 	}
-	var nextRound time.Time // replication: the next snapshot round
-	if a.replicating() {
-		t.snapshotRound()
-		nextRound = a.now().Add(a.cfg.Replicate.Interval.D())
-	}
-	startedAt, lastAudit := a.now(), time.Time{}
-	// Since when the health check has found the backend API unavailable
-	// (zero: it answers). Below APIUnavailableMax the term holds its state.
-	var unavailableSince time.Time
 	tick := time.NewTicker(hc.Interval.D())
 	defer tick.Stop()
 	for {
@@ -792,10 +835,16 @@ func (t *termState) supervise() {
 		// stalled for longer than this budget does not starve the heartbeat
 		// (Incus: 90 s, 2026-10-21..23).
 		a.beat(hc.Interval.D() + 2*a.cfg.Fence.APITimeout.D())
+		ended := false
+		a.gate.RUnlock() // parked: an in-place exec may happen here
 		select {
 		case <-t.op.Done():
-			return
+			ended = true
 		case <-tick.C:
+		}
+		a.gate.RLock()
+		if ended {
+			return
 		}
 		if pin, err := a.activePin(t.op); err == nil && pin != "" && pin != a.member {
 			// A planned move: with replication, copy to the target while
@@ -818,8 +867,8 @@ func (t *termState) supervise() {
 			t.giveUp("deposed", 0)
 			return
 		}
-		if tok, err := a.co.GetString(t.op, a.co.RefreshKey()); err == nil && tok != "" && tok != applied {
-			applied = tok
+		if tok, err := a.co.GetString(t.op, a.co.RefreshKey()); err == nil && tok != "" && tok != sv.Applied {
+			sv.Applied = tok
 			a.beat(UpTimeout)
 			pctx, cancel := context.WithTimeout(t.op, UpTimeout)
 			err := a.starter.Pull(pctx, a.member)
@@ -830,17 +879,17 @@ func (t *termState) supervise() {
 				continue
 			}
 			t.log.Info("refresh requested: pulled; recreating the workload in place", "token", tok)
-			ackPending = tok
-			healthy, failures = false, 0
+			sv.AckPending = tok
+			sv.Healthy, sv.Failures = false, 0
 			if !startOnce() {
 				return
 			}
-			startedAt = a.now()
+			sv.StartedAt = a.now()
 			continue
 		}
-		if a.replicating() && !a.now().Before(nextRound) {
+		if a.replicating() && !a.now().Before(sv.NextRound) {
 			t.snapshotRound()
-			nextRound = a.now().Add(a.cfg.Replicate.Interval.D())
+			sv.NextRound = a.now().Add(a.cfg.Replicate.Interval.D())
 		}
 		a.beat(a.cfg.Fence.APITimeout.D())
 		err := t.health()
@@ -850,10 +899,10 @@ func (t *termState) supervise() {
 		if ttl, terr := a.cli.TimeToLive(t.op, t.lease); terr == nil {
 			a.m.SetGauge("pagurus_lease_remaining_seconds", float64(max(ttl.TTL, 0)))
 		}
-		hold := t.apiUnavailable(err, &unavailableSince)
+		hold := t.apiUnavailable(err, &sv.UnavailableSince)
 		switch {
 		case err == nil:
-			if !healthy {
+			if !sv.Healthy {
 				t.log.Info("workload healthy")
 				if err := a.co.Guarded(t.op, t.epoch, t.lease, a.co.OpPutMS(a.member, coord.MemberState{
 					State: coord.MayRun, Epoch: t.epoch, By: a.member, Reason: "healthy", At: a.now().UTC(), Caps: a.caps(),
@@ -861,52 +910,52 @@ func (t *termState) supervise() {
 					t.log.Warn("cannot record healthy member state", "err", err)
 				}
 			}
-			if !everHealthy {
+			if !sv.EverHealthy {
 				a.mu.Lock()
 				a.failedTerms = 0
 				a.mu.Unlock()
 			}
-			healthy, everHealthy, failures = true, true, 0
-			if ackPending != "" {
-				if perr := a.co.PutString(t.op, a.co.RefreshDoneKey(), ackPending); perr == nil {
-					t.log.Info("refresh done", "token", ackPending)
-					ackPending = ""
+			sv.Healthy, sv.EverHealthy, sv.Failures = true, true, 0
+			if sv.AckPending != "" {
+				if perr := a.co.PutString(t.op, a.co.RefreshDoneKey(), sv.AckPending); perr == nil {
+					t.log.Info("refresh done", "token", sv.AckPending)
+					sv.AckPending = ""
 				}
 			}
 		case hold:
 			// The backend did not answer, so nothing new is known about the
 			// workload: neither a failure nor health.
-		case !errors.Is(err, errNotRunning) && a.now().Sub(startedAt) < hc.StartPeriod.D():
+		case !errors.Is(err, errNotRunning) && a.now().Sub(sv.StartedAt) < hc.StartPeriod.D():
 			// still starting (a stopped workload is not: Z2M crashed 5 s
 			// after its first healthy check on 2026-11-11 and sat Stopped
 			// for the rest of its 90 s start period)
 		default:
-			healthy = false
-			failures++
-			t.log.Warn("workload unhealthy", "err", err, "consecutive", failures)
-			if failures < hc.Failures {
+			sv.Healthy = false
+			sv.Failures++
+			t.log.Warn("workload unhealthy", "err", err, "consecutive", sv.Failures)
+			if sv.Failures < hc.Failures {
 				break
 			}
-			if restarts >= hc.MaxRestarts {
-				backoff, streak := a.releaseBackoff(everHealthy)
+			if sv.Restarts >= hc.MaxRestarts {
+				backoff, streak := a.releaseBackoff(sv.EverHealthy)
 				a.alerter.Alert("unhealthy", "workload stays unhealthy; giving the office up", "member", a.member, "err", err.Error(),
 					"backoff", backoff, "failed_terms", streak)
 				t.giveUp("unhealthy: "+err.Error(), backoff)
 				return
 			}
-			restarts++
-			failures = 0
-			t.log.Warn("restarting workload in place", "attempt", restarts)
+			sv.Restarts++
+			sv.Failures = 0
+			t.log.Warn("restarting workload in place", "attempt", sv.Restarts)
 			if !startOnce() {
 				return
 			}
-			startedAt = a.now()
+			sv.StartedAt = a.now()
 		}
 		// Right after a start, audit every tick: a deposed leader's late
 		// start is caught in one health interval, not one audit interval.
-		fast := a.now().Sub(startedAt) < 3*hc.Interval.D()
-		if fast || a.now().Sub(lastAudit) >= a.cfg.AuditInterval.D() {
-			lastAudit = a.now()
+		fast := a.now().Sub(sv.StartedAt) < 3*hc.Interval.D()
+		if fast || a.now().Sub(sv.LastAudit) >= a.cfg.AuditInterval.D() {
+			sv.LastAudit = a.now()
 			t.audit()
 		}
 	}

@@ -34,6 +34,10 @@ func TestMain(m *testing.M) {
 			os.Exit(termshim.Run(os.Args[2]))
 		case "sim-fence":
 			os.Exit(simFence(os.Args[2], os.Args[len(os.Args)-1]))
+		case "exec-host":
+			os.Exit(execHost(os.Args[2]))
+		case "exec-new":
+			os.Exit(execNew(os.Args[2], os.Args[3], os.Args[4]))
 		case "sim-pet": // a conch that pets n times, then stays alive, silent
 			n, _ := strconv.Atoi(os.Args[2])
 			addr := &net.UnixAddr{Name: os.Getenv("NOTIFY_SOCKET"), Net: "unixgram"}

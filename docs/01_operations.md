@@ -116,6 +116,43 @@ file and the image already in the member's project. So:
 - A follower never recreates on a refresh. Never pull into a member's project from another
   member: Incus pulls for the architecture of the server it talks to.
 
+## In-place upgrade
+
+A restarted agent ends its term: it releases the office, so the workload stops and starts again
+(on the same member or another one). A new binary, or a config change that is not a safety
+change, does not need that. The unit's `ExecReload` is
+
+```
+pagurus reexec -c <config> --pid $MAINPID -- <the unit's ExecStart>
+```
+
+and `systemctl reload` (NixOS: `reloadIfChanged`) runs it with the unit as it is now. It hands
+the running agent the new command line and the unit's environment, and the agent `exec()`s it in
+its own process. PID, cgroup and children survive `exec()`: conch keeps the lease, the term shim
+keeps its connection, the workload keeps running. The new image takes the agent's state and
+sockets from the old one and carries on with the same term: same office, epoch and lease, no
+start, no fence. The exec waits until every loop of the agent is between two steps, never
+inside a start, a fence, a release or a replica pull, and logs `in-place upgrade: exec`; the new
+image logs `agent resumed in place` and, while leading, `term resumed in place`.
+
+It restarts instead, as `systemctl restart` would (the term is released first), when:
+
+- the new config's `SafetyHash` or `FenceHash` differs from the running one's (TTL, margin,
+  fences, members...), or the hashing itself changed between the two binaries;
+- the watchdog is `mode: device`;
+- the running agent does not take in-place upgrades (an older binary, or one still starting:
+  it writes `<state_dir>/<service>.inplace` once it is up).
+
+Safety does not depend on the new image coming back. While it is not there, nobody pets the
+unit's watchdog and conch's term heartbeat goes stale; the watchdog acts as for a crashed agent
+(`WatchdogSec`, and `FailureAction` where armed), and a restarted agent fences at startup.
+
+conch itself is not upgraded in place: the running `conch elect` stays until its campaign
+ends (a follower's at its next spawn, a leader's at the end of its term). Its `--fence` and
+term commands are scripts in `state_dir` that every agent rewrites, so a conch that outlives
+upgrades runs the current pagurus binary and config, never a removed one. Restart the unit to
+bring a new conch in at once.
+
 ## Metrics
 
 `pagurus run --metrics-addr :9478` serves Prometheus metrics on `/metrics` (off by default).
@@ -171,8 +208,10 @@ pagurus validate -c cfg                   # config, this member's project, the c
   `pagurus fence-ack -c cfg --member <m>` records that and the next leader proceeds.
 - **Replicated services** may refuse to start from a copy older than `replicate.max_staleness`;
   `pagurus accept-stale -c cfg` lets the next term start from it, once (`02_replication.md`).
-- **Upgrading pagurus.** Replace the binary and restart the agents one member at a time, standbys
-  first, then `move` the office off the leader and restart that one. A new binary that cannot
+- **Upgrading pagurus.** Replace the binary (or the config) and `systemctl reload pagurus@<svc>`:
+  the agent upgrades in place and keeps its term (§ In-place upgrade). A change that cannot be
+  applied in place restarts the agent instead, which releases its term: on the leader, `move`
+  the office off first if the stop matters. A new binary that cannot
   load the config exits 78 (`EX_CONFIG`), which a unit like `lab/up.sh`'s (`RestartPreventExitStatus=78`) does not restart (`pagurus check-config`
   runs the same load with no network, for a pre-deploy check). Agents whose safety-relevant config
   differs refuse to campaign rather than run with mismatched fences.
