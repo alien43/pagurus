@@ -5,7 +5,7 @@
 # workstation that reaches every member over ssh and etcd directly; pagurus
 # itself (move, audit) runs on $CTL, a member with the binary and config.
 #
-#   drill.sh [move|graceful|restart|crash|pause|stall|partition]...   (default: all but stall and partition, in that order)
+#   drill.sh [move|graceful|reload|restart|crash|pause|stall|partition]...   (default: all but stall and partition, in that order)
 #   SVC=<service> HEALTH_PATH=<path> HEALTH_PORT=<port> CTL=<member> select the service, its probe path and port, the control member.
 #
 # Where the cluster is (required):
@@ -53,8 +53,8 @@ if [ -n "${REMOTE_CLI:-}" ]; then
   etcdctl() { on "$CTL" "etcdctl $(printf '%q ' "$@")"; }
 fi
 log() { printf '%s  %s\n' "$(date +%T)" "$*"; }
-fail=0
-miss() { log "MISS: $*"; fail=1; }
+fail=0 misses=0
+miss() { log "MISS: $*"; fail=1; misses=$((misses + 1)); }
 
 PART_MEMBER=${PART_MEMBER:-${member_names[1]}}
 # The stop hook incusd runs after the kill retries the cluster database for
@@ -145,6 +145,23 @@ drill_graceful() {
   [ -z "$(running_on | grep -w "$l")" ] || miss "$l still running after its agent stopped"
   if t=$(wait_for 120 some_other_healthy "$l"); then log "   $(leader) serving ${t}s after the stop"; else miss "no handover"; fi
   restart_agent "$l"
+}
+
+# In-place upgrade: `systemctl reload` re-execs the leader's agent (pagurus
+# reexec). The term goes on: same leader, epoch and PID, and the workload
+# answers throughout.
+drill_reload() {
+  local l e pid since down=0 missed=$misses; l=$(leader); e=$(epoch); pid=$(mainpid "$l")
+  since=$(on "$l" "date '+%F %T'")
+  log "== reload: in-place upgrade of the agent on $l (pid $pid, epoch $e)"
+  on "$l" "${S}systemctl reload $unit" || { miss "reload on $l"; return; }
+  resumed() { agent_log "$l" "$since" | grep -q 'agent resumed in place'; }
+  for _ in $(seq 10); do healthy_on "$l" || down=$((down + 1)); sleep 1; done
+  wait_for 30 resumed >/dev/null || miss "no 'agent resumed in place' on $l"
+  [ "$(leader)" = "$l" ] && [ "$(epoch)" = "$e" ] || miss "the term changed: leader $(leader) epoch $(epoch)"
+  [ "$(mainpid "$l")" = "$pid" ] || miss "the agent's PID changed (restarted, not re-exec'd)"
+  [ $down = 0 ] || miss "the workload missed $down of 10 probes"
+  [ "$misses" != "$missed" ] || log "   $l still leads epoch $e, pid $pid, the workload answered every probe"
 }
 
 # No lease resume: a killed agent's term ends. systemd restarts the agent,
@@ -284,7 +301,7 @@ drill_partition() {
   for p in "${hold[@]}"; do log "   restarting $unit on $p"; restart_agent "$p"; done
 }
 
-drills=("$@"); [ ${#drills[@]} -gt 0 ] || drills=(move graceful restart crash pause)
+drills=("$@"); [ ${#drills[@]} -gt 0 ] || drills=(move graceful reload restart crash pause)
 for d in "${drills[@]}"; do settle; "drill_$d"; done
 settle
 stop_audit

@@ -11,6 +11,8 @@
 - conch's `--fence` command and term child are now scripts in `state_dir`
   (`<service>.fence-self`, `<service>.term-cmd`, run through `/bin/sh`) that every agent rewrites, so a
   conch that outlives an upgrade runs the current binary and config.
+- `scripts/drill.sh reload` (and in the lab's default set): `systemctl reload` on the leader must keep
+  its leader, epoch and PID, with the workload answering throughout.
 - conch's output must be a file (`ProcOutput`), not a pipe into the agent: conch outlives an exec.
 
 ## v0.1.7
